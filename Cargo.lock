@@ -6150,6 +6150,7 @@ dependencies = [
  "educe",
  "futures",
  "futures-await-test",
+ "getset",
  "hex",
  "humantime-serde",
  "itertools 0.14.0",
