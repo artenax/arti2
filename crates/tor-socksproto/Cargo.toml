@@ -31,7 +31,7 @@ arbitrary = { version = "1.0.1", optional = true, features = ["derive"] }
 caret = { path = "../caret", version = "0.6.0" }
 derive-deftly = { version = "~1.3.0", features = ["full", "beta"] }
 educe = "0.4.22"
-getset = "0.1"
+getset = "0.1.6"
 safelog = { path = "../safelog", version = "0.5.0" }
 subtle = "2"
 thiserror = "2"

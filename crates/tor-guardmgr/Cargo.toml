@@ -65,7 +65,7 @@ derive_more = { version = "2.0.1", features = ["full"] }
 dyn-clone = "1.0.4"
 educe = "0.4.22"
 futures = "0.3.14"
-getset = "0.1"
+getset = "0.1.6"
 humantime = "2"
 humantime-serde = "1.1.1"
 itertools = "0.14.0"
