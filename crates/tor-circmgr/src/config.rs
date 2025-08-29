@@ -216,9 +216,6 @@ impl_standard_builder! { PreemptiveCircuitConfig }
 #[derive(Debug, Clone, Builder, Eq, PartialEq)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 #[builder(derive(Debug, Serialize, Deserialize))]
-// TODO (***fixed by this MR***) Use a getters derive macro which lets us only generate getters
-// for fields we explicitly request, rather than having to mark the rest with `skip`.
-// (getset::Getters doesn't allow #[getter(skip)] at the type level)
 #[derive(getset::Getters, getset::CopyGetters)]
 pub struct CircuitTiming {
     /// How long after a circuit has first been used should we give
