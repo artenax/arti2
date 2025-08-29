@@ -2,10 +2,10 @@
 
 /// A set of parameters derived from the consensus document,
 /// controlling the KIST behavior of channels.
-#[derive(Debug, Clone, Copy, PartialEq, getset::Getters, getset::CopyGetters)]
+#[derive(Debug, Clone, Copy, PartialEq, getset::CopyGetters)]
 pub struct KistParams {
     /// Whether KIST is enabled.
-    #[getset(get = "pub")]
+    #[getset(get_copy = "pub")]
     kist_enabled: KistMode,
     /// The value to set for the [`TCP_NOTSENT_LOWAT`] socket option
     /// (on platforms that support it)
