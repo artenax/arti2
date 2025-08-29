@@ -10,7 +10,7 @@ define_derive_deftly! {
     ///
     /// Like `getset::Getters` but `pub(crate)`.
     ///
-    /// TODO add this feature to `amplify`.
+    /// TODO safely remove this feature and its usages since we switched to using "getset"
     CrateGetters:
 
     ${define REF ${if not(fmeta(getter_copy)) { & }}}
