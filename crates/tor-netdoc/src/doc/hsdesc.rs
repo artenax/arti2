@@ -131,7 +131,7 @@ pub enum IntroAuthType {
 
 /// Information in an onion service descriptor about a single
 /// introduction point.
-#[derive(Debug, Clone, amplify::Getters, Builder)]
+#[derive(Debug, Clone, getset::Getters, Builder)]
 #[builder(pattern = "owned")] // mirrors HsDescBuilder
 pub struct IntroPointDesc {
     /// The list of link specifiers needed to extend a circuit to the introduction point.
@@ -143,17 +143,18 @@ pub struct IntroPointDesc {
     /// `ChanTarget` without some processing.
     //
     // The builder setter takes a `Vec` directly.  This seems fine.
-    #[getter(skip)]
     link_specifiers: Vec<EncodedLinkSpec>,
 
     /// The key to be used to extend a circuit _to the introduction point_, using the
     /// ntor or ntor3 handshakes.  (`KP_ntor`)
     #[builder(setter(name = "ipt_kp_ntor"))] // TODO rename the internal variable too
+    #[getset(get = "pub")]
     ipt_ntor_key: curve25519::PublicKey,
 
     /// The key to be used to identify the onion service at this introduction point.
     /// (`KP_hs_ipt_sid`)
     #[builder(setter(name = "kp_hs_ipt_sid"))] // TODO rename the internal variable too
+    #[getset(get = "pub")]
     ipt_sid_key: HsIntroPtSessionIdKey,
 
     /// `KP_hss_ntor`, the key used to encrypt a handshake _to the onion
@@ -163,6 +164,7 @@ pub struct IntroPointDesc {
     /// introduction point as part of its strategy for preventing replay
     /// attacks.
     #[builder(setter(name = "kp_hss_ntor"))] // TODO rename the internal variable too
+    #[getset(get = "pub")]
     svc_ntor_key: HsSvcNtorKey,
 }
 
@@ -321,7 +323,7 @@ impl HsDesc {
     ///
     /// Accessor function.
     //
-    // TODO: We'd like to derive this, but amplify::Getters  would give us &Vec<>,
+    // TODO: We'd like to derive this, but getset::Getters  would give us &Vec<>,
     // not &[].
     //
     // Perhaps someday we can use derive_deftly, or add as_ref() support?

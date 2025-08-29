@@ -59,7 +59,10 @@ full = [
     "tor-rpc-connect?/full",
     "signal-hook",
     "signal-hook-async-std",
-    "dialoguer", "tor-key-forge/full", "tor-keymgr/full", "tor-hscrypto?/full",
+    "dialoguer",
+    "tor-key-forge/full",
+    "tor-keymgr/full",
+    "tor-hscrypto?/full",
 ]
 
 async-std = [
@@ -146,7 +149,6 @@ metrics = [
 restricted-discovery = ["tor-hsservice/restricted-discovery", "__is_experimental"]
 hsc = ["onion-service-client", "experimental-api", "keymgr", "__is_experimental"]
 __is_experimental = []
-
 # These features exist for backwards compatibility, and shouldn't be used directly.
 # Next time we do a version bump, it would be good to get rid of them.
 

@@ -70,7 +70,6 @@ hs-common = []
 __is_experimental = []
 
 [dependencies]
-amplify = { version = "4", default-features = false, features = ["derive"] }
 async-trait = "0.1.54"
 bounded-vec-deque = "0.1"
 cfg-if = "1.0.0"

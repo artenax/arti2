@@ -2,7 +2,6 @@
 
 use super::msg::{Body, empty_body};
 
-use amplify::Getters;
 use caret::caret_int;
 use derive_deftly::Deftly;
 use rand::{CryptoRng, Rng, RngCore};
@@ -134,14 +133,17 @@ impl Writeable for V1Nonce {
 }
 
 /// The v1 payload of a v1 [`ConfluxLink`] or [`ConfluxLinked`] message.
-#[derive(Debug, Clone, Deftly, Getters)]
+#[derive(Debug, Clone, Deftly, getset::Getters, getset::CopyGetters)]
 #[derive_deftly(HasMemoryCost)]
 pub struct V1LinkPayload {
     /// Random 256-bit secret, for associating two circuits together.
+    #[getset(get = "pub")]
     nonce: V1Nonce,
     /// The last sequence number sent.
+    #[getset(get_copy)]
     last_seqno_sent: u64,
     /// The last sequence number received.
+    #[getset(get_copy)]
     last_seqno_recv: u64,
     /// The desired UX properties.
     desired_ux: V1DesiredUx,
@@ -245,11 +247,11 @@ impl Body for V1LinkPayload {
 
 /// A `CONFLUX_SWITCH` message, sent from a sending endpoint when switching leg
 /// in an already linked circuit construction.
-#[derive(Clone, Debug, Deftly, Getters)]
+#[derive(Clone, Debug, Deftly, getset::CopyGetters)]
 #[derive_deftly(HasMemoryCost)]
 pub struct ConfluxSwitch {
     /// The relative sequence number.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     seqno: u32,
 }
 

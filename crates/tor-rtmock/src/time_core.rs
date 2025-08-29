@@ -8,7 +8,7 @@ use tor_rtcompat::{CoarseTimeProvider, RealCoarseTimeProvider};
 define_derive_deftly! {
     /// Derive getters for struct fields.
     ///
-    /// Like `amplify::Getters` but `pub(crate)`.
+    /// Like `getset::Getters` but `pub(crate)`.
     ///
     /// TODO add this feature to `amplify`.
     CrateGetters:

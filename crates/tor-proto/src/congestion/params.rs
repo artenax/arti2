@@ -11,17 +11,17 @@ use tor_units::Percentage;
 
 /// Fixed window parameters that are for the SENDME v0 world of fixed congestion window.
 #[non_exhaustive]
-#[derive(Builder, Copy, Clone, Debug, amplify::Getters)]
+#[derive(Builder, Copy, Clone, Debug, getset::CopyGetters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct FixedWindowParams {
     /// Circuit window starting point. From the "circwindow" param.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     circ_window_start: u16,
     /// Circuit window minimum value.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     circ_window_min: u16,
     /// Circuit window maximum value.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     circ_window_max: u16,
 }
 impl_standard_builder! { FixedWindowParams: !Deserialize + !Default }
@@ -29,25 +29,25 @@ impl_standard_builder! { FixedWindowParams: !Deserialize + !Default }
 /// Vegas queuing parameters taken from the consensus only which are different depending if the
 /// circuit is an onion service one, an exit or used for SBWS.
 #[non_exhaustive]
-#[derive(Copy, Clone, Debug, amplify::Getters)]
+#[derive(Copy, Clone, Debug, getset::CopyGetters)]
 pub struct VegasQueueParams {
     /// Alpha parameter is used to know when to increase the window.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     alpha: u32,
     /// Beta parameter is used to know when to decrease the window
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     beta: u32,
     /// Delta parameter is used as an indicator to drop the window to this considering the current
     /// BDP value and increment.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     delta: u32,
     /// Gamma parameter is only used in slow start and used to know when to increase or adjust the
     /// window with the BDP.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     gamma: u32,
     /// Parameter describe the RFC3742 'cap', after which congestion window increments are reduced.
     /// INT32_MAX disables
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     ss_cwnd_cap: u32,
 }
 
@@ -67,22 +67,24 @@ impl From<(u32, u32, u32, u32, u32)> for VegasQueueParams {
 
 /// Vegas algorithm parameters taken from the consensus.
 #[non_exhaustive]
-#[derive(Builder, Copy, Clone, Debug, amplify::Getters)]
+#[derive(Builder, Copy, Clone, Debug, getset::Getters, getset::CopyGetters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct VegasParams {
     /// The amount of queued cells that Vegas can tolerate before reacting.
+    #[getset(get = "pub")]
     cell_in_queue_params: VegasQueueParams,
     /// A hard-max on the congestion window in Slow Start.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     ss_cwnd_max: u32,
     /// This parameter defines the integer number of 'cc_sendme_inc' multiples
     /// of gap allowed between inflight and cwnd, to still declare the cwnd full.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     cwnd_full_gap: u32,
     /// This parameter defines a low watermark in percent.
+    #[getset(get = "pub")]
     cwnd_full_min_pct: Percentage<u32>,
     /// This parameter governs how often a cwnd must be full.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     cwnd_full_per_cwnd: u32,
 }
 impl_standard_builder! { VegasParams: !Deserialize + !Default }
@@ -129,7 +131,7 @@ caret_int! {
 /// The round trip estimator parameters taken from consensus and used to estimate the round trip
 /// time on a circuit.
 #[non_exhaustive]
-#[derive(Builder, Clone, Debug, amplify::Getters)]
+#[derive(Builder, Clone, Debug, getset::Getters, getset::CopyGetters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct RoundTripEstimatorParams {
     /// The "N" parameter in N-EWMA smoothing of RTT and/or bandwidth estimation, specified as a
@@ -137,17 +139,19 @@ pub struct RoundTripEstimatorParams {
     ///
     /// A percentage over 100% indicates smoothing with more than one congestion window's worth
     /// of SENDMEs.
+    #[getset(get = "pub")]
     ewma_cwnd_pct: Percentage<u32>,
     /// The maximum value of the "N" parameter in N-EWMA smoothing of RTT and/or bandwidth
     /// estimation.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     ewma_max: u32,
     /// The maximum value of the "N" parameter in N-EWMA smoothing of RTT and/or bandwidth
     /// estimation but in Slow Start.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     ewma_ss_max: u32,
     /// Describes a percentile average between min and current ewma, for use to reset RTT_min, when
     /// the congestion window hits cwnd_min.
+    #[getset(get = "pub")]
     rtt_reset_pct: Percentage<u32>,
 }
 impl_standard_builder! { RoundTripEstimatorParams: !Deserialize + !Default }
@@ -155,29 +159,30 @@ impl_standard_builder! { RoundTripEstimatorParams: !Deserialize + !Default }
 /// The parameters of what constitute a congestion window. This is used by all congestion control
 /// algorithms as in it is not specific to an algorithm.
 #[non_exhaustive]
-#[derive(Builder, Clone, Copy, Debug, amplify::Getters)]
+#[derive(Builder, Clone, Debug, getset::Getters, getset::CopyGetters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct CongestionWindowParams {
     /// Initial size of the congestion window.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     cwnd_init: u32,
     /// Percent of cwnd to increment by during slow start.
+    #[getset(get = "pub")]
     cwnd_inc_pct_ss: Percentage<u32>,
     /// Number of cells to increment cwnd by during steady state.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     cwnd_inc: u32,
     /// Number of times per congestion window to update based on congestion signals.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     cwnd_inc_rate: u32,
     /// Minimum congestion window (must be at least sendme_inc)
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     cwnd_min: u32,
     /// Maximum congestion window
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     cwnd_max: u32,
     /// The SENDME increment as in the number of cells to ACK with every SENDME. This is coming
     /// from the consensus and negotiated during circuit setup.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     sendme_inc: u32,
 }
 impl_standard_builder! { CongestionWindowParams: !Deserialize + !Default}
@@ -195,22 +200,29 @@ impl CongestionWindowParams {
 
 /// Global congestion control parameters taken from consensus. These are per-circuit.
 #[non_exhaustive]
-#[derive(Builder, Clone, Debug, amplify::Getters)]
+#[derive(Builder, Clone, Debug, getset::Getters, getset::MutGetters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct CongestionControlParams {
     /// The congestion control algorithm to use.
+    #[getset(get = "pub")]
     alg: Algorithm,
     /// Parameters to the fallback fixed-window algorithm, which we use
     /// when the one in `alg` is not supported by a given relay.
     ///
     /// It is put in here because by the time we do path selection, we don't have access to the
     /// consensus and so we have to keep our fallback ready.
+    #[getset(get)]
     fixed_window_params: FixedWindowParams,
     /// Congestion window parameters.
+<<<<<<< HEAD
     #[getter(as_mut)]
     #[getter(as_copy)]
+=======
+    #[getset(get = "pub", get_mut = "pub")]
+>>>>>>> 01b00ce02 (Replace amplify with getset in all crates)
     cwnd_params: CongestionWindowParams,
     /// RTT calculation parameters.
+    #[getset(get = "pub")]
     rtt_params: RoundTripEstimatorParams,
 }
 impl_standard_builder! { CongestionControlParams: !Deserialize + !Default }

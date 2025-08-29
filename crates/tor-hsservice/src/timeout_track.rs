@@ -799,7 +799,7 @@ mod test {
 
             let (tx, rx) = oneshot::channel();
 
-            runtime.mock_task().spawn_identified("timeout task", {
+            runtime.task().spawn_identified("timeout task", {
                 let runtime = runtime.clone();
                 async move {
                     wait_for_timeout(runtime.clone()).await;
@@ -807,7 +807,7 @@ mod test {
                 }
             });
 
-            runtime.mock_task().progress_until_stalled().await;
+            runtime.task().progress_until_stalled().await;
 
             if expected_wait == Some(Duration::ZERO) {
                 assert_eq!(poll!(rx), Poll::Ready(Ok(())));

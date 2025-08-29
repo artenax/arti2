@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 
-use amplify::Getters;
 use tor_basic_utils::PathExt;
 use tor_key_forge::KeystoreItemType;
 
@@ -10,13 +9,11 @@ use crate::{ArtiPath, KeystoreId, UnrecognizedEntry};
 
 /// A raw keystore entry descriptor.
 #[cfg_attr(feature = "onion-service-cli-extra", visibility::make(pub))]
-#[derive(Debug, Clone, PartialEq, derive_more::From, Getters)]
+#[derive(Debug, Clone, PartialEq, derive_more::From)]
 pub(crate) struct RawKeystoreEntry {
     /// The underlying keystore-specific raw identifier of the entry.
-    #[getter(skip)]
     raw_id: RawEntryId,
     /// The keystore this entry was found in.
-    #[getter(skip)]
     keystore_id: KeystoreId,
 }
 

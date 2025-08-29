@@ -45,16 +45,15 @@ struct ItemStreamPeeked<'s> {
 }
 
 /// An Item that has been lexed but not parsed
-#[derive(Debug, Clone, amplify::Getters)]
+#[derive(Debug, Clone, getset::CloneGetters, getset::CopyGetters)]
 pub struct UnparsedItem<'s> {
     /// The item's Keyword
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     keyword: KeywordRef<'s>,
     /// The Item's Arguments
-    #[getter(skip)]
     args: ArgumentStream<'s>,
     /// The Item's Object, if there was one
-    #[getter(as_clone)]
+    #[getset(get_clone = "pub")]
     object: Option<UnparsedObject<'s>>,
 }
 
@@ -70,13 +69,12 @@ pub struct ArgumentStream<'s> {
 }
 
 /// An Object that has been lexed but not parsed
-#[derive(Debug, Clone, amplify::Getters)]
+#[derive(Debug, Clone, getset::CopyGetters)]
 pub struct UnparsedObject<'s> {
     /// The Label
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     label: &'s str,
     /// The portion of the input document which is base64 data (and newlines)
-    #[getter(skip)]
     data_b64: &'s str,
 }
 

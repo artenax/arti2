@@ -42,10 +42,10 @@ pub trait SignatureItemParseable: Sized {
 // parser implementations, where lots of different strings are floating about.
 // In particular, the parser must save this value when it starts parsing
 // signatures and must then reuse it for later ones.
-#[derive(Copy, Debug, Clone, Eq, PartialEq, Hash, amplify::Getters)]
+#[derive(Copy, Debug, Clone, Eq, PartialEq, Hash, getset::CopyGetters)]
 pub struct SignedDocumentBody<'s> {
     /// The actual body as a string
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) body: &'s str,
 }
 
@@ -58,16 +58,14 @@ pub struct SignedDocumentBody<'s> {
 ///
 ///  * Extra information for calculating Irregular signatures.
 ///    Irregular signature Items can only be implemented within this crate.
-#[derive(Copy, Debug, Clone, Eq, PartialEq, Hash, amplify::Getters)]
+#[derive(Copy, Debug, Clone, Eq, PartialEq, Hash, getset::CopyGetters)]
 pub struct SignatureHashInputs<'s> {
     /// The Regular body
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) body: SignedDocumentBody<'s>,
     /// The signature item keyword and the following space
-    #[getter(skip)]
     pub(crate) signature_item_kw_spc: &'s str,
     /// The whole signature item keyword line not including the final newline
-    #[getter(skip)]
     pub(crate) signature_item_line: &'s str,
 }
 

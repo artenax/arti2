@@ -97,7 +97,6 @@ dangerous-expose-struct-fields = ["visible", "visibility", "__is_experimental"]
 __is_experimental = []
 
 [dependencies]
-amplify = { version = "4", default-features = false, features = ["derive"] }
 base64ct = { version = "1.5.1", features = ["alloc"] }
 bitflags = "2"
 cipher = { version = "0.4.1", features = ["zeroize"] }
@@ -106,6 +105,7 @@ derive_builder = { version = "0.11.2", package = "derive_builder_fork_arti" }
 derive_more = { version = "2.0.1", features = ["full"] }
 digest = "0.10.0"
 educe = "0.4.22"
+getset = "0.1"
 hex = "0.4"
 hex-literal = { version = "1.0", optional = true }
 humantime = "2"

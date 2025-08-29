@@ -10,7 +10,7 @@ use std::fs::DirEntry;
 use derive_more::{AsRef, Into};
 use fs_mistrust::{CheckedDir, Mistrust, MistrustBuilder};
 
-use amplify::Getters;
+use getset::Getters;
 use serde_with::DisplayFromStr;
 
 use tor_config::define_list_builder_helper;
@@ -97,6 +97,7 @@ fn build_static(
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct DirectoryKeyProvider {
     /// The path.
+    #[getset(get = "pub")]
     path: CfgPath,
 
     /// Configuration about which permissions we want to enforce on our files.

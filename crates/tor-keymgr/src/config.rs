@@ -3,8 +3,8 @@
 pub use tor_config::{ConfigBuildError, ConfigurationSource, Reconfigure};
 pub use tor_config_path::{CfgPath, CfgPathError};
 
-use amplify::Getters;
 use derive_builder::Builder;
+use getset::Getters;
 use serde::{Deserialize, Serialize};
 use tor_config::{
     BoolOrAuto, ExplicitOrAuto, define_list_builder_helper, impl_not_auto_value,
@@ -57,6 +57,7 @@ pub struct ArtiKeystoreConfig {
     /// It is an error to configure multiple keystores with the same [`KeystoreId`].
     #[builder(sub_builder)]
     #[builder_field_attr(serde(default))]
+    #[getset(get = "pub")]
     ctor: CTorKeystoreConfig,
 }
 
@@ -70,11 +71,13 @@ pub struct CTorKeystoreConfig {
     /// C Tor hidden service keystores.
     #[builder(default, sub_builder(fn_name = "build"), setter(custom))]
     #[builder_field_attr(serde(default))]
+    #[getset(get = "pub")]
     services: CTorServiceKeystoreConfigMap,
 
     /// C Tor hidden service client keystores.
     #[builder(default, sub_builder(fn_name = "build"))]
     #[builder_field_attr(serde(default))]
+    #[getset(get = "pub")]
     clients: CTorClientKeystoreConfigList,
 }
 
@@ -106,6 +109,7 @@ pub struct CTorServiceKeystoreConfig {
     ///     with the same [`KeystoreId`].
     ///   * have a corresponding arti hidden service configured in the
     ///     `[onion_services]` section with the same nickname
+    #[getset(get = "pub")]
     id: KeystoreId,
 
     /// The root directory of this keystore.
@@ -115,9 +119,11 @@ pub struct CTorServiceKeystoreConfig {
     /// (Note: if your service is running in restricted discovery mode, you must also set the
     /// `[[onion_services."<the nickname of your svc>".restricted_discovery.key_dirs]]`
     /// to `HiddenServiceDirectory/client_keys`).
+    #[getset(get = "pub")]
     path: PathBuf,
 
     /// The nickname of the service this keystore is to be used with.
+    #[getset(get = "pub")]
     nickname: HsNickname,
 }
 
@@ -230,6 +236,7 @@ pub struct CTorClientKeystoreConfig {
     ///
     /// Each keystore **must** have a unique identifier.
     /// It is an error to configure multiple keystores with the same [`KeystoreId`].
+    #[getset(get = "pub")]
     id: KeystoreId,
 
     /// The root directory of this keystore.
@@ -243,6 +250,7 @@ pub struct CTorClientKeystoreConfig {
     /// `<56-char-onion-addr-without-.onion-part>:descriptor:x25519:<x25519 private key in base32>`.
     ///
     /// Malformed files, and files that don't have the `.auth_private` extension, will be ignored.
+    #[getset(get = "pub")]
     path: PathBuf,
 }
 

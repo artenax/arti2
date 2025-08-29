@@ -352,7 +352,7 @@ mod tests {
 
             let start = runtime.now();
             runtime
-                .mock_task()
+                .task()
                 .spawn_identified(format!("retry runner task: {description}"), {
                     let retry_count = Arc::clone(&retry_count);
                     let errors = Arc::new(RwLock::new(errors));
@@ -381,16 +381,16 @@ mod tests {
             // upper limit for the number of retries, it's impossible to tell exactly how many
             // times the operation will be retried)
             for i in 1..=expected_run_count {
-                runtime.mock_task().progress_until_stalled().await;
+                runtime.task().progress_until_stalled().await;
                 // If our fallible_op is sleeping, advance the time until after it times out or
                 // finishes sleeping.
                 if let Some(sleep_for) = sleep_for {
                     runtime
-                        .mock_sleep()
+                        .get_sleep()
                         .advance(std::cmp::min(SINGLE_TIMEOUT, sleep_for));
                 }
-                runtime.mock_task().progress_until_stalled().await;
-                runtime.mock_sleep().advance(SHORT_DELAY);
+                runtime.task().progress_until_stalled().await;
+                runtime.get_sleep().advance(SHORT_DELAY);
                 assert_eq!(*retry_count.read().unwrap(), i);
             }
 
