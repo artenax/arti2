@@ -214,12 +214,7 @@ pub struct CongestionControlParams {
     #[getset(get)]
     fixed_window_params: FixedWindowParams,
     /// Congestion window parameters.
-<<<<<<< HEAD
-    #[getter(as_mut)]
-    #[getter(as_copy)]
-=======
     #[getset(get = "pub", get_mut = "pub")]
->>>>>>> 01b00ce02 (Replace amplify with getset in all crates)
     cwnd_params: CongestionWindowParams,
     /// RTT calculation parameters.
     #[getset(get = "pub")]
