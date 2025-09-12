@@ -828,7 +828,8 @@ pub(crate) async fn run_socks_proxy<R: Runtime>(
                             listening_on_addrs.push(addr);
                         }
                         #[cfg(unix)]
-                        Err(ref e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+                        Err(ref e) if [Some(libc::EAFNOSUPPORT), Some(libc::EADDRNOTAVAIL)]
+                            .contains(&e.raw_os_error()) => {
                             warn_report!(e, "Address family not supported {}", addr);
                         }
                         Err(ref e) => {

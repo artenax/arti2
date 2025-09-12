@@ -57,7 +57,8 @@ impl Listen {
     /// Each returned item is a list of `SocketAddr`,
     /// of which *at least one* must be successfully bound.
     /// It is OK if the others (up to all but one of them)
-    /// fail with `EAFNOSUPPORT` ("Address family not supported").
+    /// fail with `EAFNOSUPPORT` ("Address family not supported") or `EADDRNOTAVAIL`
+    /// ("Address not available").
     /// This allows handling of support, or non-support,
     /// for particular address families, eg IPv6 vs IPv4 localhost.
     /// Other errors (eg, `EADDRINUSE`) should always be treated as serious problems.
