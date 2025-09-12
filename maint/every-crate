@@ -55,11 +55,9 @@ x () {
     "$@"
 }
 
-
-
 for i in $(seq "$CHUNK_N" "$NUM_CHUNKS" "$(( NUM_CRATES-1 ))"); do
     echo ==================== "${CRATES[i]}" ====================
     # allow $CARGO to contain multiple words
-    # shellcheck disable=SC20086
-    x "$CARGO" test -p "${CRATES[i]}" --all-targets 
+    # shellcheck disable=SC2086
+    x $CARGO test -p "${CRATES[i]}" --all-targets
 done
