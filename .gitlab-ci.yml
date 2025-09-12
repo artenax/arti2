@@ -229,7 +229,7 @@ rust-recent:
   artifacts:
     paths:
       - artifacts
-    expire_in: 1 day
+    expire_in: 1 hours
 
 rust-latest:
   stage: test
@@ -275,7 +275,7 @@ rust-recent-arti-extra-features:
   artifacts:
     paths:
       - artifacts
-    expire_in: 1 day
+    expire_in: 1 hours
 
 rust-latest-arti-extra-features:
   stage: test
