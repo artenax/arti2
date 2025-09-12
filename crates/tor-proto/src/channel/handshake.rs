@@ -1,25 +1,22 @@
 //! Implementations for the channel handshake
 
-use asynchronous_codec;
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::io::{AsyncRead, AsyncWrite};
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
-use tor_cell::restricted_msg;
+use tor_cell::chancell::msg::AnyChanMsg;
 use tor_error::internal;
 
-use crate::channel::codec::{self, ChannelCodec, CodecError};
-use crate::channel::UniqId;
+use crate::channel::{ChannelType, UniqId, new_frame};
 use crate::memquota::ChannelAccount;
 use crate::util::skew::ClockSkew;
 use crate::{Error, Result};
-use tor_cell::chancell::{msg, ChanCmd, ChanMsg};
+use tor_cell::chancell::{AnyChanCell, ChanMsg, msg};
 use tor_rtcompat::{CoarseTimeProvider, SleepProvider, StreamOps};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use tor_bytes::Reader;
 use tor_linkspec::{ChanTarget, ChannelMethod, OwnedChanTargetBuilder, RelayIds};
 use tor_llcrypto as ll;
 use tor_llcrypto::pk::ed25519::Ed25519Identity;
@@ -27,15 +24,187 @@ use tor_llcrypto::pk::rsa::RsaIdentity;
 
 use digest::Digest;
 
-use super::CellFrame;
+use super::ChannelFrame;
 
 use tracing::{debug, trace};
 
 /// A list of the link protocols that we support.
 static LINK_PROTOCOLS: &[u16] = &[4, 5];
 
+/// Base trait that all handshake type must implement.
+///
+/// It has common code that all handshake share including getters for the channel frame for cell
+/// decoding/encoding and the unique ID used for logging.
+///
+/// It has both a recv() and send() function for the VERSIONS cell since every handshake must start
+/// with this cell to negotiate the link protocol version.
+trait ChannelBaseHandshake<T>
+where
+    T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
+{
+    /// Return a mutable reference to the channel frame.
+    fn framed_tls(&mut self) -> &mut ChannelFrame<T>;
+    /// Return a reference to the unique ID of this handshake.
+    fn unique_id(&self) -> &UniqId;
+
+    /// Send a [msg::Versions] cell.
+    ///
+    /// A tuple is returned that is respectively the instant and wallclock of the send.
+    async fn send_versions_cell<F>(
+        &mut self,
+        now_fn: F,
+    ) -> Result<(coarsetime::Instant, SystemTime)>
+    where
+        F: FnOnce() -> SystemTime,
+    {
+        trace!(stream_id = %self.unique_id(), "sending versions");
+        // Send versions cell
+        let version_cell = AnyChanCell::new(
+            None,
+            msg::Versions::new(LINK_PROTOCOLS)
+                .map_err(|e| Error::from_cell_enc(e, "versions message"))?
+                .into(),
+        );
+        self.framed_tls().send(version_cell).await?;
+        Ok((
+            coarsetime::Instant::now(), // Flushed at instant
+            now_fn(),                   // Flushed at wallclock
+        ))
+    }
+
+    /// Receive a [msg::Versions] cell.
+    ///
+    /// The negotiated link protocol is returned, and also recorded in the underlying channel
+    /// frame. This automatically transitions the frame into the "Handshake" state of the
+    /// underlying cell handler. In other words, once the link protocol version is negotiated, the
+    /// handler can encode and decode cells for that version in order to continue the handshake.
+    async fn recv_versions_cell(&mut self) -> Result<u16> {
+        // Get versions cell.
+        // Get versions cell.
+        trace!(stream_id = %self.unique_id(), "waiting for versions");
+        // This can be None if we've reached EOF or any type of I/O error on the underlying TCP or
+        // TLS stream. Either case, it is unexpected.
+        let Some(cell) = self.framed_tls().next().await.transpose()? else {
+            return Err(Error::ChanIoErr(Arc::new(std::io::Error::from(
+                std::io::ErrorKind::UnexpectedEof,
+            ))));
+        };
+        let AnyChanMsg::Versions(their_versions) = cell.into_circid_and_msg().1 else {
+            return Err(Error::from(internal!(
+                "Unexpected cell, expecting a VERSIONS cell",
+            )));
+        };
+        trace!(stream_id = %self.unique_id(), "received their VERSIONS {:?}", their_versions);
+
+        // Determine which link protocol we negotiated.
+        let link_protocol = their_versions
+            .best_shared_link_protocol(LINK_PROTOCOLS)
+            .ok_or_else(|| Error::HandshakeProto("No shared link protocols".into()))?;
+        trace!(stream_id = %self.unique_id(), "negotiated version {}", link_protocol);
+
+        // Set the link protocol into our channel frame.
+        self.framed_tls()
+            .codec_mut()
+            .set_link_version(link_protocol)?;
+        Ok(link_protocol)
+    }
+}
+
+/// Handshake initiator base trait. All initiator handshake should implement this trait in order to
+/// enjoy the helper functions.
+///
+/// It requires the base handshake trait to be implement for access to the base getters.
+trait ChannelInitiatorHandshake<T>: ChannelBaseHandshake<T>
+where
+    T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
+{
+    /// Return true iff this handshake is expecting to receive an AUTH_CHALLENGE from the
+    /// responder. As a handshake initiator, we always know if we expect one or not. A client or
+    /// bridge do not authenticate with the responder while relays will always do.
+    fn is_expecting_auth_challenge(&self) -> bool;
+
+    /// As an initiator, we are expecting the responder's cells which are (not in that order):
+    ///     - [msg::AuthChallenge], [msg::Certs], [msg::Netinfo]
+    ///
+    /// Any duplicate, missing cell or unexpected results in a protocol level error.
+    ///
+    /// This returns the [msg::AuthChallenge], [msg::Certs] and [msg::Netinfo] cells along the
+    /// instant when the netinfo cell was received. This is needed for the clock skew calculation.
+    async fn recv_cells_from_responder(
+        &mut self,
+    ) -> Result<(
+        Option<msg::AuthChallenge>,
+        msg::Certs,
+        (msg::Netinfo, coarsetime::Instant),
+    )> {
+        let mut auth_challenge_cell: Option<msg::AuthChallenge> = None;
+        let mut certs_cell: Option<msg::Certs> = None;
+        let mut netinfo_cell: Option<(msg::Netinfo, coarsetime::Instant)> = None;
+
+        // IMPORTANT: Protocol wise, we MUST only allow one single cell of each type for a valid
+        // handshake. Any duplicates lead to a failure. They can arrive in any order unfortunately.
+
+        // Read until we have the netinfo cell.
+        while let Some(cell) = self.framed_tls().next().await.transpose()? {
+            use super::AnyChanMsg::*;
+            let (_, m) = cell.into_circid_and_msg();
+            trace!(stream_id = %self.unique_id(), "received a {} cell.", m.cmd());
+            match m {
+                // Ignore the padding. Only VPADDING cell can be sent during handshaking.
+                Vpadding(_) => (),
+                // Clients don't care about AuthChallenge
+                AuthChallenge(ac) => {
+                    if auth_challenge_cell.replace(ac).is_some() {
+                        return Err(Error::HandshakeProto(
+                            "Duplicate AUTH_CHALLENGE cell".into(),
+                        ));
+                    }
+                }
+                Certs(c) => {
+                    if certs_cell.replace(c).is_some() {
+                        return Err(Error::HandshakeProto("Duplicate CERTS cell".into()));
+                    }
+                }
+                Netinfo(n) => {
+                    if netinfo_cell.is_some() {
+                        // This should be impossible, since we would
+                        // exit this loop on the first netinfo cell.
+                        return Err(Error::from(internal!(
+                            "Somehow tried to record a duplicate NETINFO cell"
+                        )));
+                    }
+                    netinfo_cell = Some((n, coarsetime::Instant::now()));
+                    break;
+                }
+                // This should not happen because the ChannelFrame makes sure that only allowed cell on
+                // the channel are decoded. However, Rust wants us to consider all AnyChanMsg.
+                _ => {
+                    return Err(Error::from(internal!(
+                        "Unexpected cell during initiator handshake: {m:?}"
+                    )));
+                }
+            }
+        }
+
+        // Missing any of the above means we are not connected to a Relay and so we abort the
+        // handshake protocol.
+        let Some((netinfo, netinfo_rcvd_at)) = netinfo_cell else {
+            return Err(Error::HandshakeProto("Missing NETINFO cell".into()));
+        };
+        let Some(certs) = certs_cell else {
+            return Err(Error::HandshakeProto("Missing CERTS cell".into()));
+        };
+        // If we plan to authenticate, we require an AUTH_CHALLENGE cell from the responder.
+        if self.is_expecting_auth_challenge() && auth_challenge_cell.is_none() {
+            return Err(Error::HandshakeProto("Missing AUTH_CHALLENGE cell".into()));
+        };
+
+        Ok((auth_challenge_cell, certs, (netinfo, netinfo_rcvd_at)))
+    }
+}
+
 /// A raw client channel on which nothing has been done.
-pub struct OutboundClientHandshake<
+pub struct ClientInitiatorHandshake<
     T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
     S: CoarseTimeProvider + SleepProvider,
 > {
@@ -45,17 +214,43 @@ pub struct OutboundClientHandshake<
     /// Memory quota account
     memquota: ChannelAccount,
 
-    /// Underlying TLS stream.
+    /// Cell encoder/decoder wrapping the underlying TLS stream
     ///
     /// (We don't enforce that this is actually TLS, but if it isn't, the
     /// connection won't be secure.)
-    tls: T,
+    framed_tls: ChannelFrame<T>,
 
     /// Declared target method for this channel, if any.
     target_method: Option<ChannelMethod>,
 
     /// Logging identifier for this stream.  (Used for logging only.)
     unique_id: UniqId,
+}
+
+/// Implement the base channel handshake trait.
+impl<T, S> ChannelBaseHandshake<T> for ClientInitiatorHandshake<T, S>
+where
+    T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
+    S: CoarseTimeProvider + SleepProvider,
+{
+    fn framed_tls(&mut self) -> &mut ChannelFrame<T> {
+        &mut self.framed_tls
+    }
+    fn unique_id(&self) -> &UniqId {
+        &self.unique_id
+    }
+}
+
+/// Implement the initiator channel handshake trait.
+impl<T, S> ChannelInitiatorHandshake<T> for ClientInitiatorHandshake<T, S>
+where
+    T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
+    S: CoarseTimeProvider + SleepProvider,
+{
+    fn is_expecting_auth_challenge(&self) -> bool {
+        // Client never authenticate with a responder, only relay do.
+        false
+    }
 }
 
 /// A client channel on which versions have been negotiated and the
@@ -65,6 +260,8 @@ pub struct UnverifiedChannel<
     T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
     S: CoarseTimeProvider + SleepProvider,
 > {
+    /// Indicate what type of channel this is.
+    channel_type: ChannelType,
     /// Runtime handle (insofar as we need it)
     sleep_prov: S,
     /// Memory quota account
@@ -72,7 +269,7 @@ pub struct UnverifiedChannel<
     /// The negotiated link protocol.  Must be a member of LINK_PROTOCOLS
     link_protocol: u16,
     /// The Source+Sink on which we're reading and writing cells.
-    tls: CellFrame<T>,
+    framed_tls: ChannelFrame<T>,
     /// The certs cell that we got from the relay.
     certs_cell: msg::Certs,
     /// Declared target method for this channel, if any.
@@ -100,6 +297,8 @@ pub struct VerifiedChannel<
     T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
     S: CoarseTimeProvider + SleepProvider,
 > {
+    /// Indicate what type of channel this is.
+    channel_type: ChannelType,
     /// Runtime handle (insofar as we need it)
     sleep_prov: S,
     /// Memory quota account
@@ -107,7 +306,7 @@ pub struct VerifiedChannel<
     /// The negotiated link protocol.
     link_protocol: u16,
     /// The Source+Sink on which we're reading and writing cells.
-    tls: CellFrame<T>,
+    framed_tls: ChannelFrame<T>,
     /// Declared target method for this stream, if any.
     target_method: Option<ChannelMethod>,
     /// Logging identifier for this stream.  (Used for logging only.)
@@ -120,42 +319,10 @@ pub struct VerifiedChannel<
     clock_skew: ClockSkew,
 }
 
-restricted_msg! {
-    /// A restricted subset of ChanMsg that can arrive during a handshake.
-    ///
-    /// (These are messages that come after the VERSIONS cell, up to and
-    /// including the NETINFO.)
-    ///
-    /// Note that unrecognized message types (ones not yet implemented in Arti)
-    /// cause an error, rather than getting ignored.  That's intentional: if we
-    /// start to allow them in the future, we should negotiate a new Channel
-    /// protocol for the VERSIONS cell.
-    #[derive(Clone,Debug)]
-    enum HandshakeMsg : ChanMsg {
-        Padding,
-        Vpadding,
-        AuthChallenge,
-        Certs,
-        Netinfo
-    }
-}
-
-/// Convert a CodecError to an Error, under the context that it occurs while
-/// doing a channel handshake.
-fn codec_err_to_handshake(err: CodecError) -> Error {
-    match err {
-        CodecError::Io(e) => Error::HandshakeIoErr(Arc::new(e)),
-        CodecError::DecCell(e) => {
-            Error::HandshakeProto(format!("Invalid cell on handshake: {}", e))
-        }
-        CodecError::EncCell(e) => Error::from_cell_enc(e, "cell on handshake"),
-    }
-}
-
 impl<
-        T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
-        S: CoarseTimeProvider + SleepProvider,
-    > OutboundClientHandshake<T, S>
+    T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
+    S: CoarseTimeProvider + SleepProvider,
+> ClientInitiatorHandshake<T, S>
 {
     /// Construct a new OutboundClientHandshake.
     pub(crate) fn new(
@@ -165,7 +332,7 @@ impl<
         memquota: ChannelAccount,
     ) -> Self {
         Self {
-            tls,
+            framed_tls: new_frame(tls, ChannelType::ClientInitiator),
             target_method,
             unique_id: UniqId::new(),
             sleep_prov,
@@ -182,11 +349,6 @@ impl<
     where
         F: FnOnce() -> SystemTime,
     {
-        /// Helper: wrap an IoError as a HandshakeIoErr.
-        fn io_err_to_handshake(err: std::io::Error) -> Error {
-            Error::HandshakeIoErr(Arc::new(err))
-        }
-
         match &self.target_method {
             Some(method) => debug!(
                 stream_id = %self.unique_id,
@@ -195,152 +357,47 @@ impl<
             ),
             None => debug!(stream_id = %self.unique_id, "starting Tor handshake"),
         }
-        trace!(stream_id = %self.unique_id, "sending versions");
-        // Send versions cell
-        {
-            let my_versions = msg::Versions::new(LINK_PROTOCOLS)
-                .map_err(|e| Error::from_cell_enc(e, "versions message"))?;
-            self.tls
-                .write_all(
-                    &my_versions
-                        .encode_for_handshake()
-                        .map_err(|e| Error::from_cell_enc(e.into(), "versions message"))?,
-                )
-                .await
-                .map_err(io_err_to_handshake)?;
-            self.tls.flush().await.map_err(io_err_to_handshake)?;
-        }
-        let versions_flushed_at = coarsetime::Instant::now();
-        let versions_flushed_wallclock = now_fn();
+        // Send versions cell.
+        let (versions_flushed_at, versions_flushed_wallclock) =
+            self.send_versions_cell(now_fn).await?;
 
-        // Get versions cell.
-        trace!(stream_id = %self.unique_id, "waiting for versions");
-        let their_versions: msg::Versions = {
-            // TODO: this could be turned into another function, I suppose.
-            let mut hdr = [0_u8; 5];
-            let not_relay = || {
-                Err(Error::HandshakeProto(
-                    "Doesn't seem to be a tor relay".into(),
-                ))
-            };
-            match self.tls.read_exact(&mut hdr).await {
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return not_relay(),
-                otherwise => otherwise,
-            }
-            .map_err(io_err_to_handshake)?;
-            if hdr[0..3] != [0, 0, ChanCmd::VERSIONS.into()] {
-                return not_relay();
-            }
-            let msglen = u16::from_be_bytes(
-                hdr[3..5]
-                    .try_into()
-                    .expect("Two-byte field was not two bytes!?"),
-            );
-            let mut msg = vec![0; msglen as usize];
-            self.tls
-                .read_exact(&mut msg)
-                .await
-                .map_err(io_err_to_handshake)?;
-            let mut reader = Reader::from_slice(&msg);
-            reader
-                .extract()
-                .map_err(|e| Error::from_bytes_err(e, "versions cell"))?
-        };
-        trace!(stream_id = %self.unique_id, "received {:?}", their_versions);
+        // Receive versions cell.
+        let link_protocol = self.recv_versions_cell().await?;
 
-        // Determine which link protocol we negotiated.
-        let link_protocol = their_versions
-            .best_shared_link_protocol(LINK_PROTOCOLS)
-            .ok_or_else(|| Error::HandshakeProto("No shared link protocols".into()))?;
-        trace!(stream_id = %self.unique_id, "negotiated version {}", link_protocol);
+        // Receive the relay responder cells. Ignore the AUTH_CHALLENGE cell, we don't need it as
+        // we are not authenticating with our responder because we are a client.
+        let (_, certs_cell, (netinfo_cell, netinfo_rcvd_at)) =
+            self.recv_cells_from_responder().await?;
 
-        // Now we can switch to using a "Framed". We can ignore the
-        // AsyncRead/AsyncWrite aspects of the tls, and just treat it
-        // as a stream and a sink for cells.
-        let codec = ChannelCodec::<HandshakeMsg, HandshakeMsg>::new(link_protocol);
-        let mut tls = asynchronous_codec::Framed::new(self.tls, codec);
+        // Get the clock skew.
+        let clock_skew = unauthenticated_clock_skew(
+            &netinfo_cell,
+            netinfo_rcvd_at,
+            versions_flushed_at,
+            versions_flushed_wallclock,
+        );
 
-        // Read until we have the netinfo cells.
-        let mut certs: Option<msg::Certs> = None;
-        let mut netinfo: Option<(msg::Netinfo, coarsetime::Instant)> = None;
-        let mut seen_authchallenge = false;
+        trace!(stream_id = %self.unique_id, "received handshake, ready to verify.");
 
-        // Loop: reject duplicate and unexpected cells
-        trace!(stream_id = %self.unique_id, "waiting for rest of handshake.");
-        while let Some(m) = tls.next().await {
-            use HandshakeMsg::*;
-            let (_, m) = m.map_err(codec_err_to_handshake)?.into_circid_and_msg();
-            trace!(stream_id = %self.unique_id, "received a {} cell.", m.cmd());
-            match m {
-                // Are these technically allowed?
-                Padding(_) | Vpadding(_) => (),
-                // Clients don't care about AuthChallenge
-                AuthChallenge(_) => {
-                    if seen_authchallenge {
-                        return Err(Error::HandshakeProto("Duplicate authchallenge cell".into()));
-                    }
-                    seen_authchallenge = true;
-                }
-                Certs(c) => {
-                    if certs.is_some() {
-                        return Err(Error::HandshakeProto("Duplicate certs cell".into()));
-                    }
-                    certs = Some(c);
-                }
-                Netinfo(n) => {
-                    if netinfo.is_some() {
-                        // This should be impossible, since we would
-                        // exit this loop on the first netinfo cell.
-                        return Err(Error::from(internal!(
-                            "Somehow tried to record a duplicate NETINFO cell"
-                        )));
-                    }
-                    netinfo = Some((n, coarsetime::Instant::now()));
-                    break;
-                }
-            }
-        }
-
-        // If we have certs and netinfo, we can finish authenticating.
-        match (certs, netinfo) {
-            (Some(_), None) => Err(Error::HandshakeProto(
-                "Missing netinfo or closed stream".into(),
-            )),
-            (None, _) => Err(Error::HandshakeProto("Missing certs cell".into())),
-            (Some(certs_cell), Some((netinfo_cell, netinfo_rcvd_at))) => {
-                trace!(stream_id = %self.unique_id, "received handshake, ready to verify.");
-                // Try to compute our clock skew.  It won't be authenticated
-                // yet, since we haven't checked the certificates.
-                let clock_skew = if let Some(netinfo_timestamp) = netinfo_cell.timestamp() {
-                    let delay = netinfo_rcvd_at - versions_flushed_at;
-                    ClockSkew::from_handshake_timestamps(
-                        versions_flushed_wallclock,
-                        netinfo_timestamp,
-                        delay.into(),
-                    )
-                } else {
-                    ClockSkew::None
-                };
-                Ok(UnverifiedChannel {
-                    link_protocol,
-                    tls: codec::change_message_types(tls),
-                    certs_cell,
-                    netinfo_cell,
-                    clock_skew,
-                    target_method: self.target_method.take(),
-                    unique_id: self.unique_id,
-                    sleep_prov: self.sleep_prov.clone(),
-                    memquota: self.memquota.clone(),
-                })
-            }
-        }
+        Ok(UnverifiedChannel {
+            channel_type: ChannelType::ClientInitiator,
+            link_protocol,
+            framed_tls: self.framed_tls,
+            certs_cell,
+            netinfo_cell,
+            clock_skew,
+            target_method: self.target_method.take(),
+            unique_id: self.unique_id,
+            sleep_prov: self.sleep_prov.clone(),
+            memquota: self.memquota.clone(),
+        })
     }
 }
 
 impl<
-        T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
-        S: CoarseTimeProvider + SleepProvider,
-    > UnverifiedChannel<T, S>
+    T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
+    S: CoarseTimeProvider + SleepProvider,
+> UnverifiedChannel<T, S>
 {
     /// Return the reported clock skew from this handshake.
     ///
@@ -582,8 +639,9 @@ impl<
         rsa_cert_timeliness?;
 
         Ok(VerifiedChannel {
+            channel_type: self.channel_type,
             link_protocol: self.link_protocol,
-            tls: self.tls,
+            framed_tls: self.framed_tls,
             unique_id: self.unique_id,
             target_method: self.target_method,
             ed25519_id: *identity_key,
@@ -596,9 +654,9 @@ impl<
 }
 
 impl<
-        T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
-        S: CoarseTimeProvider + SleepProvider,
-    > VerifiedChannel<T, S>
+    T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
+    S: CoarseTimeProvider + SleepProvider,
+> VerifiedChannel<T, S>
 {
     /// Send a 'Netinfo' message to the relay to finish the handshake,
     /// and create an open channel and reactor.
@@ -627,10 +685,10 @@ impl<
             .and_then(|addrs| addrs.first())
             .map(SocketAddr::ip);
         let netinfo = msg::Netinfo::from_client(peer_ip);
-        self.tls
-            .send(netinfo.into())
-            .await
-            .map_err(codec_err_to_handshake)?;
+        self.framed_tls.send(netinfo.into()).await?;
+
+        // We have finalized the handshake, move our codec to Open.
+        self.framed_tls.codec_mut().set_open()?;
 
         debug!(
             stream_id = %self.unique_id,
@@ -644,8 +702,8 @@ impl<
         // Note: this is necessary because after `StreamExit::split()`,
         // we no longer have access to the underlying stream
         // or its StreamOps implementation.
-        let stream_ops = self.tls.new_handle();
-        let (tls_sink, tls_stream) = self.tls.split();
+        let stream_ops = self.framed_tls.new_handle();
+        let (tls_sink, tls_stream) = self.framed_tls.split();
 
         let mut peer_builder = OwnedChanTargetBuilder::default();
         if let Some(target_method) = self.target_method {
@@ -661,6 +719,7 @@ impl<
             .expect("OwnedChanTarget builder failed");
 
         super::Channel::new(
+            self.channel_type,
             self.link_protocol,
             Box::new(tls_sink),
             Box::new(tls_stream),
@@ -674,6 +733,31 @@ impl<
     }
 }
 
+/// Helper: Calculate a clock skew from the [msg::Netinfo] cell data and the time at which we sent
+/// the [msg::Versions] cell.
+///
+/// This is unauthenticated as in not validated with the certificates. Before using it, make sure
+/// that you have authenticated the other party.
+fn unauthenticated_clock_skew(
+    netinfo_cell: &msg::Netinfo,
+    netinfo_rcvd_at: coarsetime::Instant,
+    versions_flushed_at: coarsetime::Instant,
+    versions_flushed_wallclock: SystemTime,
+) -> ClockSkew {
+    // Try to compute our clock skew.  It won't be authenticated yet, since we haven't checked
+    // the certificates.
+    if let Some(netinfo_timestamp) = netinfo_cell.timestamp() {
+        let delay = netinfo_rcvd_at - versions_flushed_at;
+        ClockSkew::from_handshake_timestamps(
+            versions_flushed_wallclock,
+            netinfo_timestamp,
+            delay.into(),
+        )
+    } else {
+        ClockSkew::None
+    }
+}
+
 #[cfg(test)]
 pub(super) mod test {
     #![allow(clippy::unwrap_used)]
@@ -682,9 +766,9 @@ pub(super) mod test {
     use std::time::{Duration, SystemTime};
 
     use super::*;
-    use crate::channel::codec::test::MsgBuf;
-    use crate::util::fake_mq;
     use crate::Result;
+    use crate::channel::handler::test::MsgBuf;
+    use crate::util::fake_mq;
     use tor_cell::chancell::msg;
     use tor_linkspec::OwnedChanTarget;
     use tor_rtcompat::{PreferredRuntime, Runtime};
@@ -734,14 +818,14 @@ pub(super) mod test {
             // netinfo cell -- quite minimal.
             add_padded(&mut buf, NETINFO_PREFIX);
             let mb = MsgBuf::new(&buf[..]);
-            let handshake = OutboundClientHandshake::new(mb, None, rt.clone(), fake_mq());
+            let handshake = ClientInitiatorHandshake::new(mb, None, rt.clone(), fake_mq());
             let unverified = handshake.connect(|| now).await?;
 
             assert_eq!(unverified.link_protocol, 5);
             // No timestamp in the NETINFO, so no skew.
             assert_eq!(unverified.clock_skew(), ClockSkew::None);
 
-            // Try again with an authchallenge cell and some padding.
+            // Try again with some padding.
             let mut buf = Vec::new();
             buf.extend_from_slice(VERSIONS);
             buf.extend_from_slice(NOCERTS);
@@ -750,7 +834,7 @@ pub(super) mod test {
             buf.extend_from_slice(VPADDING);
             add_padded(&mut buf, NETINFO_PREFIX_WITH_TIME);
             let mb = MsgBuf::new(&buf[..]);
-            let handshake = OutboundClientHandshake::new(mb, None, rt.clone(), fake_mq());
+            let handshake = ClientInitiatorHandshake::new(mb, None, rt.clone(), fake_mq());
             let unverified = handshake.connect(|| now).await?;
             // Correct timestamp in the NETINFO, so no skew.
             assert_eq!(unverified.clock_skew(), ClockSkew::None);
@@ -758,7 +842,7 @@ pub(super) mod test {
             // Now pretend our clock is fast.
             let now2 = now + Duration::from_secs(3600);
             let mb = MsgBuf::new(&buf[..]);
-            let handshake = OutboundClientHandshake::new(mb, None, rt.clone(), fake_mq());
+            let handshake = ClientInitiatorHandshake::new(mb, None, rt.clone(), fake_mq());
             let unverified = handshake.connect(|| now2).await?;
             assert_eq!(
                 unverified.clock_skew(),
@@ -774,7 +858,7 @@ pub(super) mod test {
         S: CoarseTimeProvider + SleepProvider,
     {
         let mb = MsgBuf::new(input);
-        let handshake = OutboundClientHandshake::new(mb, None, sleep_prov, fake_mq());
+        let handshake = ClientInitiatorHandshake::new(mb, None, sleep_prov, fake_mq());
         handshake.connect(SystemTime::now).await.err().unwrap()
     }
 
@@ -785,7 +869,7 @@ pub(super) mod test {
             assert!(matches!(err, Error::HandshakeProto(_)));
             assert_eq!(
                 format!("{}", err),
-                "Handshake protocol violation: Doesn't seem to be a tor relay"
+                "Handshake protocol violation: Invalid CircID in variable cell"
             );
 
             let err = connect_err(&hex!("0000 07 0004 1234 ffff")[..], rt.clone()).await;
@@ -805,7 +889,7 @@ pub(super) mod test {
             // Here's a certs cell that will fail.
             buf.extend_from_slice(&hex!("00000000 81 0001 01")[..]);
             let err = connect_err(buf, rt.clone()).await;
-            assert!(matches!(err, Error::HandshakeProto(_)));
+            assert!(matches!(err, Error::HandshakeProto { .. }));
         });
     }
 
@@ -821,7 +905,7 @@ pub(super) mod test {
             assert!(matches!(err, Error::HandshakeProto(_)));
             assert_eq!(
                 format!("{}", err),
-                "Handshake protocol violation: Duplicate certs cell"
+                "Handshake protocol violation: Duplicate CERTS cell"
             );
 
             let mut buf = Vec::new();
@@ -834,7 +918,7 @@ pub(super) mod test {
             assert!(matches!(err, Error::HandshakeProto(_)));
             assert_eq!(
                 format!("{}", err),
-                "Handshake protocol violation: Duplicate authchallenge cell"
+                "Handshake protocol violation: Duplicate AUTH_CHALLENGE cell"
             );
         });
     }
@@ -849,7 +933,7 @@ pub(super) mod test {
             assert!(matches!(err, Error::HandshakeProto(_)));
             assert_eq!(
                 format!("{}", err),
-                "Handshake protocol violation: Missing certs cell"
+                "Handshake protocol violation: Missing CERTS cell"
             );
         });
     }
@@ -864,7 +948,7 @@ pub(super) mod test {
             assert!(matches!(err, Error::HandshakeProto(_)));
             assert_eq!(
                 format!("{}", err),
-                "Handshake protocol violation: Missing netinfo or closed stream"
+                "Handshake protocol violation: Missing NETINFO cell"
             );
         });
     }
@@ -880,7 +964,7 @@ pub(super) mod test {
             assert!(matches!(err, Error::HandshakeProto(_)));
             assert_eq!(
                 format!("{}", err),
-                "Handshake protocol violation: Invalid cell on handshake: Error while parsing channel cell"
+                "Handshake protocol violation: Decoding cell error: Error while parsing channel cell: Bad object: Unexpected command CREATE in HandshakeRelayResponderMsg"
             );
         });
     }
@@ -891,10 +975,14 @@ pub(super) mod test {
     {
         let localhost = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let netinfo_cell = msg::Netinfo::from_client(Some(localhost));
+        let mut framed_tls = new_frame(MsgBuf::new(&b""[..]), ChannelType::ClientInitiator);
+        let _ = framed_tls.codec_mut().set_link_version(4);
+        let _ = framed_tls.codec_mut().set_open();
         let clock_skew = ClockSkew::None;
         UnverifiedChannel {
+            channel_type: ChannelType::ClientInitiator,
             link_protocol: 4,
-            tls: asynchronous_codec::Framed::new(MsgBuf::new(&b""[..]), ChannelCodec::new(4)),
+            framed_tls,
             certs_cell: certs,
             netinfo_cell,
             clock_skew,
@@ -1133,12 +1221,20 @@ pub(super) mod test {
     mod certs {
         use hex_literal::hex;
 
-        pub(crate) const CERT_T2: &[u8] = &hex!("308201B930820122A0030201020208607C28BE6C390943300D06092A864886F70D01010B0500301F311D301B06035504030C147777772E74636A76356B766A646472322E636F6D301E170D3230303831303030303030305A170D3231303831303030303030305A301F311D301B06035504030C147777772E74636A76356B766A646472322E636F6D30819F300D06092A864886F70D010101050003818D0030818902818100D38B1E6CEB946E0DB0751F4CBACE3DCB9688B6C25304227B4710C35AFB73627E50500F5913E158B621802612D1C75827003703338375237552EB3CD3C12F6AB3604E60C1A2D26BB1FBAD206FF023969A90909D6A65A5458A5312C26EBD3A3DAD30302D4515CDCD264146AC18E6FC60A04BD3EC327F04294D96BA5AA25B464C3F0203010001300D06092A864886F70D01010B0500038181003BCE561EA7F95CC00B78AAB5D69573FF301C282A751D4A651921D042F1BECDBA24D918A6D8A5E138DC07BBA0B335478AE37ABD2C93A93932442AE9084329E846170FE0FC4A50AAFC804F311CC3CA4F41D845A7BA5901CBBC3E021E9794AAC70CE1F37B0A951592DB1B64F2B4AFB81AE52DBD9B6FEDE96A5FB8125EB6251EE50A");
+        pub(crate) const CERT_T2: &[u8] = &hex!(
+            "308201B930820122A0030201020208607C28BE6C390943300D06092A864886F70D01010B0500301F311D301B06035504030C147777772E74636A76356B766A646472322E636F6D301E170D3230303831303030303030305A170D3231303831303030303030305A301F311D301B06035504030C147777772E74636A76356B766A646472322E636F6D30819F300D06092A864886F70D010101050003818D0030818902818100D38B1E6CEB946E0DB0751F4CBACE3DCB9688B6C25304227B4710C35AFB73627E50500F5913E158B621802612D1C75827003703338375237552EB3CD3C12F6AB3604E60C1A2D26BB1FBAD206FF023969A90909D6A65A5458A5312C26EBD3A3DAD30302D4515CDCD264146AC18E6FC60A04BD3EC327F04294D96BA5AA25B464C3F0203010001300D06092A864886F70D01010B0500038181003BCE561EA7F95CC00B78AAB5D69573FF301C282A751D4A651921D042F1BECDBA24D918A6D8A5E138DC07BBA0B335478AE37ABD2C93A93932442AE9084329E846170FE0FC4A50AAFC804F311CC3CA4F41D845A7BA5901CBBC3E021E9794AAC70CE1F37B0A951592DB1B64F2B4AFB81AE52DBD9B6FEDE96A5FB8125EB6251EE50A"
+        );
 
-        pub(crate) const CERT_T4: &[u8] = &hex!("01040006CC2A01F82294B866A31F01FC5D0DA8572850A9B929545C3266558D7D2316E3B74172B00100200400DCB604DB2034B00FD16986D4ADB9D16B21CB4E4457A33DEC0F538903683E96E9FF1A5203FA27F86EF7528D89A0845D2520166E340754FFEA2AAE0F612B7CE5DA094A0236CDAC45034B0B6842C18E7F6B51B93A3CF7E60663B8AD061C30A62602");
-        pub(crate) const CERT_T5: &[u8] = &hex!("01050006C98A03B4FD606B64E4CBD466B8D76CB131069BAE6F3AA1878857C9F624E31D77A799B8007173E5F8068431D0D3F5EE16B4C9FFD59DF373E152A87281BAE744AA5FCF72171BF4B27C4E8FC1C6A9FC5CA11058BC49647063D7903CFD9F512F89099B27BC0C");
+        pub(crate) const CERT_T4: &[u8] = &hex!(
+            "01040006CC2A01F82294B866A31F01FC5D0DA8572850A9B929545C3266558D7D2316E3B74172B00100200400DCB604DB2034B00FD16986D4ADB9D16B21CB4E4457A33DEC0F538903683E96E9FF1A5203FA27F86EF7528D89A0845D2520166E340754FFEA2AAE0F612B7CE5DA094A0236CDAC45034B0B6842C18E7F6B51B93A3CF7E60663B8AD061C30A62602"
+        );
+        pub(crate) const CERT_T5: &[u8] = &hex!(
+            "01050006C98A03B4FD606B64E4CBD466B8D76CB131069BAE6F3AA1878857C9F624E31D77A799B8007173E5F8068431D0D3F5EE16B4C9FFD59DF373E152A87281BAE744AA5FCF72171BF4B27C4E8FC1C6A9FC5CA11058BC49647063D7903CFD9F512F89099B27BC0C"
+        );
 
-        pub(crate) const CERT_T7: &[u8] = &hex!("DCB604DB2034B00FD16986D4ADB9D16B21CB4E4457A33DEC0F538903683E96E90006DA3A805CF6006F9179066534DE6B45AD47A5C469063EE462762723396DC9F25452A0A52DA3F5087DD239F2A311F6B0D4DFEFF4ABD089DC3D0237A0ABAB19EB2045B91CDCAF04BE0A72D548A27BF2E77BD876ECFE5E1BE622350DA6BF31F6E306ED896488DD5B39409B23FC3EB7B2C9F7328EB18DA36D54D80575899EA6507CCBFCDF1F");
+        pub(crate) const CERT_T7: &[u8] = &hex!(
+            "DCB604DB2034B00FD16986D4ADB9D16B21CB4E4457A33DEC0F538903683E96E90006DA3A805CF6006F9179066534DE6B45AD47A5C469063EE462762723396DC9F25452A0A52DA3F5087DD239F2A311F6B0D4DFEFF4ABD089DC3D0237A0ABAB19EB2045B91CDCAF04BE0A72D548A27BF2E77BD876ECFE5E1BE622350DA6BF31F6E306ED896488DD5B39409B23FC3EB7B2C9F7328EB18DA36D54D80575899EA6507CCBFCDF1F"
+        );
 
         pub(crate) const PEER_CERT_DIGEST: &[u8] =
             &hex!("b4fd606b64e4cbd466b8d76cb131069bae6f3aa1878857c9f624e31d77a799b8");
@@ -1154,9 +1250,12 @@ pub(super) mod test {
             let ed25519_id = [3_u8; 32].into();
             let rsa_id = [4_u8; 20].into();
             let peer_addr = "127.1.1.2:443".parse().unwrap();
+            let mut framed_tls = new_frame(MsgBuf::new(&b""[..]), ChannelType::ClientInitiator);
+            let _ = framed_tls.codec_mut().set_link_version(4);
             let ver = VerifiedChannel {
+                channel_type: ChannelType::ClientInitiator,
                 link_protocol: 4,
-                tls: asynchronous_codec::Framed::new(MsgBuf::new(&b""[..]), ChannelCodec::new(4)),
+                framed_tls,
                 unique_id: UniqId::new(),
                 target_method: Some(ChannelMethod::Direct(vec![peer_addr])),
                 ed25519_id,

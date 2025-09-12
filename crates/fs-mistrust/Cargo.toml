@@ -1,15 +1,15 @@
 [package]
 name = "fs-mistrust"
-version = "0.10.0"
+version = "0.11.0"
 authors = ["The Tor Project, Inc.", "Nick Mathewson <nickm@torproject.org>"]
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 homepage = "https://gitlab.torproject.org/tpo/core/arti/-/wikis/home"
 description = "Ensure that files can only be read or written by trusted users"
 keywords = ["fs", "file", "permissions", "ownership", "privacy"]
 categories = ["filesystem"]
 repository = "https://gitlab.torproject.org/tpo/core/arti.git/"
-rust-version = "1.83"
+rust-version = "1.85.1"
 
 [features]
 default = ["walkdir", "anon_home"]
@@ -27,7 +27,7 @@ walkdir = { version = "2", optional = true }
 [dev-dependencies]
 serde_json = "1.0.50"
 tempfile = "3"
-toml = "0.8.8"
+toml = "0.9.5"
 [package.metadata.docs.rs]
 all-features = true
 

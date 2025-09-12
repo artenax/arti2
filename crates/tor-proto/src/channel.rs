@@ -15,9 +15,9 @@
 //!
 //!  * Create a TLS connection as an object that implements AsyncRead +
 //!    AsyncWrite + StreamOps, and pass it to a [ChannelBuilder].  This will
-//!    yield an [handshake::OutboundClientHandshake] that represents
+//!    yield an [handshake::ClientInitiatorHandshake] that represents
 //!    the state of the handshake.
-//!  * Call [handshake::OutboundClientHandshake::connect] on the result
+//!  * Call [handshake::ClientInitiatorHandshake::connect] on the result
 //!    to negotiate the rest of the handshake.  This will verify
 //!    syntactic correctness of the handshake, but not its cryptographic
 //!    integrity.
@@ -28,8 +28,8 @@
 //!  * Launch an asynchronous task to call the reactor's run() method.
 //!
 //! One you have a running channel, you can create circuits on it with
-//! its [Channel::new_circ] method.  See
-//! [crate::tunnel::circuit::PendingClientCirc] for information on how to
+//! its [Channel::new_tunnel] method.  See
+//! [crate::client::circuit::PendingClientTunnel] for information on how to
 //! proceed from there.
 //!
 //! # Design
@@ -56,9 +56,10 @@
 pub const CHANNEL_BUFFER_SIZE: usize = 128;
 
 mod circmap;
-mod codec;
+mod handler;
 mod handshake;
 pub mod kist;
+mod msg;
 pub mod padding;
 pub mod params;
 mod reactor;
@@ -67,11 +68,13 @@ mod unique_id;
 pub use crate::channel::params::*;
 use crate::channel::reactor::{BoxedChannelSink, BoxedChannelStream, Reactor};
 pub use crate::channel::unique_id::UniqId;
+use crate::client::circuit::PendingClientTunnel;
+use crate::client::circuit::padding::QueuedCellPaddingInfo;
 use crate::memquota::{ChannelAccount, CircuitAccount, SpecificAccount as _};
 use crate::util::err::ChannelClosed;
 use crate::util::oneshot_broadcast;
 use crate::util::ts::AtomicOptTimestamp;
-use crate::{tunnel, tunnel::circuit, ClockSkew};
+use crate::{ClockSkew, client};
 use crate::{Error, Result};
 use reactor::BoxedChannelStreamOps;
 use safelog::sensitive as sv;
@@ -79,9 +82,9 @@ use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+use tor_cell::chancell::ChanMsg;
 use tor_cell::chancell::msg::AnyChanMsg;
-use tor_cell::chancell::{msg, msg::PaddingNegotiate, AnyChanCell, CircId};
-use tor_cell::chancell::{ChanCell, ChanMsg};
+use tor_cell::chancell::{AnyChanCell, CircId, msg::PaddingNegotiate};
 use tor_cell::restricted_msg;
 use tor_error::internal;
 use tor_linkspec::{HasRelayIds, OwnedChanTarget};
@@ -95,7 +98,7 @@ use tor_rtcompat::{CoarseTimeProvider, DynTimeProvider, SleepProvider, StreamOps
 mod testing_exports {
     #![allow(unreachable_pub)]
     pub use super::reactor::CtrlMsg;
-    pub use crate::tunnel::circuit::celltypes::CreateResponse;
+    pub use crate::client::circuit::celltypes::CreateResponse;
 }
 #[cfg(feature = "testing")]
 pub use testing_exports::*;
@@ -117,9 +120,7 @@ use tracing::trace;
 
 // reexport
 use crate::channel::unique_id::CircUniqIdContext;
-#[cfg(test)]
-pub(crate) use codec::CodecError;
-pub use handshake::{OutboundClientHandshake, UnverifiedChannel, VerifiedChannel};
+pub use handshake::{ClientInitiatorHandshake, UnverifiedChannel, VerifiedChannel};
 
 use kist::KistParams;
 
@@ -148,14 +149,62 @@ restricted_msg! {
     }
 }
 
-/// A channel cell that we allot to be sent on an open channel from
-/// a server to a client.
-pub(crate) type OpenChanCellS2C = ChanCell<OpenChanMsgS2C>;
+/// This indicate what type of channel it is. It allows us to decide for the correct channel cell
+/// state machines and authentication process (if any).
+///
+/// It is created when a channel is requested for creation which means the subsystem wanting to
+/// open a channel needs to know what type it wants.
+#[derive(Clone, Copy, Debug, derive_more::Display)]
+#[non_exhaustive]
+pub enum ChannelType {
+    /// Client: Initiated from a client to a relay. Client is unauthenticated and relay is
+    /// authenticated.
+    ClientInitiator,
+    /// Relay: Initiating as a relay to a relay. Both sides are authenticated.
+    RelayInitiator,
+    /// Relay: Responding as a relay to a relay or client. Authenticated or Unauthenticated.
+    RelayResponder {
+        /// Indicate if the channel is authenticated. Responding as a relay can be either from a
+        /// Relay (authenticated) or a Client/Bridge (Unauthenticated). We only know this
+        /// information once the handshake is completed.
+        ///
+        /// This side is always authenticated, the other side can be if a relay or not if
+        /// bridge/client. This is set to false unless we end up authenticating the other side
+        /// meaning a relay.
+        authenticated: bool,
+    },
+}
 
-/// Type alias: A Sink and Stream that transforms a TLS connection into
-/// a cell-based communication mechanism.
-type CellFrame<T> =
-    asynchronous_codec::Framed<T, crate::channel::codec::ChannelCodec<OpenChanMsgS2C, AnyChanMsg>>;
+impl ChannelType {
+    /// Return true if this channel type is an initiator.
+    #[expect(unused)] // TODO: Remove once used.
+    pub(crate) fn is_initiator(&self) -> bool {
+        matches!(self, Self::ClientInitiator | Self::RelayInitiator)
+    }
+}
+
+/// A channel cell frame used for sending and receiving cells on a channel. The handler takes care
+/// of the cell codec transition depending in which state the channel is.
+///
+/// ChannelFrame is used to basically handle all in and outbound cells on a channel for its entire
+/// lifetime.
+pub(crate) type ChannelFrame<T> = asynchronous_codec::Framed<T, handler::ChannelCellHandler>;
+
+/// An entry in a channel's queue of cells to be flushed.
+pub(crate) type ChanCellQueueEntry = (AnyChanCell, Option<QueuedCellPaddingInfo>);
+
+/// Helper: Return a new channel frame [ChannelFrame] from an object implementing AsyncRead + AsyncWrite. In the
+/// tor context, it is always a TLS stream.
+///
+/// The ty (type) argument needs to be able to transform into a [handler::ChannelCellHandler] which would
+/// generally be a [ChannelType].
+pub(crate) fn new_frame<T, I>(tls: T, ty: I) -> ChannelFrame<T>
+where
+    T: AsyncRead + AsyncWrite,
+    I: Into<handler::ChannelCellHandler>,
+{
+    asynchronous_codec::Framed::new(tls, ty.into())
+}
 
 /// An open client channel, ready to send and receive Tor cells.
 ///
@@ -188,10 +237,13 @@ type CellFrame<T> =
 /// with an error.
 #[derive(Debug)]
 pub struct Channel {
+    /// The channel type.
+    #[expect(unused)] // TODO: Remove once used.
+    channel_type: ChannelType,
     /// A channel used to send control messages to the Reactor.
     control: mpsc::UnboundedSender<CtrlMsg>,
     /// A channel used to send cells to the Reactor.
-    cell_tx: mq_queue::Sender<AnyChanCell, mq_queue::MpscSpec>,
+    cell_tx: mq_queue::Sender<ChanCellQueueEntry, mq_queue::MpscSpec>,
 
     /// A receiver that indicates whether the channel is closed.
     ///
@@ -298,7 +350,7 @@ use PaddingControlState as PCS;
 #[derive(Debug)]
 pub(crate) struct ChannelSender {
     /// MPSC sender to send cells.
-    cell_tx: mq_queue::Sender<AnyChanCell, mq_queue::MpscSpec>,
+    cell_tx: mq_queue::Sender<ChanCellQueueEntry, mq_queue::MpscSpec>,
     /// A receiver used to check if the channel is closed.
     reactor_closed_rx: oneshot_broadcast::Receiver<Result<CloseInfo>>,
     /// Unique ID for this channel. For logging.
@@ -309,18 +361,19 @@ impl ChannelSender {
     /// Check whether a cell type is permissible to be _sent_ on an
     /// open client channel.
     fn check_cell(&self, cell: &AnyChanCell) -> Result<()> {
-        use msg::AnyChanMsg::*;
+        use tor_cell::chancell::msg::AnyChanMsg::*;
         let msg = cell.msg();
         match msg {
             Created(_) | Created2(_) | CreatedFast(_) => Err(Error::from(internal!(
                 "Can't send {} cell on client channel",
                 msg.cmd()
             ))),
-            Certs(_) | Versions(_) | Authenticate(_) | Authorize(_) | AuthChallenge(_)
-            | Netinfo(_) => Err(Error::from(internal!(
-                "Can't send {} cell after handshake is done",
-                msg.cmd()
-            ))),
+            Certs(_) | Versions(_) | Authenticate(_) | AuthChallenge(_) | Netinfo(_) => {
+                Err(Error::from(internal!(
+                    "Can't send {} cell after handshake is done",
+                    msg.cmd()
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -334,7 +387,7 @@ impl ChannelSender {
     }
 }
 
-impl Sink<AnyChanCell> for ChannelSender {
+impl Sink<ChanCellQueueEntry> for ChannelSender {
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
@@ -344,21 +397,21 @@ impl Sink<AnyChanCell> for ChannelSender {
             .map_err(|_| ChannelClosed.into())
     }
 
-    fn start_send(self: Pin<&mut Self>, cell: AnyChanCell) -> Result<()> {
+    fn start_send(self: Pin<&mut Self>, cell: ChanCellQueueEntry) -> Result<()> {
         let this = self.get_mut();
         if this.reactor_closed_rx.is_ready() {
             return Err(ChannelClosed.into());
         }
-        this.check_cell(&cell)?;
+        this.check_cell(&cell.0)?;
         {
-            use msg::AnyChanMsg::*;
-            match cell.msg() {
+            use tor_cell::chancell::msg::AnyChanMsg::*;
+            match cell.0.msg() {
                 Relay(_) | Padding(_) | Vpadding(_) => {} // too frequent to log.
                 _ => trace!(
                     channel_id = %this.unique_id,
                     "Sending {} for {}",
-                    cell.msg().cmd(),
-                    CircId::get_or_zero(cell.circid())
+                    cell.0.msg().cmd(),
+                    CircId::get_or_zero(cell.0.circid())
                 ),
             }
         }
@@ -423,17 +476,17 @@ impl ChannelBuilder {
     /// authentication info from the relay: call `check()` on the result
     /// to check that.  Finally, to finish the handshake, call `finish()`
     /// on the result of _that_.
-    pub fn launch<T, S>(
+    pub fn launch_client<T, S>(
         self,
         tls: T,
         sleep_prov: S,
         memquota: ChannelAccount,
-    ) -> OutboundClientHandshake<T, S>
+    ) -> ClientInitiatorHandshake<T, S>
     where
         T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
         S: CoarseTimeProvider + SleepProvider,
     {
-        handshake::OutboundClientHandshake::new(tls, self.target, sleep_prov, memquota)
+        handshake::ClientInitiatorHandshake::new(tls, self.target, sleep_prov, memquota)
     }
 }
 
@@ -443,8 +496,12 @@ impl Channel {
     /// Internal method, called to finalize the channel when we've
     /// sent our netinfo cell, received the peer's netinfo cell, and
     /// we're finally ready to create circuits.
+    ///
+    /// Quick note on the allow clippy. This is has one call site so for now, it is fine that we
+    /// bust the mighty 7 arguments.
     #[allow(clippy::too_many_arguments)] // TODO consider if we want a builder
     fn new<S>(
+        channel_type: ChannelType,
         link_protocol: u16,
         sink: BoxedChannelSink,
         stream: BoxedChannelStream,
@@ -478,6 +535,7 @@ impl Channel {
         let details = Arc::new(details);
 
         let channel = Arc::new(Channel {
+            channel_type,
             control: control_tx,
             cell_tx,
             reactor_closed_rx,
@@ -490,9 +548,10 @@ impl Channel {
         });
 
         // We start disabled; the channel manager will `reconfigure` us soon after creation.
-        let padding_timer = Box::pin(padding::Timer::new_disabled(sleep_prov, None)?);
+        let padding_timer = Box::pin(padding::Timer::new_disabled(sleep_prov.clone(), None)?);
 
         let reactor = Reactor {
+            runtime: sleep_prov,
             control: control_rx,
             cells: cell_rx,
             reactor_closed_tx,
@@ -666,16 +725,16 @@ impl Channel {
         }
     }
 
-    /// Return a newly allocated PendingClientCirc object with
-    /// a corresponding circuit reactor. A circuit ID is allocated, but no
+    /// Return a newly allocated PendingClientTunnel object with
+    /// a corresponding tunnel reactor. A circuit ID is allocated, but no
     /// messages are sent, and no cryptography is done.
     ///
     /// To use the results of this method, call Reactor::run() in a
     /// new task, then use the methods of
-    /// [crate::tunnel::circuit::PendingClientCirc] to build the circuit.
-    pub async fn new_circ(
+    /// [crate::client::circuit::PendingClientTunnel] to build the circuit.
+    pub async fn new_tunnel(
         self: &Arc<Self>,
-    ) -> Result<(circuit::PendingClientCirc, tunnel::reactor::Reactor)> {
+    ) -> Result<(PendingClientTunnel, client::reactor::Reactor)> {
         if self.is_closing() {
             return Err(ChannelClosed.into());
         }
@@ -694,11 +753,12 @@ impl Channel {
             sender,
             tx,
         })?;
-        let (id, circ_unique_id) = rx.await.map_err(|_| ChannelClosed)??;
+        let (id, circ_unique_id, padding_ctrl, padding_stream) =
+            rx.await.map_err(|_| ChannelClosed)??;
 
         trace!("{}: Allocated CircId {}", circ_unique_id, id);
 
-        Ok(circuit::PendingClientCirc::new(
+        Ok(PendingClientTunnel::new(
             id,
             self.clone(),
             createdreceiver,
@@ -706,6 +766,8 @@ impl Channel {
             circ_unique_id,
             time_prov,
             memquota,
+            padding_ctrl,
+            padding_stream,
         ))
     }
 
@@ -733,7 +795,7 @@ impl Channel {
     /// Note that this method does not _cause_ the channel to shut down on its own.
     pub fn wait_for_close(
         &self,
-    ) -> impl Future<Output = StdResult<CloseInfo, ClosedUnexpectedly>> + Send + Sync + 'static
+    ) -> impl Future<Output = StdResult<CloseInfo, ClosedUnexpectedly>> + Send + Sync + 'static + use<>
     {
         self.reactor_closed_rx
             .clone()
@@ -757,7 +819,7 @@ impl Channel {
     //  * It returns the mpsc Receiver
     //  * It does not require explicit specification of details
     #[cfg(feature = "testing")]
-    pub fn new_fake() -> (Channel, mpsc::UnboundedReceiver<CtrlMsg>) {
+    pub fn new_fake(channel_type: ChannelType) -> (Channel, mpsc::UnboundedReceiver<CtrlMsg>) {
         let (control, control_recv) = mpsc::unbounded();
         let details = fake_channel_details();
 
@@ -772,6 +834,7 @@ impl Channel {
         let (_tx, rx) = oneshot_broadcast::channel();
 
         let channel = Channel {
+            channel_type,
             control,
             cell_tx: fake_mpsc().0,
             reactor_closed_rx: rx,
@@ -811,7 +874,7 @@ where
                 return Err(Error::ChanMismatch(format!(
                     "Peer does not have {} identity",
                     id_type
-                )))
+                )));
             }
         }
     }
@@ -863,8 +926,8 @@ fn fake_channel_details() -> Arc<ChannelDetails> {
 /// Make an MPSC queue, of the type we use in Channels, but a fake one for testing
 #[cfg(any(test, feature = "testing"))] // Used by Channel::new_fake which is also feature=testing
 pub(crate) fn fake_mpsc() -> (
-    mq_queue::Sender<AnyChanCell, mq_queue::MpscSpec>,
-    mq_queue::Receiver<AnyChanCell, mq_queue::MpscSpec>,
+    mq_queue::Sender<ChanCellQueueEntry, mq_queue::MpscSpec>,
+    mq_queue::Receiver<ChanCellQueueEntry, mq_queue::MpscSpec>,
 ) {
     crate::fake_mpsc(CHANNEL_BUFFER_SIZE)
 }
@@ -875,15 +938,15 @@ pub(crate) mod test {
     // reactor code; there are just a few more cases to examine here.
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::channel::codec::test::MsgBuf;
-    pub(crate) use crate::channel::reactor::test::new_reactor;
+    use crate::channel::handler::test::MsgBuf;
+    pub(crate) use crate::channel::reactor::test::{CodecResult, new_reactor};
     use crate::util::fake_mq;
     use tor_cell::chancell::msg::HandshakeType;
-    use tor_cell::chancell::{msg, AnyChanCell};
+    use tor_cell::chancell::{AnyChanCell, msg};
     use tor_rtcompat::PreferredRuntime;
 
     /// Make a new fake reactor-less channel.  For testing only, obviously.
-    pub(crate) fn fake_channel(details: Arc<ChannelDetails>) -> Channel {
+    pub(crate) fn fake_channel(channel_type: ChannelType) -> Channel {
         let unique_id = UniqId::new();
         let peer_id = OwnedChanTarget::builder()
             .ed_identity([6_u8; 32].into())
@@ -893,6 +956,7 @@ pub(crate) mod test {
         // This will make rx trigger immediately.
         let (_tx, rx) = oneshot_broadcast::channel();
         Channel {
+            channel_type,
             control: mpsc::unbounded().0,
             cell_tx: fake_mpsc().0,
             reactor_closed_rx: rx,
@@ -901,7 +965,7 @@ pub(crate) mod test {
             clock_skew: ClockSkew::None,
             opened_at: coarsetime::Instant::now(),
             mutable: Default::default(),
-            details,
+            details: fake_channel_details(),
         }
     }
 
@@ -909,18 +973,22 @@ pub(crate) mod test {
     fn send_bad() {
         tor_rtcompat::test_with_all_runtimes!(|_rt| async move {
             use std::error::Error;
-            let chan = fake_channel(fake_channel_details());
+            let chan = fake_channel(ChannelType::ClientInitiator);
 
             let cell = AnyChanCell::new(CircId::new(7), msg::Created2::new(&b"hihi"[..]).into());
             let e = chan.sender().check_cell(&cell);
             assert!(e.is_err());
-            assert!(format!("{}", e.unwrap_err().source().unwrap())
-                .contains("Can't send CREATED2 cell on client channel"));
+            assert!(
+                format!("{}", e.unwrap_err().source().unwrap())
+                    .contains("Can't send CREATED2 cell on client channel")
+            );
             let cell = AnyChanCell::new(None, msg::Certs::new_empty().into());
             let e = chan.sender().check_cell(&cell);
             assert!(e.is_err());
-            assert!(format!("{}", e.unwrap_err().source().unwrap())
-                .contains("Can't send CERTS cell after handshake is done"));
+            assert!(
+                format!("{}", e.unwrap_err().source().unwrap())
+                    .contains("Can't send CERTS cell after handshake is done")
+            );
 
             let cell = AnyChanCell::new(
                 CircId::new(5),
@@ -938,16 +1006,16 @@ pub(crate) mod test {
     fn chanbuilder() {
         let rt = PreferredRuntime::create().unwrap();
         let mut builder = ChannelBuilder::default();
-        builder.set_declared_method(tor_linkspec::ChannelMethod::Direct(vec!["127.0.0.1:9001"
-            .parse()
-            .unwrap()]));
+        builder.set_declared_method(tor_linkspec::ChannelMethod::Direct(vec![
+            "127.0.0.1:9001".parse().unwrap(),
+        ]));
         let tls = MsgBuf::new(&b""[..]);
-        let _outbound = builder.launch(tls, rt, fake_mq());
+        let _outbound = builder.launch_client(tls, rt, fake_mq());
     }
 
     #[test]
     fn check_match() {
-        let chan = fake_channel(fake_channel_details());
+        let chan = fake_channel(ChannelType::ClientInitiator);
 
         let t1 = OwnedChanTarget::builder()
             .ed_identity([6; 32].into())
@@ -972,15 +1040,16 @@ pub(crate) mod test {
 
     #[test]
     fn unique_id() {
-        let ch1 = fake_channel(fake_channel_details());
-        let ch2 = fake_channel(fake_channel_details());
+        let ch1 = fake_channel(ChannelType::ClientInitiator);
+        let ch2 = fake_channel(ChannelType::ClientInitiator);
         assert_ne!(ch1.unique_id(), ch2.unique_id());
     }
 
     #[test]
     fn duration_unused_at() {
         let details = fake_channel_details();
-        let ch = fake_channel(Arc::clone(&details));
+        let mut ch = fake_channel(ChannelType::ClientInitiator);
+        ch.details = details.clone();
         details.unused_since.update();
         assert!(ch.duration_unused().is_some());
     }

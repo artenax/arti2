@@ -26,12 +26,12 @@ circuits.  Finally, each circuit multiplexes a number of "streams",
 each corresponding roughly to an application-level request.
 
 This crate implements the logic, protocols, and cryptography that
-implement these [`channel::Channel`]s, [`circuit::ClientCirc`]s, and
-[`stream::DataStream`]s.  It uses rust async code and future-related
-traits, and is intended to work with (nearly) any executor
-implementation that complies with the futures API.  It should also
-work with nearly any TLS implementation that exposes AsyncRead and
-AsyncWrite traits.
+implement these [`channel::Channel`]s, [`client::circuit::ClientCirc`]s, and
+[`client::stream::DataStream`]s.  It uses rust async code and
+future-related traits, and is intended to work with (nearly) any
+executor implementation that complies with the futures API.
+It should also work with nearly any TLS implementation that exposes
+AsyncRead and AsyncWrite traits.
 
 ### Not in this crate
 
@@ -101,3 +101,8 @@ all the ones I could find or think of, but it would be great to
 find a good way to eliminate every lock that we have.
 
 License: MIT OR Apache-2.0
+
+[`tor-netdoc`]: https://docs.rs/tor-netdoc/
+[`tor-netdir`]: https://docs.rs/tor-netdir/
+[`arti-client`]: https://docs.rs/arti-client/
+

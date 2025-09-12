@@ -100,6 +100,7 @@ pub use anon_level::Anonymity;
 pub use config::OnionServiceConfig;
 pub use err::{ClientError, EstablishSessionError, FatalError, IntroRequestError, StartupError};
 pub use ipt_mgr::IptError;
+use keys::HsTimePeriodKeySpecifier;
 pub use keys::{
     BlindIdKeypairSpecifier, BlindIdPublicKeySpecifier, DescSigningKeypairSpecifier,
     HsIdKeypairSpecifier, HsIdPublicKeySpecifier,
@@ -108,9 +109,13 @@ use pow::{NewPowManager, PowManager};
 pub use publish::UploadError as DescUploadError;
 pub use req::{RendRequest, StreamRequest};
 pub use tor_hscrypto::pk::HsId;
+use tor_keymgr::KeystoreEntry;
 pub use tor_persist::hsnickname::{HsNickname, InvalidNickname};
 
 pub use helpers::handle_rend_requests;
+
+#[cfg(feature = "onion-service-cli-extra")]
+use tor_netdir::NetDir;
 
 //---------- top-level service implementation (types and methods) ----------
 
@@ -302,6 +307,9 @@ impl OnionService {
             .storage_handle("iptpub")
             .map_err(StartupError::StateDirectoryInaccessible)?;
 
+        let status_tx = StatusSender::new(OnionServiceStatus::new_shutdown());
+        let (config_tx, config_rx) = postage::watch::channel_with(Arc::new(config));
+
         let pow_manager_storage_handle = state_handle
             .storage_handle("pow_manager")
             .map_err(StartupError::StateDirectoryInaccessible)?;
@@ -319,15 +327,15 @@ impl OnionService {
             pow_nonce_dir,
             keymgr.clone(),
             pow_manager_storage_handle,
+            netdir_provider.clone(),
+            status_tx.clone().into(),
+            config_rx.clone(),
         )?;
 
         let (shutdown_tx, shutdown_rx) = broadcast::channel(0);
-        let (config_tx, config_rx) = postage::watch::channel_with(Arc::new(config));
 
         let (ipt_mgr_view, publisher_view) =
             crate::ipt_set::ipts_channel(&runtime, iptpub_storage_handle)?;
-
-        let status_tx = StatusSender::new(OnionServiceStatus::new_shutdown());
 
         let ipt_mgr = IptManager::new(
             runtime.clone(),
@@ -426,6 +434,22 @@ impl OnionService {
 
         maybe_generate_hsid(&self.keymgr, &self.config.nickname, offline_hsid, selector)
     }
+
+    /// List the no-longer-relevant keys of this service.
+    ///
+    /// Returns the [`KeystoreEntry`]s associated with time periods that are not
+    /// "relevant" according to the specified [`NetDir`],
+    /// (i.e. the keys associated with time periods
+    /// the service is not publishing descriptors for).
+    // TODO: unittest
+    #[cfg(feature = "onion-service-cli-extra")]
+    pub fn list_expired_keys(&self, netdir: &NetDir) -> tor_keymgr::Result<Vec<KeystoreEntry>> {
+        list_expired_keys_for_service(
+            &netdir.hs_all_time_periods(),
+            self.config.nickname(),
+            &self.keymgr,
+        )
+    }
 }
 
 impl OnionServiceBuilder {
@@ -490,7 +514,7 @@ impl RunningOnionService {
     ///
     /// You can turn the resulting stream into a stream of [`StreamRequest`]
     /// using the [`handle_rend_requests`] helper function.
-    fn launch(self: &Arc<Self>) -> Result<impl Stream<Item = RendRequest>, StartupError> {
+    fn launch(self: &Arc<Self>) -> Result<impl Stream<Item = RendRequest> + use<>, StartupError> {
         let (rend_req_rx, launch) = {
             let mut inner = self.inner.lock().expect("poisoned lock");
             inner
@@ -641,6 +665,54 @@ pub fn supported_hsservice_protocols() -> tor_protover::Protocols {
     .collect()
 }
 
+/// Returns all the keys (as [`KeystoreEntry`]) of the service
+/// identified by `nickname` that are expired according to the
+/// provided [`HsDirParams`].
+fn list_expired_keys_for_service<'a>(
+    relevant_periods: &[HsDirParams],
+    nickname: &HsNickname,
+    keymgr: &'a KeyMgr,
+) -> tor_keymgr::Result<Vec<KeystoreEntry<'a>>> {
+    let arti_pat = tor_keymgr::KeyPathPattern::Arti(format!("hss/{}/*", nickname));
+    let possibly_relevant_keys = keymgr.list_matching(&arti_pat)?;
+    let mut expired_keys = Vec::new();
+
+    for entry in possibly_relevant_keys {
+        let key_path = entry.key_path();
+        let mut append_if_expired = |spec: &dyn HsTimePeriodKeySpecifier| {
+            if spec.nickname() != nickname {
+                return Err(internal!(
+                    "keymgr gave us key {spec:?} that doesn't match our pattern {arti_pat:?}"
+                )
+                .into());
+            }
+            let is_expired = relevant_periods
+                .iter()
+                .all(|p| &p.time_period() != spec.period());
+
+            if is_expired {
+                expired_keys.push(entry.clone());
+            }
+
+            tor_keymgr::Result::Ok(())
+        };
+
+        macro_rules! append_if_expired {
+            ($K:ty) => {{
+                if let Ok(spec) = <$K>::try_from(key_path) {
+                    append_if_expired(&spec)?;
+                }
+            }};
+        }
+
+        append_if_expired!(BlindIdPublicKeySpecifier);
+        append_if_expired!(BlindIdKeypairSpecifier);
+        append_if_expired!(DescSigningKeypairSpecifier);
+    }
+
+    Ok(expired_keys)
+}
+
 #[cfg(test)]
 pub(crate) mod test {
     // @@ begin test lint list maintained by maint/add_warning @@
@@ -662,7 +734,7 @@ pub(crate) mod test {
     use std::path::Path;
 
     use fs_mistrust::Mistrust;
-    use test_temp_dir::{test_temp_dir, TestTempDir, TestTempDirGuard};
+    use test_temp_dir::{TestTempDir, TestTempDirGuard, test_temp_dir};
 
     use tor_basic_utils::test_rng::testing_rng;
     use tor_keymgr::{ArtiNativeKeystore, KeyMgrBuilder};
@@ -842,13 +914,15 @@ pub(crate) mod test {
             .insert(hsid_public, &pub_hsid_spec, KeystoreSelector::Primary, true)
             .unwrap();
 
-        assert!(maybe_generate_hsid(
-            &keymgr,
-            &nickname,
-            false, /* offline_hsid */
-            Default::default()
-        )
-        .is_err());
+        assert!(
+            maybe_generate_hsid(
+                &keymgr,
+                &nickname,
+                false, /* offline_hsid */
+                Default::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]

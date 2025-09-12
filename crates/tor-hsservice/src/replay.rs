@@ -141,12 +141,12 @@ impl<T: ReplayLogType> ReplayLog<T> {
     pub(crate) fn new_logged(
         dir: &InstanceRawSubdir,
         name: &T::Name,
-    ) -> Result<Self, CreateIptError> {
+    ) -> Result<Self, OpenReplayLogError> {
         let leaf = T::format_filename(name);
         let path = dir.as_path().join(leaf);
         let lock_guard = dir.raw_lock_guard();
 
-        Self::new_logged_inner(&path, lock_guard).map_err(|error| CreateIptError::OpenReplayLog {
+        Self::new_logged_inner(&path, lock_guard).map_err(|error| OpenReplayLogError {
             file: path,
             error: error.into(),
         })
@@ -304,7 +304,7 @@ impl<T: ReplayLogType> ReplayLog<T> {
 ///
 /// We isolate this code to make it easier to replace.
 mod data {
-    use super::{ReplayError, OUTPUT_LEN};
+    use super::{OUTPUT_LEN, ReplayError};
     use growable_bloom_filter::GrowableBloom;
 
     /// A probabilistic membership filter.
@@ -356,6 +356,17 @@ pub(crate) enum ReplayError {
     Log(Arc<std::io::Error>),
 }
 
+/// Error occured while opening replay log.
+#[derive(thiserror::Error, Clone, Debug)]
+#[error("unable to open replay log: {file:?}")]
+pub struct OpenReplayLogError {
+    /// What filesystem object we tried to do it to
+    pub(crate) file: PathBuf,
+    /// What happened
+    #[source]
+    pub(crate) error: Arc<io::Error>,
+}
+
 #[cfg(test)]
 mod test {
     // @@ begin test lint list maintained by maint/add_warning @@
@@ -375,7 +386,7 @@ mod test {
     use super::*;
     use crate::test::mk_state_instance;
     use rand::Rng;
-    use test_temp_dir::{test_temp_dir, TestTempDir, TestTempDirGuard};
+    use test_temp_dir::{TestTempDir, TestTempDirGuard, test_temp_dir};
 
     struct TestReplayLogType;
 

@@ -1,23 +1,24 @@
 //! Configure tracing subscribers for Arti
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use derive_builder::Builder;
 use fs_mistrust::Mistrust;
 use serde::{Deserialize, Serialize};
 use std::io::IsTerminal as _;
 use std::path::Path;
 use std::str::FromStr;
-use tor_config::impl_standard_builder;
 use tor_config::ConfigBuildError;
+use tor_config::impl_standard_builder;
 use tor_config::{define_list_builder_accessors, define_list_builder_helper};
 use tor_config_path::{CfgPath, CfgPathResolver};
 use tor_error::warn_report;
-use tracing::{error, Subscriber};
+use tracing::{Subscriber, error};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{filter::Targets, fmt, registry, Layer};
+use tracing_subscriber::{Layer, filter::Targets, fmt, registry};
 
+mod fields;
 mod time;
 
 /// Structure to hold our logging configuration options
@@ -152,7 +153,7 @@ fn filt_from_opt_str(s: &Option<String>, source: &str) -> Result<Option<Targets>
 }
 
 /// Try to construct a tracing [`Layer`] for logging to stderr.
-fn console_layer<S>(config: &LoggingConfig, cli: Option<&str>) -> Result<impl Layer<S>>
+fn console_layer<S>(config: &LoggingConfig, cli: Option<&str>) -> Result<impl Layer<S> + use<S>>
 where
     S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
@@ -167,6 +168,8 @@ where
     // if isatty() returns true on the console, we can't be sure that the
     // terminal isn't saving backlog to disk or something like that.
     Ok(fmt::Layer::default()
+        // we apply custom field formatting so that error fields are listed last
+        .fmt_fields(fields::ErrorsLastFieldFormatter)
         .with_ansi(use_color)
         .with_timer(timer)
         .with_writer(std::io::stderr) // we make this explicit, to match with use_color.
@@ -198,7 +201,7 @@ fn logfile_layer<S>(
     granularity: std::time::Duration,
     mistrust: &Mistrust,
     path_resolver: &CfgPathResolver,
-) -> Result<(impl Layer<S> + Send + Sync + Sized, WorkerGuard)>
+) -> Result<(impl Layer<S> + Send + Sync + Sized + use<S>, WorkerGuard)>
 where
     S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + Send + Sync,
 {
@@ -225,6 +228,8 @@ where
     let appender = RollingFileAppender::new(rotation, directory, fname);
     let (nonblocking, guard) = non_blocking(appender);
     let layer = fmt::layer()
+        // we apply custom field formatting so that error fields are listed last
+        .fmt_fields(fields::ErrorsLastFieldFormatter)
         .with_ansi(false)
         .with_writer(nonblocking)
         .with_timer(timer)
@@ -240,7 +245,7 @@ fn logfile_layers<S>(
     config: &LoggingConfig,
     mistrust: &Mistrust,
     path_resolver: &CfgPathResolver,
-) -> Result<(impl Layer<S>, Vec<WorkerGuard>)>
+) -> Result<(impl Layer<S> + use<S>, Vec<WorkerGuard>)>
 where
     S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + Send + Sync,
 {

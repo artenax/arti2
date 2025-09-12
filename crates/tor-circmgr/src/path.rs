@@ -21,10 +21,10 @@ use std::time::SystemTime;
 
 use rand::Rng;
 
-use tor_error::{bad_api_usage, internal, Bug};
+use tor_dircommon::fallback::FallbackDir;
+use tor_error::{Bug, bad_api_usage, internal};
 #[cfg(feature = "geoip")]
 use tor_geoip::{CountryCode, HasCountryCode};
-use tor_guardmgr::fallback::FallbackDir;
 use tor_guardmgr::{GuardMgr, GuardMonitor, GuardUsable};
 use tor_linkspec::{HasAddrs, HasRelayIds, OwnedChanTarget, OwnedCircTarget, RelayIdSet};
 use tor_netdir::{FamilyRules, NetDir, Relay};
@@ -264,6 +264,15 @@ impl OwnedPath {
             OwnedPath::Normal(p) => p.len(),
         }
     }
+
+    /// Return a reference to the first hop of this path, as an OwnedChanTarget.
+    pub(crate) fn first_hop_as_chantarget(&self) -> &OwnedChanTarget {
+        match self {
+            OwnedPath::ChannelOnly(ct) => ct,
+            // This access won't panic, since we enforce that path is nonempty.
+            OwnedPath::Normal(path) => path[0].chan_target(),
+        }
+    }
 }
 
 /// A path builder that builds multi-hop, anonymous paths.
@@ -304,7 +313,7 @@ fn pick_path<'a, B: AnonymousPathBuilder, R: Rng, RT: Runtime>(
             return Err(bad_api_usage!(
                 "Tried to build a multihop path without a network directory"
             )
-            .into())
+            .into());
         }
     };
     let rs_cfg = config.relay_selection_config();

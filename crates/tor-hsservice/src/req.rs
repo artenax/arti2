@@ -6,9 +6,10 @@
 use crate::internal_prelude::*;
 
 use tor_cell::relaycell::msg::{Connected, End, Introduce2};
+use tor_circmgr::ServiceOnionServiceDataTunnel;
 use tor_hscrypto::Subcredential;
 use tor_keymgr::ArtiPath;
-use tor_proto::stream::{IncomingStream, IncomingStreamRequest};
+use tor_proto::client::stream::{IncomingStream, IncomingStreamRequest};
 
 /// Request to complete an introduction/rendezvous handshake.
 ///
@@ -40,6 +41,8 @@ pub struct RendRequest {
     ///
     /// TODO: This also contains `raw`, which is maybe not so great; it would be
     /// neat to implement more efficiently.
+    //
+    // TODO MSRV TBD: Replace with std OnceCell (#1996)
     expanded: once_cell::unsync::OnceCell<rend_handshake::IntroRequest>,
 }
 
@@ -57,7 +60,7 @@ pub struct StreamRequest {
     stream: IncomingStream,
 
     /// The circuit that made this request.
-    on_circuit: Arc<ClientCirc>,
+    on_tunnel: Arc<ServiceOnionServiceDataTunnel>,
 }
 
 /// Keys and objects needed to answer a RendRequest.
@@ -211,7 +214,7 @@ impl RendRequest {
             .expect("intro_request succeeded but did not fill 'expanded'.");
         let rend_handshake::OpenSession {
             stream_requests,
-            circuit,
+            tunnel,
         } = intro_request
             .establish_session(
                 self.context.filter.clone(),
@@ -221,6 +224,8 @@ impl RendRequest {
             .await
             .map_err(ClientError::EstablishSession)?;
 
+        let tunnel = Arc::new(tunnel);
+
         // Note that we move circuit (which is an Arc<ClientCirc>) into this
         // closure, which lives for as long as the stream of StreamRequest, and
         // for as long as each individual StreamRequest.  This is how we keep
@@ -228,7 +233,7 @@ impl RendRequest {
         // the Stream we return is dropped.
         Ok(stream_requests.map(move |stream| StreamRequest {
             stream,
-            on_circuit: circuit.clone(),
+            on_tunnel: tunnel.clone(),
         }))
     }
 
@@ -276,7 +281,7 @@ impl StreamRequest {
     /// Reject this request and close the rendezvous circuit entirely,
     /// along with all other streams attached to the circuit.
     pub fn shutdown_circuit(self) -> Result<(), Bug> {
-        self.on_circuit.terminate();
+        self.on_tunnel.terminate();
         Ok(())
     }
 

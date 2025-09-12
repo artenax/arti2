@@ -100,20 +100,21 @@ use std::ffi::OsString;
 use std::fmt::Write;
 
 pub use cfg::{
-    ApplicationConfig, ApplicationConfigBuilder, ArtiCombinedConfig, ArtiConfig, ArtiConfigBuilder,
-    ProxyConfig, ProxyConfigBuilder, SystemConfig, SystemConfigBuilder, ARTI_EXAMPLE_CONFIG,
+    ARTI_EXAMPLE_CONFIG, ApplicationConfig, ApplicationConfigBuilder, ArtiCombinedConfig,
+    ArtiConfig, ArtiConfigBuilder, ProxyConfig, ProxyConfigBuilder, SystemConfig,
+    SystemConfigBuilder,
 };
 pub use logging::{LoggingConfig, LoggingConfigBuilder};
 
-use arti_client::config::default_config_files;
 use arti_client::TorClient;
+use arti_client::config::default_config_files;
 use safelog::with_safe_logging_suppressed;
-use tor_config::mistrust::BuilderExt as _;
 use tor_config::ConfigurationSources;
+use tor_config::mistrust::BuilderExt as _;
 use tor_rtcompat::ToplevelRuntime;
 
 use anyhow::{Context, Error, Result};
-use clap::{value_parser, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, value_parser};
 #[allow(unused_imports)]
 use tracing::{error, info, warn};
 
@@ -135,6 +136,8 @@ fn create_runtime() -> std::io::Result<impl ToplevelRuntime> {
             use tor_rtcompat::tokio::TokioNativeTlsRuntime as ChosenRuntime;
         } else if #[cfg(all(feature="tokio", feature="rustls"))] {
             use tor_rtcompat::tokio::TokioRustlsRuntime as ChosenRuntime;
+            // Note: See comments in tor_rtcompate::impls::rustls::RustlsProvider
+            // about choice of default crypto provider.
             let _idempotent_ignore = rustls_crate::crypto::CryptoProvider::install_default(
                 rustls_crate::crypto::ring::default_provider(),
 
@@ -143,6 +146,8 @@ fn create_runtime() -> std::io::Result<impl ToplevelRuntime> {
             use tor_rtcompat::async_std::AsyncStdNativeTlsRuntime as ChosenRuntime;
         } else if #[cfg(all(feature="async-std", feature="rustls"))] {
             use tor_rtcompat::async_std::AsyncStdRustlsRuntime as ChosenRuntime;
+            // Note: See comments in tor_rtcompate::impls::rustls::RustlsProvider
+            // about choice of default crypto provider.
             let _idempotent_ignore = rustls_crate::crypto::CryptoProvider::install_default(
                 rustls_crate::crypto::ring::default_provider(),
             );
@@ -386,7 +391,9 @@ where
     #[cfg(feature = "harden")]
     if !config.application().permit_debugging {
         if let Err(e) = process::enable_process_hardening() {
-            error!("Encountered a problem while enabling hardening. To disable this feature, set application.permit_debugging to true.");
+            error!(
+                "Encountered a problem while enabling hardening. To disable this feature, set application.permit_debugging to true."
+            );
             return Err(e);
         }
     }
@@ -400,7 +407,7 @@ where
     cfg_if::cfg_if! {
         if #[cfg(feature = "onion-service-cli-extra")] {
             if let Some(keys_matches) = matches.subcommand_matches("keys") {
-                return subcommands::keys::run(runtime, keys_matches, &client_config);
+                return subcommands::keys::run(runtime, keys_matches, &config, &client_config);
             } else if let Some(raw_matches) = matches.subcommand_matches("keys-raw") {
                 return subcommands::raw::run(runtime, raw_matches, &client_config);
             }

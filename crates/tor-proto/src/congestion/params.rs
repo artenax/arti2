@@ -6,7 +6,7 @@
 use caret::caret_int;
 use derive_builder::Builder;
 
-use tor_config::{impl_standard_builder, ConfigBuildError};
+use tor_config::{ConfigBuildError, impl_standard_builder};
 use tor_units::Percentage;
 
 /// Fixed window parameters that are for the SENDME v0 world of fixed congestion window.
@@ -155,7 +155,7 @@ impl_standard_builder! { RoundTripEstimatorParams: !Deserialize + !Default }
 /// The parameters of what constitute a congestion window. This is used by all congestion control
 /// algorithms as in it is not specific to an algorithm.
 #[non_exhaustive]
-#[derive(Builder, Clone, Debug, amplify::Getters)]
+#[derive(Builder, Clone, Copy, Debug, amplify::Getters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct CongestionWindowParams {
     /// Initial size of the congestion window.
@@ -208,6 +208,7 @@ pub struct CongestionControlParams {
     fixed_window_params: FixedWindowParams,
     /// Congestion window parameters.
     #[getter(as_mut)]
+    #[getter(as_copy)]
     cwnd_params: CongestionWindowParams,
     /// RTT calculation parameters.
     rtt_params: RoundTripEstimatorParams,

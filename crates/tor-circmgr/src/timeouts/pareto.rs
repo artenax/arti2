@@ -48,15 +48,14 @@ impl MsecDuration {
     }
 }
 
-/// Module to hold calls to const_assert.
+/// Module to hold const assertions.
 ///
 /// This is a separate module so we can change the clippy warnings on it.
 #[allow(clippy::checked_conversions)]
 mod assertion {
-    use static_assertions::const_assert;
     // If this assertion is untrue, then we can't safely use u16 fields in
     // time_histogram.
-    const_assert!(super::TIME_HISTORY_LEN <= u16::MAX as usize);
+    const _: () = assert!(super::TIME_HISTORY_LEN <= u16::MAX as usize);
 }
 
 /// A history of circuit timeout observations, used to estimate our
@@ -570,6 +569,7 @@ impl super::TimeoutEstimator for ParetoTimeoutEstimator {
             self.timeouts.take();
         }
         if is_last {
+            tracing::trace!(%hop, ?delay, "Circuit creation success");
             self.history.add_success(true);
         }
     }
@@ -590,6 +590,7 @@ impl super::TimeoutEstimator for ParetoTimeoutEstimator {
         if hop > 0 && have_seen_recent_activity {
             self.history.add_success(false);
             if self.history.n_recent_timeouts() > self.p.reset_after_timeouts {
+                tracing::debug!("Multiple connections failed, resetting timeouts...");
                 let base_timeouts = self.base_timeouts();
                 self.history.clear();
                 self.timeouts.take();
@@ -668,8 +669,8 @@ mod test {
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
     use crate::timeouts::TimeoutEstimator;
-    use tor_basic_utils::test_rng::testing_rng;
     use tor_basic_utils::RngExt as _;
+    use tor_basic_utils::test_rng::testing_rng;
 
     /// Return an action to build a 3-hop circuit.
     fn b3() -> Action {

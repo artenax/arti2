@@ -56,28 +56,40 @@
 #[cfg(feature = "bench")]
 pub mod bench_utils;
 pub mod channel;
+pub mod circuit;
+pub mod client;
+pub(crate) mod conflux;
 mod congestion;
 mod crypto;
 pub mod memquota;
-pub mod stream;
 pub(crate) mod tunnel;
 mod util;
+
+#[cfg(feature = "relay")]
+pub(crate) mod relay;
 
 pub use util::err::{Error, ResolveError};
 pub use util::skew::ClockSkew;
 
 pub use channel::params::ChannelPaddingInstructions;
+pub use client::{ClientTunnel, HopLocation, TargetHop};
 pub use congestion::params as ccparams;
 pub use crypto::cell::{HopNum, HopNumDisplay};
-pub use tunnel::{circuit, HopLocation, TargetHop};
+#[cfg(feature = "send-control-msg")]
+#[cfg_attr(docsrs, doc(cfg(feature = "send-control-msg")))]
+pub use {
+    crate::client::Conversation,
+    crate::client::msghandler::{MsgHandler, UserMsgHandler},
+    crate::client::reactor::MetaCellDisposition,
+};
 
 /// A Result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
 use std::fmt::Debug;
 use tor_memquota::{
-    mq_queue::{self, ChannelSpec as _},
     HasMemoryCost,
+    mq_queue::{self, ChannelSpec as _},
 };
 use tor_rtcompat::DynTimeProvider;
 
@@ -139,7 +151,7 @@ pub fn supported_client_protocols() -> tor_protover::Protocols {
     use tor_protover::named::*;
     // WARNING: REMOVING ELEMENTS FROM THIS LIST CAN BE DANGEROUS!
     // SEE [`tor_protover::doc_changing`]
-    [
+    let mut protocols = vec![
         LINK_V4,
         LINK_V5,
         LINKAUTH_ED25519_SHA256_EXPORTER,
@@ -147,9 +159,14 @@ pub fn supported_client_protocols() -> tor_protover::Protocols {
         RELAY_NTOR,
         RELAY_EXTEND_IPv6,
         RELAY_NTORV3,
-    ]
-    .into_iter()
-    .collect()
+        RELAY_NEGOTIATE_SUBPROTO,
+    ];
+    #[cfg(feature = "flowctl-cc")]
+    protocols.push(FLOWCTRL_CC);
+    #[cfg(feature = "counter-galois-onion")]
+    protocols.push(RELAY_CRYPT_CGO);
+
+    protocols.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -168,12 +185,23 @@ mod test {
     #![allow(clippy::needless_pass_by_value)]
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
 
+    use cfg_if::cfg_if;
+
     use super::*;
 
     #[test]
     fn protocols() {
         let pr = supported_client_protocols();
-        let expected = "FlowCtrl=1 Link=4-5 LinkAuth=3 Relay=2-4".parse().unwrap();
+        cfg_if! {
+            if #[cfg(all(feature="flowctl-cc", feature="counter-galois-onion"))] {
+                let expected = "FlowCtrl=1-2 Link=4-5 LinkAuth=3 Relay=2-6".parse().unwrap();
+            } else if #[cfg(feature="flowctl-cc")] {
+                let expected = "FlowCtrl=1-2 Link=4-5 LinkAuth=3 Relay=2-5".parse().unwrap();
+                // (Note that we don't have to check for cgo without cc, since that isn't possible.)
+            } else {
+                let expected = "FlowCtrl=1 Link=4-5 LinkAuth=3 Relay=2-5".parse().unwrap();
+            }
+        }
         assert_eq!(pr, expected);
     }
 }

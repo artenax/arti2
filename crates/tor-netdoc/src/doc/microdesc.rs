@@ -19,8 +19,8 @@ use crate::types::family::{RelayFamily, RelayFamilyId};
 use crate::types::misc::*;
 use crate::types::policy::PortPolicy;
 use crate::util;
-use crate::util::str::Extent;
 use crate::util::PeekableIterator;
+use crate::util::str::Extent;
 use crate::{AllowAnnotations, Error, NetdocErrorKind as EK, Result};
 use tor_error::internal;
 use tor_llcrypto::d;
@@ -39,6 +39,9 @@ mod build;
 #[cfg(feature = "build_docs")]
 pub use build::MicrodescBuilder;
 
+/// Length of a router microdescriptor digest
+pub const DOC_DIGEST_LEN: usize = 32;
+
 /// Annotations prepended to a microdescriptor that has been stored to
 /// disk.
 #[allow(dead_code)]
@@ -50,7 +53,7 @@ pub struct MicrodescAnnotation {
 }
 
 /// The digest of a microdescriptor as used in microdesc consensuses
-pub type MdDigest = [u8; 32];
+pub type MdDigest = [u8; DOC_DIGEST_LEN];
 
 /// A single microdescriptor.
 #[allow(dead_code)]
@@ -584,8 +587,8 @@ mod test {
 
     #[test]
     fn test_bad() {
-        use crate::types::policy::PolicyError;
         use crate::Pos;
+        use crate::types::policy::PolicyError;
         fn check(fname: &str, e: &Error) {
             let content = read_bad(fname);
             let res = Microdesc::parse(&content);

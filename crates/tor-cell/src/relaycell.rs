@@ -4,7 +4,7 @@ use std::num::NonZeroU16;
 
 use crate::chancell::{BoxedCellBody, CELL_DATA_LEN};
 use derive_deftly::Deftly;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use tor_bytes::{EncodeError, EncodeResult, Error, Result};
 use tor_bytes::{Reader, Writer};
 use tor_error::internal;
@@ -364,6 +364,17 @@ impl RelayCellDecoderResult {
     pub fn incomplete_info(&self) -> Option<IncompleteRelayMsgInfo> {
         self.incomplete.clone()
     }
+
+    /// Return true if this consists of nothing but padding.
+    pub fn is_padding(&self) -> bool {
+        // If all the messages we have are padding...
+        self.msgs.iter().all(|m| m.cmd() == RelayCmd::DROP) &&
+            // ... and any pending incomplete message is either absent or is padding...
+            self.incomplete
+                .as_ref()
+                .is_none_or(|incomplete| incomplete.cmd() == RelayCmd::DROP)
+        // ... then this is padding.
+    }
 }
 
 /// Information about a relay message for which we don't yet have the complete body.
@@ -678,7 +689,7 @@ impl<M: RelayMsg> RelayMsgOuter<M> {
         w.assert_offset_is(STREAM_ID_OFFSET_V0);
         w.write_u16(StreamId::get_or_zero(self.streamid));
         w.write_u32(0); // Digest
-                        // (It would be simpler to use NestedWriter at this point, but it uses an internal Vec that we are trying to avoid.)
+        // (It would be simpler to use NestedWriter at this point, but it uses an internal Vec that we are trying to avoid.)
         w.assert_offset_is(LEN_POS);
         w.write_u16(0); // Length.
         w.assert_offset_is(BODY_POS);
@@ -727,7 +738,7 @@ impl<M: RelayMsg> RelayMsgOuter<M> {
             (_, id) => {
                 return Err(EncodeError::Bug(internal!(
                     "Tried to encode invalid stream ID {id:?} for {cmd}"
-                )))
+                )));
             }
         }
         w.assert_offset_is(body_pos);
@@ -818,7 +829,7 @@ impl<M: RelayMsg> RelayMsgOuter<M> {
             StreamIdReq::Unrecognized | StreamIdReq::Any => {
                 return Err(Error::InvalidMessage(
                     format!("Unrecognized relay command {cmd}").into(),
-                ))
+                ));
             }
         };
         if r.remaining() < len {

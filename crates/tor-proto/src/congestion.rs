@@ -142,10 +142,10 @@ pub(crate) struct CongestionWindow {
 
 impl CongestionWindow {
     /// Constructor taking consensus parameters.
-    fn new(params: &CongestionWindowParams) -> Self {
+    fn new(params: CongestionWindowParams) -> Self {
         Self {
             value: params.cwnd_init(),
-            params: params.clone(),
+            params,
             is_full: false,
         }
     }
@@ -280,7 +280,7 @@ impl CongestionControl {
         // Use what the consensus tells us to use.
         let algorithm: Box<dyn CongestionControlAlgorithm> = match params.alg() {
             Algorithm::FixedWindow(p) => Box::new(fixed::FixedWindow::new(*p)),
-            Algorithm::Vegas(ref p) => {
+            Algorithm::Vegas(p) => {
                 let cwnd = CongestionWindow::new(params.cwnd_params());
                 Box::new(vegas::Vegas::new(*p, &state, cwnd))
             }

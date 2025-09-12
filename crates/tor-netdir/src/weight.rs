@@ -12,10 +12,10 @@
 //!   relay provides particularly scarce functionality, we might choose not to
 //!   use it for other roles, or to use it less commonly for them.
 
-use crate::params::NetParameters;
 use crate::ConsensusRelays;
+use crate::params::NetParameters;
 use bitflags::bitflags;
-use tor_netdoc::doc::netstatus::{self, MdConsensus, MdConsensusRouterStatus, NetParams};
+use tor_netdoc::doc::netstatus::{self, MdConsensus, MdRouterStatus, NetParams};
 
 /// Helper: Calculate the function we should use to find initial relay
 /// bandwidths.
@@ -66,8 +66,8 @@ impl BandwidthFn {
     /// Apply this function to the measured or unmeasured bandwidth
     /// of a single relay.
     fn apply(&self, w: &netstatus::RelayWeight) -> u32 {
-        use netstatus::RelayWeight::*;
         use BandwidthFn::*;
+        use netstatus::RelayWeight::*;
         match (self, w) {
             (Uniform, _) => 1,
             (IncludeUnmeasured, Unmeasured(u)) => *u,
@@ -184,7 +184,7 @@ bitflags! {
 
 impl WeightKind {
     /// Return the appropriate WeightKind for a relay.
-    fn for_rs(rs: &MdConsensusRouterStatus) -> Self {
+    fn for_rs(rs: &MdRouterStatus) -> Self {
         let mut r = WeightKind::empty();
         if rs.is_flagged_guard() {
             r |= WeightKind::GUARD;
@@ -236,7 +236,7 @@ impl WeightSet {
     /// NOTE: This function _does not_ consider whether the relay in question
     /// actually matches the given role.  For example, if `role` is Guard
     /// we don't check whether or not `rs` actually has the Guard flag.
-    pub(crate) fn weight_rs_for_role(&self, rs: &MdConsensusRouterStatus, role: WeightRole) -> u64 {
+    pub(crate) fn weight_rs_for_role(&self, rs: &MdRouterStatus, role: WeightRole) -> u64 {
         self.weight_bw_for_role(WeightKind::for_rs(rs), rs.weight(), role)
     }
 
@@ -387,11 +387,7 @@ fn w_param(p: &NetParams<i32>, kwd: &str) -> u32 {
 fn clamp_to_pos(inp: i32) -> u32 {
     // (The spec says that we might encounter negative values here, though
     // we never actually generate them, and don't plan to generate them.)
-    if inp < 0 {
-        0
-    } else {
-        inp as u32
-    }
+    if inp < 0 { 0 } else { inp as u32 }
 }
 
 /// Compute a 'shift' value such that `(a * b) >> shift` will be contained
@@ -429,7 +425,7 @@ mod test {
     use std::net::SocketAddr;
     use std::time::{Duration, SystemTime};
     use tor_basic_utils::test_rng::testing_rng;
-    use tor_netdoc::doc::netstatus::{Lifetime, RelayFlags, RouterStatusBuilder};
+    use tor_netdoc::doc::netstatus::{Lifetime, MdRouterStatusBuilder, RelayFlags};
 
     #[test]
     fn t_clamp() {
@@ -456,9 +452,11 @@ mod test {
         assert_eq!(calculate_shift(1 << 32, 1 << 33), 3);
         assert!(((1_u64 << 32) >> 3).checked_mul(1_u64 << 33).is_some());
         assert_eq!(calculate_shift(432 << 40, 7777 << 40), 38);
-        assert!(((432_u64 << 40) >> 38)
-            .checked_mul(7777_u64 << 40)
-            .is_some());
+        assert!(
+            ((432_u64 << 40) >> 38)
+                .checked_mul(7777_u64 << 40)
+                .is_some()
+        );
     }
 
     #[test]
@@ -498,8 +496,8 @@ mod test {
 
     #[test]
     fn t_apply_bwfn() {
-        use netstatus::RelayWeight::*;
         use BandwidthFn::*;
+        use netstatus::RelayWeight::*;
 
         assert_eq!(Uniform.apply(&Measured(7)), 1);
         assert_eq!(Uniform.apply(&Unmeasured(0)), 1);
@@ -512,8 +510,7 @@ mod test {
     }
 
     // From a fairly recent Tor consensus.
-    const TESTVEC_PARAMS: &str =
-        "Wbd=0 Wbe=0 Wbg=4096 Wbm=10000 Wdb=10000 Web=10000 Wed=10000 Wee=10000 Weg=10000 Wem=10000 Wgb=10000 Wgd=0 Wgg=5904 Wgm=5904 Wmb=10000 Wmd=0 Wme=0 Wmg=4096 Wmm=10000";
+    const TESTVEC_PARAMS: &str = "Wbd=0 Wbe=0 Wbg=4096 Wbm=10000 Wdb=10000 Web=10000 Wed=10000 Wee=10000 Weg=10000 Wem=10000 Wgb=10000 Wgd=0 Wgg=5904 Wgm=5904 Wmb=10000 Wmd=0 Wme=0 Wmg=4096 Wmm=10000";
 
     #[test]
     fn t_weightset_basic() {
@@ -610,7 +607,7 @@ mod test {
 
     /// Return a routerstatus builder set up to deliver a routerstatus
     /// with most features disabled.
-    fn rs_builder() -> RouterStatusBuilder<[u8; 32]> {
+    fn rs_builder() -> MdRouterStatusBuilder {
         MdConsensus::builder()
             .rs()
             .identity([9; 20].into())

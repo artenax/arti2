@@ -4,21 +4,22 @@ use crate::path::{OwnedPath, TorPath};
 use crate::timeouts::{self, Action};
 use crate::{Error, Result};
 use async_trait::async_trait;
-use futures::task::SpawnExt;
 use futures::Future;
+use futures::task::SpawnExt;
 use oneshot_fused_workaround as oneshot;
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc,
+    atomic::{AtomicU32, Ordering},
 };
 use std::time::{Duration, Instant};
 use tor_chanmgr::{ChanMgr, ChanProvenance, ChannelUsage};
 use tor_error::into_internal;
 use tor_guardmgr::GuardStatus;
-use tor_linkspec::{ChanTarget, IntoOwnedChanTarget, OwnedChanTarget, OwnedCircTarget};
+use tor_linkspec::{IntoOwnedChanTarget, OwnedChanTarget, OwnedCircTarget};
 use tor_netdir::params::NetParameters;
+use tor_proto::ClientTunnel;
 use tor_proto::ccparams::{self, AlgorithmType};
-use tor_proto::circuit::{CircParameters, ClientCirc, PendingClientCirc};
+use tor_proto::client::circuit::{CircParameters, PendingClientTunnel};
 use tor_rtcompat::{Runtime, SleepProviderExt};
 use tor_units::Percentage;
 
@@ -38,30 +39,38 @@ pub(crate) use guardstatus::GuardStatusHandle;
 /// complicates things a bit.
 #[async_trait]
 pub(crate) trait Buildable: Sized {
+    /// Our equivalent to a tor_proto::Channel.
+    type Chan: Send + Sync;
+
+    /// Use a channel manager to open a new channel (or find an existing channel)
+    /// to a provided [`OwnedChanTarget`].
+    async fn open_channel<RT: Runtime>(
+        chanmgr: &ChanMgr<RT>,
+        ct: &OwnedChanTarget,
+        guard_status: &GuardStatusHandle,
+        usage: ChannelUsage,
+    ) -> Result<Arc<Self::Chan>>;
+
     /// Launch a new one-hop circuit to a given relay, given only a
     /// channel target `ct` specifying that relay.
     ///
     /// (Since we don't have a CircTarget here, we can't extend the circuit
     /// to be multihop later on.)
     async fn create_chantarget<RT: Runtime>(
-        chanmgr: &ChanMgr<RT>,
+        chan: Arc<Self::Chan>,
         rt: &RT,
-        guard_status: &GuardStatusHandle,
         ct: &OwnedChanTarget,
         params: CircParameters,
-        usage: ChannelUsage,
-    ) -> Result<Arc<Self>>;
+    ) -> Result<Self>;
 
     /// Launch a new circuit through a given relay, given a circuit target
     /// `ct` specifying that relay.
     async fn create<RT: Runtime>(
-        chanmgr: &ChanMgr<RT>,
+        chan: Arc<Self::Chan>,
         rt: &RT,
-        guard_status: &GuardStatusHandle,
         ct: &OwnedCircTarget,
         params: CircParameters,
-        usage: ChannelUsage,
-    ) -> Result<Arc<Self>>;
+    ) -> Result<Self>;
 
     /// Extend this circuit-like object by one hop, to the location described
     /// in `ct`.
@@ -73,40 +82,17 @@ pub(crate) trait Buildable: Sized {
     ) -> Result<()>;
 }
 
-/// Try to make a [`PendingClientCirc`] to a given relay, and start its
+/// Try to make a [`PendingClientTunnel`] to a given relay, and start its
 /// reactor.
 ///
 /// This is common code, shared by all the first-hop functions in the
-/// implementation of `Buildable` for `Arc<ClientCirc>`.
-async fn create_common<RT: Runtime, CT: ChanTarget>(
-    chanmgr: &ChanMgr<RT>,
+/// implementation of `Buildable` for `ClientTunnel`.
+async fn create_common<RT: Runtime>(
+    chan: Arc<tor_proto::channel::Channel>,
     rt: &RT,
-    target: &CT,
-    guard_status: &GuardStatusHandle,
-    usage: ChannelUsage,
-) -> Result<PendingClientCirc> {
-    // Get or construct the channel.
-    let result = chanmgr.get_or_launch(target, usage).await;
-
-    // Report the clock skew if appropriate, and exit if there has been an error.
-    let chan = match result {
-        Ok((chan, ChanProvenance::NewlyCreated)) => {
-            guard_status.skew(chan.clock_skew());
-            chan
-        }
-        Ok((chan, _)) => chan,
-        Err(cause) => {
-            if let Some(skew) = cause.clock_skew() {
-                guard_status.skew(skew);
-            }
-            return Err(Error::Channel {
-                peer: target.to_logged(),
-                cause,
-            });
-        }
-    };
+) -> Result<PendingClientTunnel> {
     // Construct the (zero-hop) circuit.
-    let (pending_circ, reactor) = chan.new_circ().await.map_err(|error| Error::Protocol {
+    let (pending_tunnel, reactor) = chan.new_tunnel().await.map_err(|error| Error::Protocol {
         error,
         peer: None, // we don't blame the peer, because new_circ() does no networking.
         action: "initializing circuit",
@@ -118,22 +104,54 @@ async fn create_common<RT: Runtime, CT: ChanTarget>(
     })
     .map_err(|e| Error::from_spawn("circuit reactor task", e))?;
 
-    Ok(pending_circ)
+    Ok(pending_tunnel)
 }
 
 #[async_trait]
-impl Buildable for ClientCirc {
-    async fn create_chantarget<RT: Runtime>(
+impl Buildable for ClientTunnel {
+    type Chan = tor_proto::channel::Channel;
+
+    async fn open_channel<RT: Runtime>(
         chanmgr: &ChanMgr<RT>,
-        rt: &RT,
+        target: &OwnedChanTarget,
         guard_status: &GuardStatusHandle,
+        usage: ChannelUsage,
+    ) -> Result<Arc<Self::Chan>> {
+        // If we fail now, it's the guard's fault.
+        guard_status.pending(GuardStatus::Failure);
+
+        // Get or construct the channel.
+        let result = chanmgr.get_or_launch(target, usage).await;
+
+        // Report the clock skew if appropriate, and exit if there has been an error.
+        match result {
+            Ok((chan, ChanProvenance::NewlyCreated)) => {
+                guard_status.skew(chan.clock_skew());
+                Ok(chan)
+            }
+            Ok((chan, _)) => Ok(chan),
+            Err(cause) => {
+                if let Some(skew) = cause.clock_skew() {
+                    guard_status.skew(skew);
+                }
+                Err(Error::Channel {
+                    peer: target.to_logged(),
+                    cause,
+                })
+            }
+        }
+    }
+
+    async fn create_chantarget<RT: Runtime>(
+        chan: Arc<Self::Chan>,
+        rt: &RT,
         ct: &OwnedChanTarget,
         params: CircParameters,
-        usage: ChannelUsage,
-    ) -> Result<Arc<Self>> {
-        let circ = create_common(chanmgr, rt, ct, guard_status, usage).await?;
-        let unique_id = Some(circ.peek_unique_id());
-        circ.create_firsthop_fast(params)
+    ) -> Result<Self> {
+        let pending_tunnel = create_common(chan, rt).await?;
+        let unique_id = Some(pending_tunnel.peek_unique_id());
+        pending_tunnel
+            .create_firsthop_fast(params)
             .await
             .map_err(|error| Error::Protocol {
                 peer: Some(ct.to_logged()),
@@ -143,18 +161,15 @@ impl Buildable for ClientCirc {
             })
     }
     async fn create<RT: Runtime>(
-        chanmgr: &ChanMgr<RT>,
+        chan: Arc<Self::Chan>,
         rt: &RT,
-        guard_status: &GuardStatusHandle,
         ct: &OwnedCircTarget,
         params: CircParameters,
-        usage: ChannelUsage,
-    ) -> Result<Arc<Self>> {
-        let circ = create_common(chanmgr, rt, ct, guard_status, usage).await?;
-        let unique_id = Some(circ.peek_unique_id());
+    ) -> Result<Self> {
+        let pending_tunnel = create_common(chan, rt).await?;
+        let unique_id = Some(pending_tunnel.peek_unique_id());
 
-        let handshake_res = circ.create_firsthop(ct, params).await;
-
+        let handshake_res = pending_tunnel.create_firsthop(ct, params).await;
         handshake_res.map_err(|error| Error::Protocol {
             peer: Some(ct.to_logged()),
             error,
@@ -168,9 +183,14 @@ impl Buildable for ClientCirc {
         ct: &OwnedCircTarget,
         params: CircParameters,
     ) -> Result<()> {
-        // use "ClientCirc::" name to avoid calling _this_ method.
-        let res = ClientCirc::extend(self, ct, params).await;
+        let circ = self.as_single_circ().map_err(|error| Error::Protocol {
+            peer: Some(ct.to_logged()),
+            error,
+            action: "extend tunnel",
+            unique_id: Some(self.unique_id()),
+        })?;
 
+        let res = circ.extend(ct, params).await;
         res.map_err(|error| Error::Protocol {
             error,
             // We can't know who caused the error, since it may have been
@@ -183,9 +203,9 @@ impl Buildable for ClientCirc {
     }
 }
 
-/// An implementation type for [`CircuitBuilder`].
+/// An implementation type for [`TunnelBuilder`].
 ///
-/// A `CircuitBuilder` holds references to all the objects that are needed
+/// A `TunnelBuilder` holds references to all the objects that are needed
 /// to build circuits correctly.
 ///
 /// In general, you should not need to construct or use this object yourself,
@@ -219,30 +239,22 @@ impl<R: Runtime, C: Buildable + Sync + Send + 'static> Builder<R, C> {
     /// `guard_status` has its pending status set correctly to correspond
     /// to a circuit failure at any given stage.
     ///
+    /// Requires that `channel` is a channel to the first hop of `path`.
+    ///
     /// (TODO: Find
     /// a better design there.)
     async fn build_notimeout(
         self: Arc<Self>,
         path: OwnedPath,
+        channel: Arc<C::Chan>,
         params: CircParameters,
         start_time: Instant,
         n_hops_built: Arc<AtomicU32>,
         guard_status: Arc<GuardStatusHandle>,
-        usage: ChannelUsage,
-    ) -> Result<Arc<C>> {
+    ) -> Result<C> {
         match path {
             OwnedPath::ChannelOnly(target) => {
-                // If we fail now, it's the guard's fault.
-                guard_status.pending(GuardStatus::Failure);
-                let circ = C::create_chantarget(
-                    &self.chanmgr,
-                    &self.runtime,
-                    &guard_status,
-                    &target,
-                    params,
-                    usage,
-                )
-                .await?;
+                let circ = C::create_chantarget(channel, &self.runtime, &target, params).await?;
                 self.timeouts
                     .note_hop_completed(0, self.runtime.now() - start_time, true);
                 n_hops_built.fetch_add(1, Ordering::SeqCst);
@@ -251,18 +263,8 @@ impl<R: Runtime, C: Buildable + Sync + Send + 'static> Builder<R, C> {
             OwnedPath::Normal(p) => {
                 assert!(!p.is_empty());
                 let n_hops = p.len() as u8;
-                // If we fail now, it's the guard's fault.
-                guard_status.pending(GuardStatus::Failure);
                 // Each hop has its own circ parameters. This is for the first hop (CREATE).
-                let circ = C::create(
-                    &self.chanmgr,
-                    &self.runtime,
-                    &guard_status,
-                    &p[0],
-                    params.clone(),
-                    usage,
-                )
-                .await?;
+                let circ = C::create(channel, &self.runtime, &p[0], params.clone()).await?;
                 self.timeouts
                     .note_hop_completed(0, self.runtime.now() - start_time, n_hops == 0);
                 // If we fail after this point, we can't tell whether it's
@@ -293,10 +295,9 @@ impl<R: Runtime, C: Buildable + Sync + Send + 'static> Builder<R, C> {
         params: &CircParameters,
         guard_status: Arc<GuardStatusHandle>,
         usage: ChannelUsage,
-    ) -> Result<Arc<C>> {
+    ) -> Result<C> {
         let action = Action::BuildCircuit { length: path.len() };
         let (timeout, abandon_timeout) = self.timeouts.timeouts(&action);
-        let start_time = self.runtime.now();
 
         // TODO: This is probably not the best way for build_notimeout to
         // tell us how many hops it managed to build, but at least it is
@@ -306,13 +307,27 @@ impl<R: Runtime, C: Buildable + Sync + Send + 'static> Builder<R, C> {
         let self_clone = Arc::clone(self);
         let params = params.clone();
 
+        // We open the channel separately from the rest of the circuit, since we don't want to count
+        // it towards the circuit timeout.
+        //
+        // We don't need a separate timeout here, since ChanMgr already implements its own timeouts.
+        let channel = C::open_channel(
+            &self.chanmgr,
+            path.first_hop_as_chantarget(),
+            guard_status.as_ref(),
+            usage,
+        )
+        .await?;
+
+        let start_time = self.runtime.now();
+
         let circuit_future = self_clone.build_notimeout(
             path,
+            channel,
             params,
             start_time,
             Arc::clone(&hops_built),
             guard_status,
-            usage,
         );
 
         match double_timeout(&self.runtime, circuit_future, timeout, abandon_timeout).await {
@@ -340,14 +355,14 @@ impl<R: Runtime, C: Buildable + Sync + Send + 'static> Builder<R, C> {
 
 /// A factory object to build circuits.
 ///
-/// A `CircuitBuilder` holds references to all the objects that are needed
+/// A `TunnelBuilder` holds references to all the objects that are needed
 /// to build circuits correctly.
 ///
 /// In general, you should not need to construct or use this object yourself,
 /// unless you are choosing your own paths.
-pub struct CircuitBuilder<R: Runtime> {
+pub struct TunnelBuilder<R: Runtime> {
     /// The underlying [`Builder`] object
-    builder: Arc<Builder<R, ClientCirc>>,
+    builder: Arc<Builder<R, ClientTunnel>>,
     /// Configuration for how to choose paths for circuits.
     path_config: tor_config::MutCfg<crate::PathConfig>,
     /// State-manager object to use in storing current state.
@@ -360,8 +375,8 @@ pub struct CircuitBuilder<R: Runtime> {
     vanguardmgr: Arc<VanguardMgr<R>>,
 }
 
-impl<R: Runtime> CircuitBuilder<R> {
-    /// Construct a new [`CircuitBuilder`].
+impl<R: Runtime> TunnelBuilder<R> {
+    /// Construct a new [`TunnelBuilder`].
     // TODO: eventually I'd like to make this a public function, but
     // TimeoutStateHandle is private.
     pub(crate) fn new(
@@ -374,7 +389,7 @@ impl<R: Runtime> CircuitBuilder<R> {
     ) -> Self {
         let timeouts = timeouts::Estimator::from_storage(&storage);
 
-        CircuitBuilder {
+        TunnelBuilder {
             builder: Arc::new(Builder::new(runtime, chanmgr, timeouts)),
             path_config: path_config.into(),
             storage,
@@ -443,7 +458,7 @@ impl<R: Runtime> CircuitBuilder<R> {
         params: &CircParameters,
         guard_status: Arc<GuardStatusHandle>,
         usage: ChannelUsage,
-    ) -> Result<Arc<ClientCirc>> {
+    ) -> Result<ClientTunnel> {
         self.builder
             .build_owned(path, params, guard_status, usage)
             .await
@@ -460,7 +475,7 @@ impl<R: Runtime> CircuitBuilder<R> {
         path: &TorPath<'_>,
         params: &CircParameters,
         usage: ChannelUsage,
-    ) -> Result<Arc<ClientCirc>> {
+    ) -> Result<ClientTunnel> {
         let owned = path.try_into()?;
         self.build_owned(owned, params, Arc::new(None.into()), usage)
             .await
@@ -579,27 +594,17 @@ fn circparameters_from_netparameters(
 pub fn exit_circparams_from_netparams(inp: &NetParameters) -> Result<CircParameters> {
     let alg = match AlgorithmType::from(inp.cc_alg.get()) {
         #[cfg(feature = "flowctl-cc")]
-        AlgorithmType::VEGAS => {
-            // TODO(arti#88): We always use fixed window for now,
-            // even with the "flowctl-cc" feature enabled:
-            // https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/2932#note_3191196
-            // We use `if false` so that the vegas cc code is still type checked.
-            if false {
-                build_cc_vegas(
-                    inp,
-                    (
-                        inp.cc_vegas_alpha_exit.into(),
-                        inp.cc_vegas_beta_exit.into(),
-                        inp.cc_vegas_delta_exit.into(),
-                        inp.cc_vegas_gamma_exit.into(),
-                        inp.cc_vegas_sscap_exit.into(),
-                    )
-                        .into(),
-                )
-            } else {
-                build_cc_fixedwindow(inp)
-            }
-        }
+        AlgorithmType::VEGAS => build_cc_vegas(
+            inp,
+            (
+                inp.cc_vegas_alpha_exit.into(),
+                inp.cc_vegas_beta_exit.into(),
+                inp.cc_vegas_delta_exit.into(),
+                inp.cc_vegas_gamma_exit.into(),
+                inp.cc_vegas_sscap_exit.into(),
+            )
+                .into(),
+        ),
         // Unrecognized, fallback to fixed window as in SENDME v0.
         _ => build_cc_fixedwindow(inp),
     };
@@ -612,25 +617,20 @@ pub fn onion_circparams_from_netparams(inp: &NetParameters) -> Result<CircParame
     let alg = match AlgorithmType::from(inp.cc_alg.get()) {
         #[cfg(feature = "flowctl-cc")]
         AlgorithmType::VEGAS => {
-            // TODO(arti#88): We always use fixed window for now,
-            // even with the "flowctl-cc" feature enabled:
-            // https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/2932#note_3191196
-            // We use `if false` so that the vegas cc code is still type checked.
-            if false {
-                build_cc_vegas(
-                    inp,
-                    (
-                        inp.cc_vegas_alpha_onion.into(),
-                        inp.cc_vegas_beta_onion.into(),
-                        inp.cc_vegas_delta_onion.into(),
-                        inp.cc_vegas_gamma_onion.into(),
-                        inp.cc_vegas_sscap_onion.into(),
-                    )
-                        .into(),
+            // NOTE: At the time of writing, we don't yet support cc negotiation for onion services.
+            // See `HopSettings::onion_circparams_from_netparams()` where we use a fallback
+            // algorithm for HsV3 circuits instead, and see arti#2037.
+            build_cc_vegas(
+                inp,
+                (
+                    inp.cc_vegas_alpha_onion.into(),
+                    inp.cc_vegas_beta_onion.into(),
+                    inp.cc_vegas_delta_onion.into(),
+                    inp.cc_vegas_gamma_onion.into(),
+                    inp.cc_vegas_sscap_onion.into(),
                 )
-            } else {
-                build_cc_fixedwindow(inp)
-            }
+                    .into(),
+            )
         }
         // Unrecognized, fallback to fixed window as in SENDME v0.
         _ => build_cc_fixedwindow(inp),
@@ -708,6 +708,7 @@ mod test {
     use std::sync::Mutex;
     use tor_chanmgr::ChannelConfig;
     use tor_chanmgr::ChannelUsage as CU;
+    use tor_linkspec::ChanTarget;
     use tor_linkspec::{HasRelayIds, RelayIdType, RelayIds};
     use tor_llcrypto::pk::ed25519::Ed25519Identity;
     use tor_memquota::ArcMemoryQuotaTrackerExt as _;
@@ -882,14 +883,23 @@ mod test {
     }
     #[async_trait]
     impl Buildable for Mutex<FakeCirc> {
-        async fn create_chantarget<RT: Runtime>(
-            _: &ChanMgr<RT>,
-            rt: &RT,
+        type Chan = ();
+
+        async fn open_channel<RT: Runtime>(
+            _chanmgr: &ChanMgr<RT>,
+            _ct: &OwnedChanTarget,
             _guard_status: &GuardStatusHandle,
+            _usage: ChannelUsage,
+        ) -> Result<Arc<Self::Chan>> {
+            Ok(Arc::new(()))
+        }
+
+        async fn create_chantarget<RT: Runtime>(
+            _: Arc<Self::Chan>,
+            rt: &RT,
             ct: &OwnedChanTarget,
             _: CircParameters,
-            _usage: ChannelUsage,
-        ) -> Result<Arc<Self>> {
+        ) -> Result<Self> {
             let (d1, d2) = timeouts_from_chantarget(ct);
             rt.sleep(d1).await;
             if !d2.is_zero() {
@@ -900,16 +910,14 @@ mod test {
                 hops: vec![RelayIds::from_relay_ids(ct)],
                 onehop: true,
             };
-            Ok(Arc::new(Mutex::new(c)))
+            Ok(Mutex::new(c))
         }
         async fn create<RT: Runtime>(
-            _: &ChanMgr<RT>,
+            _: Arc<Self::Chan>,
             rt: &RT,
-            _guard_status: &GuardStatusHandle,
             ct: &OwnedCircTarget,
             _: CircParameters,
-            _usage: ChannelUsage,
-        ) -> Result<Arc<Self>> {
+        ) -> Result<Self> {
             let (d1, d2) = timeouts_from_chantarget(ct);
             rt.sleep(d1).await;
             if !d2.is_zero() {
@@ -920,7 +928,7 @@ mod test {
                 hops: vec![RelayIds::from_relay_ids(ct)],
                 onehop: false,
             };
-            Ok(Arc::new(Mutex::new(c)))
+            Ok(Mutex::new(c))
         }
         async fn extend<RT: Runtime>(
             &self,
@@ -1045,6 +1053,7 @@ mod test {
             Default::default(),
             &Default::default(),
             ToplevelAccount::new_noop(),
+            None,
         ));
         // always has 3 second timeout, 100 second abandon.
         let timeouts = match advance_on_timeout {
@@ -1184,8 +1193,8 @@ mod test {
 
             assert!(timeouts[1].0); // success
             assert_eq!(timeouts[1].1, 2); // three-hop
-                                          // BUG: This timer is not always reliable, due to races.
-                                          //assert_eq!(timeouts[1].2, Duration::from_millis(3300));
+            // BUG: This timer is not always reliable, due to races.
+            //assert_eq!(timeouts[1].2, Duration::from_millis(3300));
         });
     }
 }

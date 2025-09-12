@@ -1,8 +1,8 @@
 //! Implementation for encoding and decoding of ChanCells.
 
-use super::{ChanCell, CELL_DATA_LEN};
-use crate::chancell::{ChanCmd, ChanMsg, CircId};
+use super::{CELL_DATA_LEN, ChanCell};
 use crate::Error;
+use crate::chancell::{ChanCmd, ChanMsg, CircId};
 use tor_bytes::{self, Reader, Writer};
 use tor_error::internal;
 
@@ -47,6 +47,11 @@ impl ChannelCodec {
         ChannelCodec { link_version }
     }
 
+    /// Return the link protocol version of this codec.
+    pub fn link_version(&self) -> u16 {
+        self.link_version
+    }
+
     /// Write the given cell into the provided BytesMut object.
     pub fn write_cell<M: ChanMsg>(
         &mut self,
@@ -58,7 +63,9 @@ impl ChannelCodec {
         dst.write_u32(CircId::get_or_zero(circid));
         dst.write_u8(cmd.into());
 
-        let pos = dst.len(); // always 5?
+        // this is typically 5, but not always
+        // (for example if we were given a non-empty `dst`)
+        let pos = dst.len();
 
         // now write the cell body and handle the length.
         if cmd.is_var_cell() {

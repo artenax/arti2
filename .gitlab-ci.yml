@@ -1,10 +1,3 @@
-include:
-  - project: tpo/tpa/ci-templates
-    file: [ dependency_proxy.yml ]
-    inputs: { namespace: tpo/core }
-    rules:
-      - if: $CI_PROJECT_URL =~ /gitlab.torproject.org/
-
 stages:
   - check
   - build
@@ -12,20 +5,25 @@ stages:
   - deploy
 
 variables:
-  # Don't fail pulling images if dependency_proxy.yml is not included
-  DOCKER_REGISTRY_URL: "docker.io"
   # We don't need Husky to install the Git hooks for CI.
   CARGO_HUSKY_DONT_INSTALL_HOOKS: "true"
   # fs-mistrust doesn't like umask 0
   FF_DISABLE_UMASK_FOR_DOCKER_EXECUTOR: "true"
   # Enable timestamps in job log lines.
   FF_TIMESTAMPS: "true"
-  # Pinned CI image for must Rust tests
+  # Pinned CI image for most Rust tests
   # Using "amd64/" single-arch variant to work around https://gitlab.torproject.org/tpo/tpa/team/-/issues/41621.
-  RECENT_RUST_IMAGE: "${DOCKER_REGISTRY_URL}/amd64/rust:1.86.0-bookworm"
+  RECENT_RUST_IMAGE: "docker.io/amd64/rust:1.89.0-bookworm"
   # Pinned chutney version.
-  # Last updated 2025-05-29
-  CHUTNEY_COMMIT: "81644208aa7367857693a60addee3e792a6c9625"
+  # main @ 2025-07-16
+  CHUTNEY_COMMIT: "f9435e45f826a265dd3b7d341356cb04f1aa7b09"
+  # Profile to use when building the arti bins that we use for integration tests.
+  # When changing this, also update ARTI_CI_PROFILE_PATH, below.
+  ARTI_CI_PROFILE: quicktest
+  # The *path* under `target/<platform>/` where cargo puts builds of profile
+  # `ARTI_CI_PROFILE`.  This is *usually* the same as name of the profile, but
+  # for profile `dev` is `debug`.
+  ARTI_CI_PROFILE_PATH: quicktest
 
 default:
   image:
@@ -71,13 +69,13 @@ default:
 
 check-editorconfig:
   stage: check
-  image: ${DOCKER_REGISTRY_URL}/mstruebing/editorconfig-checker
+  image: docker.io/mstruebing/editorconfig-checker
   script:
     - ec
 
 shellcheck:
   stage: check
-  image: ${DOCKER_REGISTRY_URL}/koalaman/shellcheck-alpine
+  image: docker.io/koalaman/shellcheck-alpine
   script:
     - apk add git bash
     - ./maint/common/shellcheck-all
@@ -109,6 +107,7 @@ maint-checks:
     - ./maint/common/forbid-script-extensions
     - ./maint/common/update-shell-includes --check --all
     - ./maint/cargo-check-publishable
+    - ./maint/check_case_sensitive
 
 maint-check-changelog:
   stage: test
@@ -133,7 +132,7 @@ maint-check-ownership:
 maint-check-cbindgen:
   stage: test
   # cbindgen needs nightly rust to do macro expansion
-  image: ${DOCKER_REGISTRY_URL}/rustlang/rust:nightly
+  image: docker.io/rustlang/rust:nightly
   script:
     - ./maint/common/apt-install python3-toml
     - ./maint/common/via-cargo-install-in-ci cbindgen --version 0.28.0
@@ -165,7 +164,7 @@ rust-checks:
   script:
     - rustup show
     - rustup component add rustfmt
-    - ./maint/common/via-cargo-install-in-ci cargo-sort
+    - ./maint/common/via-cargo-install-in-ci cargo-sort --version 2.0.1
     - ./maint/common/via-cargo-install-in-ci cargo-license --version 0.7.0
     - cargo fmt -- --check
     - ./maint/check_licenses
@@ -200,10 +199,10 @@ cargo-audit:
     - rustup show
 
     - section_start "cargo check"
-    - cargo check --locked --verbose --target x86_64-unknown-linux-gnu
+    - cargo check --locked --target x86_64-unknown-linux-gnu
 
     - section_start "cargo test"
-    - cargo test --verbose --target x86_64-unknown-linux-gnu
+    - cargo test --target x86_64-unknown-linux-gnu
 
     - section_start "cargo clippy"
     - rustup component add clippy
@@ -212,10 +211,10 @@ cargo-audit:
     - cargo clippy --all-features --all-targets -- -D warnings
 
     - section_start "build arti-bench"
-    - cargo build --verbose --release -p arti-bench --target x86_64-unknown-linux-gnu
+    - cargo build --release -p arti-bench --target x86_64-unknown-linux-gnu
 
     - section_start "build arti"
-    - cargo build --locked --verbose --target x86_64-unknown-linux-gnu -p arti
+    - cargo build --profile $ARTI_CI_PROFILE --locked --target x86_64-unknown-linux-gnu -p arti
 
     - section_start "build docs"
     - RUSTDOCFLAGS="-Dwarnings" cargo doc --all-features --document-private-items --no-deps
@@ -226,7 +225,7 @@ rust-recent:
   image: $RECENT_RUST_IMAGE
   script:
     - *rust-recent-script
-    - ./maint/preserve target/x86_64-unknown-linux-gnu/debug/arti target/x86_64-unknown-linux-gnu/release/arti-bench
+    - ./maint/preserve target/x86_64-unknown-linux-gnu/$ARTI_CI_PROFILE_PATH/arti target/x86_64-unknown-linux-gnu/release/arti-bench
   artifacts:
     paths:
       - artifacts
@@ -235,7 +234,7 @@ rust-recent:
 rust-latest:
   stage: test
   # Using "amd64/" single-arch variant to work around https://gitlab.torproject.org/tpo/tpa/team/-/issues/41621.
-  image: ${DOCKER_REGISTRY_URL}/amd64/rust:bookworm
+  image: docker.io/amd64/rust:bookworm
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
   script:
@@ -257,7 +256,8 @@ rust-latest:
     # Note: `-p arti` is *not* already implied by `--bin arti`. If we omit it,
     # we'll get the union of all features needed by anything in the workspace,
     # including examples.
-    - cargo build --verbose
+    - cargo build
+      --profile $ARTI_CI_PROFILE
       --target x86_64-unknown-linux-gnu
       -p arti -p tor-circmgr
       --bin arti
@@ -268,10 +268,10 @@ rust-recent-arti-extra-features:
   image: $RECENT_RUST_IMAGE
   script:
     - *rust-recent-arti-extra-features-script
-    - ./maint/preserve target/x86_64-unknown-linux-gnu/debug/arti
+    - ./maint/preserve target/x86_64-unknown-linux-gnu/$ARTI_CI_PROFILE_PATH/arti
     # Save the full-featured binary under a different name to prevent it from being
     # overwritten by the other jobs that preserve the arti binary.
-    - mv artifacts/target/x86_64-unknown-linux-gnu/debug/arti artifacts/target/x86_64-unknown-linux-gnu/debug/arti-extra
+    - mv artifacts/target/x86_64-unknown-linux-gnu/$ARTI_CI_PROFILE_PATH/arti artifacts/target/x86_64-unknown-linux-gnu/$ARTI_CI_PROFILE_PATH/arti-extra
   artifacts:
     paths:
       - artifacts
@@ -280,7 +280,7 @@ rust-recent-arti-extra-features:
 rust-latest-arti-extra-features:
   stage: test
   # Using "amd64/" single-arch variant to work around https://gitlab.torproject.org/tpo/tpa/team/-/issues/41621.
-  image: ${DOCKER_REGISTRY_URL}/amd64/rust:bookworm
+  image: docker.io/amd64/rust:bookworm
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
   script:
@@ -305,7 +305,7 @@ rust-clippy-nontest:
 
 rust-nightly:
   stage: test
-  image: ${DOCKER_REGISTRY_URL}/rustlang/rust:nightly
+  image: docker.io/rustlang/rust:nightly
   # In case there is a bug in rust:nightly, you can instead pin an older
   # version of the Docker image until that bug is fixed.  To find the
   # SHA256 ID of the last working version of nightly, look at the logs
@@ -315,8 +315,8 @@ rust-nightly:
   allow_failure: true
   script:
     - rustup show
-    - cargo build --verbose --target x86_64-unknown-linux-gnu --all-features
-    - cargo test --verbose --target x86_64-unknown-linux-gnu --all-features
+    - cargo build --target x86_64-unknown-linux-gnu --all-features
+    - cargo test --target x86_64-unknown-linux-gnu --all-features
     - rustup component add clippy
     # We check these extra warnings on CI only, since we don't want to forbid them while developing.
 
@@ -398,8 +398,8 @@ cargo-miri:
   #  1. choose a new Nightly version, for example according to these instructions
   #      https://gitlab.torproject.org/Diziet/rust-derive-deftly/-/blob/main/macros/HACKING.md?ref_type=heads#choosing-which-nightly-rust-version-to-update-to
   #  2. insert the new image hash, and corresponding nightly date, above
-  image: rustlang/rust@sha256:b68e38306c8c67d7c95b88e99e75aeef3610e533ea69f64749e1adce818cf2e1
-  # ^ this is from tags.2024-10-08T13:08+00:00.gz (see HACKING.md)
+  image: rustlang/rust@sha256:f0dbbb1daf8e2a1d40e6a5dc74b03628e64fc020baae68a59e88e06f166d5dd0
+  # ^ this is from tags.2025-06-19T13_08+00_00.gz (see HACKING.md)
   script:
     - rustup component add miri
     # TOOD use miri test more of our crates-containing-unsafe
@@ -415,7 +415,7 @@ coverage:
     - rustup component add llvm-tools
     - ./maint/common/via-cargo-install-in-ci grcov
     # Generate report
-    - ./maint/with_coverage -f cobertura -o coverage.xml cargo test --verbose --all-features
+    - ./maint/with_coverage -f cobertura -o coverage.xml cargo test --all-features
   cache:
     paths:
       - cache
@@ -430,12 +430,12 @@ coverage:
 minimal-versions:
   stage: test
   # Using "amd64/" single-arch variant to work around https://gitlab.torproject.org/tpo/tpa/team/-/issues/41621.
-  image: ${DOCKER_REGISTRY_URL}/amd64/rust:1.83
+  image: docker.io/amd64/rust:1.85.1
   needs: ["rust-checks"]
   script:
     - rustup install nightly
     - ./maint/downgrade_dependencies
-    - cargo test --verbose --target x86_64-unknown-linux-gnu --all-features
+    - cargo test --target x86_64-unknown-linux-gnu --all-features
 
 .build-repro-template:
   stage: test
@@ -444,7 +444,7 @@ minimal-versions:
     TARGET: UNDEFINED--BUG-IN-CI-YAML
   # If you upgrade this image, also change the one in docker_reproducible_build.
   # Using "amd64/" single-arch variant to work around https://gitlab.torproject.org/tpo/tpa/team/-/issues/41621.
-  image: ${DOCKER_REGISTRY_URL}/amd64/rust:1.86.0-alpine3.21
+  image: docker.io/amd64/rust:1.86.0-alpine3.21
   script:
     - apk add bash
     - ./maint/reproducible_build $TARGET
@@ -586,7 +586,11 @@ integration-chutney-shadow:
     - maint/common/apt-install libglib2.0-0
     - stow -d opt -t $HOME/.local shadow
 
-    - tests/chutney/integration-e2e-shadow
+    # Select a random simulation seed to avoid "dooming"
+    # an unlucky MR that hits a low-probability bug.
+    - SEED=$(date +%s)
+
+    - tests/chutney/integration-e2e-shadow --seed="$SEED"
   artifacts:
     paths:
       - benchmark_results.json
@@ -652,9 +656,13 @@ integration-shadow:
     # Ensure newly installed executables can be found
     - hash -r
 
+    # Select a random simulation seed to avoid "dooming"
+    # an unlucky MR that hits a low-probability bug.
+    - SEED=$(date +%s)
+
     - section_start "Run shadow test"
     - pushd tests/shadow
-    - ./run
+    - ./run -s "$SEED"
     - section_end
   artifacts:
     paths:
@@ -739,8 +747,8 @@ cli-test:
     # The rust-latest job runs the CLI tests with all features enabled.
     # This job runs the CLI tests with various feature combinations that aren't
     # covered by the other tests
-    - cargo test --verbose --target x86_64-unknown-linux-gnu -p arti cli_tests
-    - cargo test --verbose --target x86_64-unknown-linux-gnu -p arti --features experimental cli_tests
+    - cargo test --target x86_64-unknown-linux-gnu -p arti cli_tests
+    - cargo test --target x86_64-unknown-linux-gnu -p arti --features experimental cli_tests
 
 coverage-aggregated:
   rules:
@@ -775,7 +783,7 @@ pages:
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_REF_NAME == "main"
   stage: deploy
-  image: ${DOCKER_REGISTRY_URL}/node:lts
+  image: docker.io/node:lts
   script:
     # Install tools needed.
     - maint/common/apt-install git

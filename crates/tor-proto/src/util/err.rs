@@ -1,7 +1,7 @@
 //! Define an error type for the tor-proto crate.
 use std::{sync::Arc, time::Duration};
 use thiserror::Error;
-use tor_cell::relaycell::{msg::EndReason, StreamId};
+use tor_cell::relaycell::{StreamId, msg::EndReason};
 use tor_error::{Bug, ErrorKind, HasKind};
 use tor_linkspec::RelayIdType;
 
@@ -190,15 +190,6 @@ impl Error {
         Error::CellEncodeErr { object, err }
     }
 
-    /// Create an error from a tor_cell error that has occurred while trying to
-    /// decode something of type `object`
-    pub(crate) fn from_cell_dec(err: tor_cell::Error, object: &'static str) -> Error {
-        match err {
-            tor_cell::Error::ChanProto(msg) => Error::ChanProto(msg),
-            _ => Error::CellDecodeErr { err, object },
-        }
-    }
-
     /// Create an error for a tor_bytes error that occurred while parsing
     /// something of type `object`.
     pub(crate) fn from_bytes_err(err: tor_bytes::Error, object: &'static str) -> Error {
@@ -212,10 +203,16 @@ impl Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Self::ChanIoErr(Arc::new(err))
+    }
+}
+
 impl From<Error> for std::io::Error {
     fn from(err: Error) -> std::io::Error {
-        use std::io::ErrorKind;
         use Error::*;
+        use std::io::ErrorKind;
         let kind = match err {
             ChanIoErr(e) | HandshakeIoErr(e) => match Arc::try_unwrap(e) {
                 Ok(e) => return e,
@@ -262,9 +259,9 @@ impl From<Error> for std::io::Error {
 
 impl HasKind for Error {
     fn kind(&self) -> ErrorKind {
-        use tor_bytes::Error as BytesError;
         use Error as E;
         use ErrorKind as EK;
+        use tor_bytes::Error as BytesError;
         match self {
             E::BytesErr {
                 err: BytesError::Bug(e),

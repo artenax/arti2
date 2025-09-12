@@ -5,11 +5,11 @@
 //!
 //! See [`IptManager::run_once`] for discussion of the implementation approach.
 
-use crate::internal_prelude::*;
+use crate::{internal_prelude::*, replay::OpenReplayLogError};
 
-use tor_relay_selection::{RelayExclusion, RelaySelector, RelayUsage};
 use IptStatusStatus as ISS;
 use TrackedStatus as TS;
+use tor_relay_selection::{RelayExclusion, RelaySelector, RelayUsage};
 
 mod persist;
 pub(crate) use persist::IptStorageHandle;
@@ -290,7 +290,7 @@ enum ChooseIptError {
 /// An error that happened while trying to crate an IPT (at a selected relay)
 ///
 /// Used only within the IPT manager.
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub(crate) enum CreateIptError {
     /// Fatal error
     #[error("fatal error")]
@@ -301,14 +301,8 @@ pub(crate) enum CreateIptError {
     Keystore(#[from] tor_keymgr::Error),
 
     /// Error opening the intro request replay log
-    #[error("unable to open the intro req replay log: {file:?}")]
-    OpenReplayLog {
-        /// What filesystem object we tried to do it to
-        file: PathBuf,
-        /// What happened
-        #[source]
-        error: Arc<io::Error>,
-    },
+    #[error(transparent)]
+    OpenReplayLog(#[from] OpenReplayLogError),
 }
 
 //========== Relays we've chosen, and IPTs ==========
@@ -1806,7 +1800,7 @@ mod test {
     use slotmap_careful::DenseSlotMap;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
-    use test_temp_dir::{test_temp_dir, TestTempDir};
+    use test_temp_dir::{TestTempDir, test_temp_dir};
     use tor_basic_utils::test_rng::TestingRng;
     use tor_netdir::testprovider::TestNetDirProvider;
     use tor_rtmock::MockRuntime;
@@ -1973,9 +1967,9 @@ mod test {
             assert_eq!(runtime.mock_task().n_tasks(), 1); // just us
         }
 
-        fn estabs_inventory(&self) -> impl Eq + Debug + 'static {
+        fn estabs_inventory(&self) -> impl Eq + Debug + 'static + use<> {
             let estabs = self.estabs.lock().unwrap();
-            let estabs = estabs
+            estabs
                 .values()
                 .map(|MockEstabState { params: p, .. }| {
                     (
@@ -1992,8 +1986,7 @@ mod test {
                         ),
                     )
                 })
-                .collect::<BTreeMap<_, _>>();
-            estabs
+                .collect::<BTreeMap<_, _>>()
         }
     }
 

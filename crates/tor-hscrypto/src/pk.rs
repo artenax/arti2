@@ -8,10 +8,10 @@ use std::fmt::{self, Debug, Display};
 use std::str::FromStr;
 
 use digest::Digest;
-use itertools::{chain, Itertools};
+use itertools::{Itertools, chain};
 use safelog::DisplayRedacted;
 use thiserror::Error;
-use tor_basic_utils::{impl_debug_hex, StrExt as _};
+use tor_basic_utils::{StrExt as _, impl_debug_hex};
 use tor_key_forge::ToEncodableKey;
 use tor_llcrypto::d::Sha3_256;
 use tor_llcrypto::pk::ed25519::{Ed25519PublicKey, Ed25519SigningKey};
@@ -139,7 +139,7 @@ impl safelog::DisplayRedacted for HsId {
         // 8 of those bits are the version, which is currently always 0x03.
         // So we are showing 7 bits derived from the site key.
 
-        write!(f, "???{}", &unredacted[DATA - 3..])
+        write!(f, "[…]{}", &unredacted[DATA - 3..])
     }
 }
 
@@ -809,7 +809,7 @@ mod test {
             assert_eq!(format!("{:?}", &hsid), format!("HsId({})", onion));
         });
 
-        assert_eq!(format!("{}", hsid.display_redacted()), "???sid.onion");
+        assert_eq!(format!("{}", hsid.display_redacted()), "[…]sid.onion");
     }
 
     #[test]

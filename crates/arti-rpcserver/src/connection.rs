@@ -12,21 +12,21 @@ use std::{
 use asynchronous_codec::JsonCodecError;
 use derive_deftly::Deftly;
 use futures::{
+    AsyncWriteExt as _, FutureExt, Sink, SinkExt as _, StreamExt,
     channel::mpsc,
     stream::{FusedStream, FuturesUnordered},
-    AsyncWriteExt as _, FutureExt, Sink, SinkExt as _, StreamExt,
 };
 use rpc::dispatch::BoxedUpdateSink;
 use serde_json::error::Category as JsonErrorCategory;
-use tor_async_utils::{mpsc_channel_no_memquota, SinkExt as _};
+use tor_async_utils::{SinkExt as _, mpsc_channel_no_memquota};
 
 use crate::{
+    RpcMgr,
     cancel::{self, Cancel, CancelHandle},
     err::RequestParseError,
     globalid::{GlobalId, MacKey},
     msgs::{BoxedResponse, FlexibleRequest, ReqMeta, Request, RequestId, ResponseBody},
     objmap::{GenIdx, ObjMap},
-    RpcMgr,
 };
 
 use tor_rpcbase::templates::*;
@@ -171,18 +171,12 @@ impl Connection {
     /// If possible, convert an `ObjectId` into a `GenIdx` that can be used in
     /// this connection's ObjMap.
     fn id_into_local_idx(&self, id: &rpc::ObjectId) -> Result<GenIdx, rpc::LookupError> {
-        // TODO RPC: Use a tag byte instead of a magic length.
-
-        if id.as_ref().len() == GlobalId::B64_ENCODED_LEN {
-            // This is the right length to be a GlobalId; let's see if it really
-            // is one.
-            //
-            // Design note: It's not really necessary from a security POV to
-            // check the MAC here; any possible GenIdx we return will either
-            // refer to some object we're allowed to name in this session, or to
-            // no object at all.  Still, we check anyway, since it shouldn't
-            // hurt to do so.
-            let global_id = GlobalId::try_decode(&self.global_id_mac_key, id)?;
+        // Design note: It's not really necessary from a security POV to
+        // check the MAC here; any possible GenIdx we return will either
+        // refer to some object we're allowed to name in this session, or to
+        // no object at all.  Still, we check anyway, since it shouldn't
+        // hurt to do so.
+        if let Some(global_id) = GlobalId::try_decode(&self.global_id_mac_key, id)? {
             // We have a GlobalId with a valid MAC. Let's make sure it applies
             // to this connection's ObjMap.  (We do not support referring to
             // anyone else's objects.)
@@ -586,8 +580,8 @@ impl ConnectionError {
     /// Such errors should be tolerated without much complaint;
     /// other errors should at least be logged somewhere.
     fn is_connection_close(&self) -> bool {
-        use std::io::ErrorKind as IK;
         use JsonErrorCategory as JK;
+        use std::io::ErrorKind as IK;
         #[allow(clippy::match_like_matches_macro)]
         match self {
             Self::ReadFailed(e) | Self::WriteFailed(e) => match e.kind() {
@@ -729,8 +723,8 @@ pub(crate) enum CancelError {
 
 impl From<cancel::CannotCancel> for CancelError {
     fn from(value: cancel::CannotCancel) -> Self {
-        use cancel::CannotCancel as CC;
         use CancelError as CE;
+        use cancel::CannotCancel as CC;
         match value {
             CC::Cancelled => CE::AlreadyCancelled,
             // We map "finished" to RequestNotFound since it is not in the general case
@@ -742,8 +736,8 @@ impl From<cancel::CannotCancel> for CancelError {
 
 impl From<CancelError> for RpcError {
     fn from(err: CancelError) -> Self {
-        use rpc::RpcErrorKind as REK;
         use CancelError as CE;
+        use rpc::RpcErrorKind as REK;
         let code = match err {
             CE::RequestNotFound => REK::RequestError,
             CE::CannotCancelRequest => REK::RequestError,

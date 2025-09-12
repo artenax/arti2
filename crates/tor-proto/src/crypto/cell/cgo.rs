@@ -21,17 +21,16 @@
 use aes::{Aes128, Aes128Dec, Aes128Enc, Aes256, Aes256Dec, Aes256Enc};
 use cipher::{BlockCipher, BlockDecrypt, BlockEncrypt, BlockSizeUser, StreamCipher as _};
 use digest::KeyInit;
-use polyval::{universal_hash::UniversalHash, Polyval};
-use static_assertions::const_assert;
+use polyval::{Polyval, universal_hash::UniversalHash};
 use tor_cell::{
-    chancell::{ChanCmd, CELL_DATA_LEN},
+    chancell::{CELL_DATA_LEN, ChanCmd},
     relaycell::msg::SendmeTag,
 };
 use tor_error::internal;
 use zeroize::Zeroizing;
 
 use super::{CryptInit, RelayCellBody};
-use crate::{circuit::CircuitBinding, util::ct};
+use crate::{client::circuit::CircuitBinding, util::ct};
 
 /// Size of CGO tag, in bytes.
 const CGO_TAG_LEN: usize = 16;
@@ -200,7 +199,7 @@ mod prf {
     const PRF_N0_LEN: usize = CGO_PAYLOAD_LEN;
     /// Offset of the PRF's output when used with t=1.
     const PRF_N1_OFFSET: usize = 31 * 16;
-    const_assert!(PRF_N1_OFFSET >= PRF_N0_LEN);
+    const _: () = assert!(PRF_N1_OFFSET >= PRF_N0_LEN);
 
     /// Pseudorandom function based on CTR128, Polyval, and an underlying block cipher.
     //
@@ -679,8 +678,8 @@ mod test {
 
     #[test]
     fn testvec_polyval() {
-        use polyval::universal_hash::{KeyInit, UniversalHash};
         use polyval::Polyval;
+        use polyval::universal_hash::{KeyInit, UniversalHash};
 
         // Test vectors from RFC8452 worked example in appendix A.
         let h = hex!("25629347589242761d31f826ba4b757b");

@@ -9,7 +9,9 @@ Options:
           Specify which config file(s) to read. Defaults to [File("[..]"), Dir("[..]")]
 
   -k, --keystore-id <KEYSTORE_ID>
-          Identifier of the keystore. If omitted, keys and certificates from all the keystores will be returned
+          Identifier of the keystore.
+          
+          If omitted, keys and certificates from all the keystores will be returned.
 
   -o <KEY=VALUE>
           Override config file parameters, using TOML-like syntax.

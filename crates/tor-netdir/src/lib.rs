@@ -61,7 +61,6 @@ pub mod testprovider;
 use async_trait::async_trait;
 #[cfg(feature = "hs-service")]
 use itertools::chain;
-use static_assertions::const_assert;
 use tor_error::warn_report;
 use tor_linkspec::{
     ChanTarget, DirectChanMethodsHelper, HasAddrs, HasRelayIds, RelayIdRef, RelayIdType,
@@ -69,12 +68,12 @@ use tor_linkspec::{
 use tor_llcrypto as ll;
 use tor_llcrypto::pk::{ed25519::Ed25519Identity, rsa::RsaIdentity};
 use tor_netdoc::doc::microdesc::{MdDigest, Microdesc};
-use tor_netdoc::doc::netstatus::{self, MdConsensus, MdConsensusRouterStatus, RouterStatus};
+use tor_netdoc::doc::netstatus::{self, MdConsensus, MdRouterStatus};
 #[cfg(feature = "hs-common")]
 use {hsdir_ring::HsDirRing, std::iter};
 
 use derive_more::{From, Into};
-use futures::{stream::BoxStream, StreamExt};
+use futures::{StreamExt, stream::BoxStream};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use rand::seq::{IndexedRandom as _, SliceRandom as _, WeightError};
 use serde::Deserialize;
@@ -91,7 +90,7 @@ use typed_index_collections::{TiSlice, TiVec};
 use {
     itertools::Itertools,
     std::collections::HashSet,
-    tor_error::{internal, Bug},
+    tor_error::{Bug, internal},
     tor_hscrypto::{pk::HsBlindId, time::TimePeriod},
 };
 
@@ -132,15 +131,15 @@ pub(crate) struct RouterStatusIdx(usize);
 pub(crate) trait ConsensusRelays {
     /// Obtain the list of relays in the consensus
     //
-    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdConsensusRouterStatus>;
+    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdRouterStatus>;
 }
 impl ConsensusRelays for MdConsensus {
-    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdConsensusRouterStatus> {
+    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdRouterStatus> {
         TiSlice::from_ref(MdConsensus::relays(self))
     }
 }
 impl ConsensusRelays for NetDir {
-    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdConsensusRouterStatus> {
+    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdRouterStatus> {
         self.consensus.c_relays()
     }
 }
@@ -148,7 +147,7 @@ impl ConsensusRelays for NetDir {
 /// Configuration for determining when two relays have addresses "too close" in
 /// the network.
 ///
-/// Used by [`Relay::low_level_details().in_same_subnet()`].
+/// Used by `Relay::low_level_details().in_same_subnet()`.
 #[derive(Deserialize, Debug, Clone, Copy, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SubnetConfig {
@@ -799,7 +798,7 @@ pub struct PartialNetDir {
 #[derive(Clone)]
 pub struct Relay<'a> {
     /// A router descriptor for this relay.
-    rs: &'a netstatus::MdConsensusRouterStatus,
+    rs: &'a netstatus::MdRouterStatus,
     /// A microdescriptor for this relay.
     md: &'a Microdesc,
     /// The country code this relay is in, if we know one.
@@ -812,7 +811,7 @@ pub struct Relay<'a> {
 #[derive(Debug)]
 pub struct UncheckedRelay<'a> {
     /// A router descriptor for this relay.
-    rs: &'a netstatus::MdConsensusRouterStatus,
+    rs: &'a netstatus::MdRouterStatus,
     /// A microdescriptor for this relay, if there is one.
     md: Option<&'a Microdesc>,
     /// The country code this relay is in, if we know one.
@@ -911,10 +910,8 @@ impl PartialNetDir {
                 .c_relays()
                 .iter()
                 .map(|rs| {
-                    let ret = db
-                        .lookup_country_code_multi(rs.addrs().iter().map(|x| x.ip()))
-                        .cloned();
-                    ret
+                    db.lookup_country_code_multi(rs.addrs().iter().map(|x| x.ip()))
+                        .cloned()
                 })
                 .collect()
         } else {
@@ -1059,7 +1056,7 @@ impl NetDir {
     /// index within the consensus.
     fn relay_from_rs_and_rsidx<'a>(
         &'a self,
-        rs: &'a netstatus::MdConsensusRouterStatus,
+        rs: &'a netstatus::MdRouterStatus,
         rsidx: RouterStatusIdx,
     ) -> UncheckedRelay<'a> {
         debug_assert_eq!(self.c_relays()[rsidx].rsa_identity(), rs.rsa_identity());
@@ -1128,18 +1125,15 @@ impl NetDir {
                 move |replica: u8| {
                     let hsdir_idx = hsdir_ring::service_hsdir_index(&hsid, replica, ring.params());
 
-                    let items = ring
-                        .ring_items_at(hsdir_idx, spread, |(hsdir_idx, _)| {
-                            // According to rend-spec 2.2.3:
-                            //                                                  ... If any of those
-                            // nodes have already been selected for a lower-numbered replica of the
-                            // service, any nodes already chosen are disregarded (i.e. skipped over)
-                            // when choosing a replica's hsdir_spread_store nodes.
-                            selected_nodes.insert(*hsdir_idx)
-                        })
-                        .collect::<Vec<_>>();
-
-                    items
+                    ring.ring_items_at(hsdir_idx, spread, |(hsdir_idx, _)| {
+                        // According to rend-spec 2.2.3:
+                        //                                                  ... If any of those
+                        // nodes have already been selected for a lower-numbered replica of the
+                        // service, any nodes already chosen are disregarded (i.e. skipped over)
+                        // when choosing a replica's hsdir_spread_store nodes.
+                        selected_nodes.insert(*hsdir_idx)
+                    })
+                    .collect::<Vec<_>>()
                 }
             })
             .filter_map(move |(_hsdir_idx, rs_idx)| {
@@ -1217,7 +1211,7 @@ impl NetDir {
     /// Obtain a `Relay` given a `RouterStatusIdx`
     ///
     /// Differs from `relay_from_rs_and_rsi` as follows:
-    ///  * That function expects the caller to already have an `MdConsensusRouterStatus`;
+    ///  * That function expects the caller to already have an `MdRouterStatus`;
     ///    it checks with `debug_assert` that the relay in the netdir matches.
     ///  * That function panics if the `RouterStatusIdx` is invalid; this one returns `None`.
     ///  * That function returns an `UncheckedRelay`; this one a `Relay`.
@@ -1379,7 +1373,7 @@ impl NetDir {
 
         // TODO: If we later support more identity key types, this will
         // become incorrect.  This assertion might help us recognize that case.
-        const_assert!(RelayIdType::COUNT == 2);
+        const _: () = assert!(RelayIdType::COUNT == 2);
 
         match (rsa_id, ed25519_id) {
             (Some(r), Some(e)) => self.id_pair_listed(e, r),
@@ -1706,7 +1700,7 @@ impl NetDir {
     ///
     /// Note: because this function is used to assess the total
     /// properties of the consensus, the `usable` predicate takes a
-    /// [`RouterStatus`] rather than a [`Relay`].
+    /// [`MdRouterStatus`] rather than a [`Relay`].
     pub fn total_weight<P>(&self, role: WeightRole, usable: P) -> RelayWeight
     where
         P: Fn(&UncheckedRelay<'_>) -> bool,
@@ -1959,18 +1953,15 @@ impl NetDir {
                 move |(ring, replica): (&HsDirRing, u8)| {
                     let hsdir_idx = hsdir_ring::service_hsdir_index(hsid, replica, ring.params());
 
-                    let items = ring
-                        .ring_items_at(hsdir_idx, spread, |(hsdir_idx, _)| {
-                            // According to rend-spec 2.2.3:
-                            //                                                  ... If any of those
-                            // nodes have already been selected for a lower-numbered replica of the
-                            // service, any nodes already chosen are disregarded (i.e. skipped over)
-                            // when choosing a replica's hsdir_spread_store nodes.
-                            selected_nodes.insert(*hsdir_idx)
-                        })
-                        .collect::<Vec<_>>();
-
-                    items
+                    ring.ring_items_at(hsdir_idx, spread, |(hsdir_idx, _)| {
+                        // According to rend-spec 2.2.3:
+                        //                                                  ... If any of those
+                        // nodes have already been selected for a lower-numbered replica of the
+                        // service, any nodes already chosen are disregarded (i.e. skipped over)
+                        // when choosing a replica's hsdir_spread_store nodes.
+                        selected_nodes.insert(*hsdir_idx)
+                    })
+                    .collect::<Vec<_>>()
                 }
             })
             .filter_map(|(_hsdir_idx, rs_idx)| {
@@ -2081,7 +2072,7 @@ impl<'a> Relay<'a> {
     /// This function is only available if the crate was built with
     /// its `experimental-api` feature.
     #[cfg(feature = "experimental-api")]
-    pub fn rs(&self) -> &netstatus::MdConsensusRouterStatus {
+    pub fn rs(&self) -> &netstatus::MdRouterStatus {
         self.rs
     }
     /// Return a reference to this relay's "microdescriptor" entry in
@@ -2620,14 +2611,16 @@ mod test {
         assert!(e32.low_level_details().ipv4_policy().allows_some_port());
         assert!(e32.low_level_details().ipv6_policy().allows_some_port());
 
-        assert!(e12
-            .low_level_details()
-            .ipv4_declared_policy()
-            .allows_some_port());
-        assert!(e12
-            .low_level_details()
-            .ipv6_declared_policy()
-            .allows_some_port());
+        assert!(
+            e12.low_level_details()
+                .ipv4_declared_policy()
+                .allows_some_port()
+        );
+        assert!(
+            e12.low_level_details()
+                .ipv6_declared_policy()
+                .allows_some_port()
+        );
     }
 
     #[cfg(feature = "experimental-api")]
@@ -2809,9 +2802,11 @@ mod test {
             .unwrap();
         assert_eq!(w, RelayWeight(4_000));
 
-        assert!(netdir
-            .weight_by_rsa_id(&[99; 20].into(), WeightRole::Guard)
-            .is_none());
+        assert!(
+            netdir
+                .weight_by_rsa_id(&[99; 20].into(), WeightRole::Guard)
+                .is_none()
+        );
     }
 
     #[test]

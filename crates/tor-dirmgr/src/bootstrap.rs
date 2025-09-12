@@ -9,13 +9,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::err::BootstrapAction;
-use crate::state::{DirState, PoisonedState};
 use crate::DirMgrConfig;
 use crate::DocSource;
+use crate::err::BootstrapAction;
+use crate::state::{DirState, PoisonedState};
 use crate::{
+    DirMgr, DocId, DocQuery, DocumentText, Error, Readiness, Result,
     docid::{self, ClientRequest},
-    upgrade_weak_ref, DirMgr, DocId, DocQuery, DocumentText, Error, Readiness, Result,
+    upgrade_weak_ref,
 };
 
 use futures::FutureExt;
@@ -23,8 +24,8 @@ use futures::StreamExt;
 use oneshot_fused_workaround as oneshot;
 use tor_dirclient::DirResponse;
 use tor_error::{info_report, warn_report};
-use tor_rtcompat::scheduler::TaskSchedule;
 use tor_rtcompat::Runtime;
+use tor_rtcompat::scheduler::TaskSchedule;
 use tracing::{debug, info, trace, warn};
 
 use crate::storage::Store;
@@ -226,10 +227,10 @@ pub(crate) fn make_consensus_request(
     request.set_skew_limit(
         // If we are _fast_ by at least this much, then any valid directory will
         // seem to be at least this far in the past.
-        config.tolerance.post_valid_tolerance,
+        config.tolerance.post_valid_tolerance(),
         // If we are _slow_ by this much, then any valid directory will seem to
         // be at least this far in the future.
-        config.tolerance.pre_valid_tolerance,
+        config.tolerance.pre_valid_tolerance(),
     );
 
     Ok(ClientRequest::Consensus(request))
@@ -635,8 +636,7 @@ pub(crate) async fn download<R: Runtime>(
                 futures::select_biased! {
                     outcome = download_attempt(&dirmgr, state, parallelism.into(), attempt_id).fuse() => {
                         if let Err(e) = outcome {
-                            // TODO: get warn_report! to support `attempt=%attempt_id`?
-                            warn_report!(e, "Error while downloading (attempt {})", attempt_id);
+                            warn_report!(e, attempt=%attempt_id, "Error while downloading.");
                             propagate_fatal_errors!(Err(e));
                             continue 'next_attempt;
                         } else {
@@ -740,8 +740,8 @@ mod test {
     use super::*;
     use crate::storage::DynStore;
     use crate::test::new_mgr;
-    use crate::DownloadSchedule;
     use std::sync::Mutex;
+    use tor_dircommon::retry::DownloadSchedule;
     use tor_netdoc::doc::microdesc::MdDigest;
     use tor_rtcompat::SleepProvider;
 

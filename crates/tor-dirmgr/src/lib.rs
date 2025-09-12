@@ -49,14 +49,12 @@
 // this lint and instead produces another lint about a useless clippy attribute.
 #![allow(clippy::single_component_path_imports)]
 
-pub mod authority;
 mod bootstrap;
 pub mod config;
 mod docid;
 mod docmeta;
 mod err;
 mod event;
-mod retry;
 mod shared_ref;
 mod state;
 mod storage;
@@ -76,10 +74,10 @@ use crate::storage::{DynStore, Store};
 use bootstrap::AttemptId;
 use event::DirProgress;
 use postage::watch;
-pub use retry::{DownloadSchedule, DownloadScheduleBuilder};
 use scopeguard::ScopeGuard;
 use tor_circmgr::CircMgr;
 use tor_dirclient::SourceInfo;
+use tor_dircommon::config::DirTolerance;
 use tor_error::{info_report, into_internal, warn_report};
 use tor_netdir::params::NetParameters;
 use tor_netdir::{DirEvent, MdReceiver, NetDir, NetDirProvider};
@@ -88,8 +86,8 @@ use async_trait::async_trait;
 use futures::{stream::BoxStream, task::SpawnExt};
 use oneshot_fused_workaround as oneshot;
 use tor_netdoc::doc::netstatus::ProtoStatuses;
-use tor_rtcompat::scheduler::{TaskHandle, TaskSchedule};
 use tor_rtcompat::Runtime;
+use tor_rtcompat::scheduler::{TaskHandle, TaskSchedule};
 use tracing::{debug, info, trace, warn};
 
 use std::marker::PhantomData;
@@ -100,16 +98,12 @@ use std::{collections::HashMap, sync::Weak};
 use std::{fmt::Debug, time::SystemTime};
 
 use crate::state::{DirState, NetDirChange};
-pub use authority::{Authority, AuthorityBuilder};
-pub use config::{
-    DirMgrConfig, DirTolerance, DirToleranceBuilder, DownloadScheduleConfig,
-    DownloadScheduleConfigBuilder, NetworkConfig, NetworkConfigBuilder,
-};
+pub use config::DirMgrConfig;
 pub use docid::DocId;
 pub use err::Error;
 pub use event::{DirBlockage, DirBootstrapEvents, DirBootstrapStatus};
 pub use storage::DocumentText;
-pub use tor_guardmgr::fallback::{FallbackDir, FallbackDirBuilder};
+pub use tor_dircommon::fallback::{FallbackDir, FallbackDirBuilder};
 pub use tor_netdir::Timeliness;
 
 /// Re-export of `strum` crate for use by an internal macro
@@ -598,7 +592,9 @@ impl<R: Runtime> DirMgr<R> {
                     // upgrade_to_readwrite() function is idempotent.)  We can
                     // do our own bootstrapping.
                     if logged {
-                        info!("The previous owning process has given up the lock. We are now in charge of managing the directory.");
+                        info!(
+                            "The previous owning process has given up the lock. We are now in charge of managing the directory."
+                        );
                     }
                     return Ok(());
                 }
@@ -609,7 +605,9 @@ impl<R: Runtime> DirMgr<R> {
                 if bootstrapped {
                     info!("Another process is managing the directory. We'll use its cache.");
                 } else {
-                    info!("Another process is bootstrapping the directory. Waiting till it finishes or exits.");
+                    info!(
+                        "Another process is bootstrapping the directory. Waiting till it finishes or exits."
+                    );
                 }
             }
 
@@ -677,7 +675,7 @@ impl<R: Runtime> DirMgr<R> {
                 // TODO(nickm): instead of getting this every time we loop, it
                 // might be a good idea to refresh it with each attempt, at
                 // least at the point of checking the number of attempts.
-                dirmgr.config.get().schedule.retry_bootstrap
+                dirmgr.config.get().schedule.retry_bootstrap()
             };
             let mut retry_delay = retry_config.schedule();
 
@@ -696,7 +694,10 @@ impl<R: Runtime> DirMgr<R> {
                 if let Err(err) = outcome {
                     if state.is_ready(Readiness::Usable) {
                         usable = true;
-                        info_report!(err, "Unable to completely download a directory. (Nevertheless, the directory is usable, so we'll pause for now)");
+                        info_report!(
+                            err,
+                            "Unable to completely download a directory. (Nevertheless, the directory is usable, so we'll pause for now)"
+                        );
                         break 'retry_attempt;
                     }
 
@@ -874,11 +875,7 @@ impl<R: Runtime> DirMgr<R> {
             .expect("Directory storage lock poisoned")
             .is_readonly();
         // A race-condition is possible here, but I believe it's harmless.
-        if rw {
-            Some(&self.store)
-        } else {
-            None
-        }
+        if rw { Some(&self.store) } else { None }
     }
 
     /// Construct a DirMgr from a DirMgrConfig.
@@ -965,7 +962,7 @@ impl<R: Runtime> DirMgr<R> {
     /// Multiple events may be batched up into a single item: each time
     /// this stream yields an event, all you can assume is that the event has
     /// occurred at least once.
-    pub fn events(&self) -> impl futures::Stream<Item = DirEvent> {
+    pub fn events(&self) -> impl futures::Stream<Item = DirEvent> + use<R> {
         self.events.subscribe()
     }
 
@@ -1150,7 +1147,7 @@ pub(crate) fn default_consensus_cutoff(
     /// We _always_ allow at least this much age in our consensuses, to account
     /// for the fact that consensuses have some lifetime.
     const MIN_AGE_TO_ALLOW: Duration = Duration::from_secs(3 * 3600);
-    let allow_skew = std::cmp::max(MIN_AGE_TO_ALLOW, tolerance.post_valid_tolerance);
+    let allow_skew = std::cmp::max(MIN_AGE_TO_ALLOW, tolerance.post_valid_tolerance());
     let cutoff = time::OffsetDateTime::from(now - allow_skew);
     // We now round cutoff to the next hour, so that we aren't leaking our exact
     // time to the directory cache.
@@ -1371,7 +1368,7 @@ mod test {
                 )
                 .unwrap()
             };
-            let tolerance = DirTolerance::default().post_valid_tolerance;
+            let tolerance = DirTolerance::default().post_valid_tolerance();
             match req {
                 ClientRequest::Consensus(r) => {
                     assert_eq!(r.old_consensus_digests().count(), 0);

@@ -18,9 +18,9 @@ pub use tor_config::convert_helper_via_multi_line_list_builder;
 pub use tor_config::impl_standard_builder;
 pub use tor_config::list_builder::{MultilineListBuilder, MultilineListBuilderError};
 pub use tor_config::mistrust::BuilderExt as _;
-pub use tor_config::{define_list_builder_accessors, define_list_builder_helper};
 pub use tor_config::{BoolOrAuto, ConfigError};
 pub use tor_config::{ConfigBuildError, ConfigurationSource, ConfigurationSources, Reconfigure};
+pub use tor_config::{define_list_builder_accessors, define_list_builder_helper};
 pub use tor_config_path::{CfgPath, CfgPathError, CfgPathResolver};
 pub use tor_linkspec::{ChannelMethod, HasChanMethod, PtTransportName, TransportId};
 
@@ -43,11 +43,13 @@ pub mod circ {
 
 /// Types for configuring how Tor accesses its directory information.
 pub mod dir {
-    pub use tor_dirmgr::{
-        Authority, AuthorityBuilder, DirMgrConfig, DirTolerance, DirToleranceBuilder,
-        DownloadSchedule, DownloadScheduleConfig, DownloadScheduleConfigBuilder, FallbackDir,
-        FallbackDirBuilder, NetworkConfig, NetworkConfigBuilder,
+    pub use tor_dircommon::authority::{Authority, AuthorityBuilder};
+    pub use tor_dircommon::config::{
+        DirTolerance, DirToleranceBuilder, DownloadScheduleConfig, DownloadScheduleConfigBuilder,
+        NetworkConfig, NetworkConfigBuilder,
     };
+    pub use tor_dircommon::retry::{DownloadSchedule, DownloadScheduleBuilder};
+    pub use tor_dirmgr::{DirMgrConfig, FallbackDir, FallbackDirBuilder};
 }
 
 /// Types for configuring pluggable transports.
@@ -487,7 +489,7 @@ fn validate_bridges_config(bridges: &BridgesConfigBuilder) -> Result<(), ConfigB
             return Err(ConfigBuildError::Inconsistent {
                 fields: ["enabled", "bridges"].map(Into::into).into_iter().collect(),
                 problem: "bridges.enabled=true, but no bridges defined".into(),
-            })
+            });
         }
     }
     #[cfg(feature = "pt-client")]
@@ -738,8 +740,8 @@ impl tor_circmgr::hspool::HsCircPoolConfig for TorClientConfig {
     }
 }
 
-impl AsRef<tor_guardmgr::fallback::FallbackList> for TorClientConfig {
-    fn as_ref(&self) -> &tor_guardmgr::fallback::FallbackList {
+impl AsRef<tor_dircommon::fallback::FallbackList> for TorClientConfig {
+    fn as_ref(&self) -> &tor_dircommon::fallback::FallbackList {
         self.tor_network.fallback_caches()
     }
 }
@@ -894,6 +896,8 @@ mod test {
     #![allow(clippy::useless_vec)]
     #![allow(clippy::needless_pass_by_value)]
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
     use super::*;
 
     #[test]
@@ -908,10 +912,22 @@ mod test {
     fn builder() {
         let sec = std::time::Duration::from_secs(1);
 
-        let auth = dir::Authority::builder()
+        let auth1 = dir::Authority::builder()
             .name("Fred")
             .v3ident([22; 20].into())
             .clone();
+        let mut auth2 = dir::Authority::builder();
+        auth2.name("Mercury");
+        auth2.v3ident([44; 20].into());
+        auth2
+            .dirports()
+            .push(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80)));
+        auth2.dirports().push(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            80,
+            0,
+            0,
+        )));
         let mut fallback = dir::FallbackDir::builder();
         fallback
             .rsa_identity([23; 20].into())
@@ -920,7 +936,7 @@ mod test {
             .push("127.0.0.7:7".parse().unwrap());
 
         let mut bld = TorClientConfig::builder();
-        bld.tor_network().set_authorities(vec![auth]);
+        bld.tor_network().set_authorities(vec![auth1, auth2]);
         bld.tor_network().set_fallback_caches(vec![fallback]);
         bld.storage()
             .cache_dir(CfgPath::new("/var/tmp/foo".to_owned()))

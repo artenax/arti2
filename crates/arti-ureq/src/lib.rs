@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 
 use arti_client::{IntoTorAddr, TorClient};
 use ureq::{
-    http::{uri::Scheme, Uri},
+    http::{Uri, uri::Scheme},
     tls::TlsProvider as UreqTlsProvider,
     unversioned::{
         resolver::{ArrayVec, ResolvedSocketAddrs, Resolver as UreqResolver},
@@ -58,7 +58,7 @@ use ureq::{
 
 use educe::Educe;
 use thiserror::Error;
-use tor_proto::stream::{DataReader, DataWriter};
+use tor_proto::client::stream::{DataReader, DataWriter};
 use tor_rtcompat::{Runtime, ToplevelBlockOn};
 
 #[cfg(feature = "rustls")]
@@ -618,7 +618,7 @@ pub fn get_default_tls_provider() -> UreqTlsProvider {
 /// ```rust,no_run
 /// let rt = tor_rtcompat::PreferredRuntime::create().expect("Failed to create runtime.");
 /// let tls_provider = arti_ureq::get_default_tls_provider();
-///    
+///
 /// let client = arti_client::TorClient::with_runtime(rt.clone())
 ///     .create_unbootstrapped()
 ///     .expect("Error creating Tor Client.");
@@ -742,13 +742,11 @@ mod arti_ureq_test {
             .expect("Failed to read body.");
         let json_response: serde_json::Value =
             serde_json::from_str(&response).expect("Failed to parse JSON.");
-        let is_tor = json_response
+        json_response
             .get("IsTor")
             .expect("Failed to retrieve IsTor property from response")
             .as_bool()
-            .expect("Failed to convert IsTor to bool");
-
-        is_tor
+            .expect("Failed to convert IsTor to bool")
     }
 
     // Quick internal test to check if our helper function `equal_types` works as expected.

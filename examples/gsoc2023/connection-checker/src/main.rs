@@ -46,7 +46,7 @@ use arti_client::config::{BridgeConfigBuilder, CfgPath, Reconfigure};
 use arti_client::{TorClient, TorClientConfig};
 use clap::Parser;
 use tor_error::ErrorReport;
-use tor_proto::stream::ClientStreamCtrl as _;
+use tor_proto::client::stream::ClientStreamCtrl as _;
 use tor_rtcompat::PreferredRuntime;
 use tracing::{error, info};
 
@@ -96,14 +96,17 @@ async fn build_circuit(tor_client: &TorClient<PreferredRuntime>, remote: &str) -
     info!("Attempting to build circuit...");
     match tor_client.connect(remote).await {
         Ok(stream) => {
-            let circuit = stream
+            let tunnel = stream
                 .client_stream_ctrl()
                 .ok_or_else(|| Error::msg("failed to get client stream ctrl?!"))?
-                .circuit()
+                .tunnel()
                 .ok_or_else(|| Error::msg("failed to get client circuit?!"))?;
-            let circ = circuit.path_ref()?;
-            for node in circ.iter() {
-                println!("Node: {node}");
+            let paths = tunnel.all_paths();
+            for (i, circ) in paths.into_iter().enumerate() {
+                println!("Circ {i}:");
+                for node in circ.iter() {
+                    println!("\tNode: {node}");
+                }
             }
             Ok(())
         }
