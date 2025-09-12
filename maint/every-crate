@@ -12,7 +12,7 @@ CHUNK_N=0
 mapfile -t CRATES < <( maint/list_crates --all )
 NUM_CRATES=${#CRATES[@]}
 
-OPTS=":c:n:"
+OPTS="c:n:"
 
 while getopts ${OPTS} opt; do
     case ${opt} in
