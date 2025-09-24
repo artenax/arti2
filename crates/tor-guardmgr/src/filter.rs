@@ -48,6 +48,13 @@ impl GuardFilter {
             .push(SingleFilter::ReachableAddrs(addrs.into_iter().collect()));
     }
 
+    /// Restrict this filter to only permit connections to guards that are
+    /// BGP-safe according to the ASNs in `is_bgp_safe_checker` .
+    pub fn push_is_bgp_safe_checker(&mut self, is_bgp_safe_checker: DynIsBgpSafeChecker) {
+        self.filters
+            .push(SingleFilter::IsBgpSafe(is_bgp_safe_checker));
+    }
+
     /// Return true if this filter permits the provided `target`.
     pub(crate) fn permits<C: ChanTarget>(&self, target: &C) -> bool {
         self.filters.iter().all(|filt| filt.permits(target))
