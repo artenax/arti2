@@ -12,7 +12,7 @@ use tor_guardmgr::{GuardFilter, GuardMgrConfig};
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 use tor_netdoc::types::policy::AddrPortPattern;
-use tor_relay_selection::RelaySelectionConfig;
+use tor_relay_selection::{IsBgpSafeCheckerCsv, IsBgpSafeCheckerError, RelaySelectionConfig};
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -197,6 +197,39 @@ pub struct PreemptiveCircuitConfig {
     pub(crate) min_exit_circs_for_port: usize,
 }
 impl_standard_builder! { PreemptiveCircuitConfig }
+
+/// Configuration for data sources used by the BGP safety checker.
+#[derive(Debug, Clone, Builder, Eq, PartialEq)]
+#[builder(build_fn(error = "ConfigBuildError"))]
+#[builder(derive(Debug, Serialize, Deserialize))]
+pub struct IsBgpSafeCheckerConfig {
+    /// Path to CSV file with BGP safety status of ASNs.
+    #[builder(default)]
+    pub(crate) asns_csv: Option<String>,
+
+    /// Path to ip2asn data file.
+    #[builder(default)]
+    pub(crate) ip2asn_tsv: Option<String>,
+}
+impl_standard_builder! { IsBgpSafeCheckerConfig }
+
+impl IsBgpSafeCheckerConfig {
+    /// Return a new [`GuardFilter`] containing the safe ASNs derived
+    /// from the data sources.
+    /// Returns an error if the data files cannot be read or parsed.
+    pub(crate) fn build_guard_filter(&self) -> Result<GuardFilter, IsBgpSafeCheckerError> {
+        let mut filt = GuardFilter::default();
+        if let (Some(asns_csv), Some(ip2asn_tsv)) = (&self.asns_csv, &self.ip2asn_tsv) {
+            let is_bgp_safe_checker = IsBgpSafeCheckerCsv::from_files(
+                std::path::Path::new(asns_csv),
+                std::path::Path::new(ip2asn_tsv),
+            )?;
+            filt.push_is_bgp_safe_checker(std::sync::Arc::new(is_bgp_safe_checker));
+        }
+
+        Ok(filt)
+    }
+}
 
 /// Configuration for circuit timeouts, expiration, and so on.
 ///
