@@ -41,6 +41,11 @@ impl GuardFilter {
         GuardFilter::default()
     }
 
+    /// Append filters of another `GuardFilter` to this one.
+    pub fn extend(&mut self, other: GuardFilter) {
+        self.filters.extend(other.filters);
+    }
+
     /// Restrict this filter to only permit connections to an address permitted
     /// by one of the patterns in `addrs`.
     pub fn push_reachable_addresses(&mut self, addrs: impl IntoIterator<Item = AddrPortPattern>) {
