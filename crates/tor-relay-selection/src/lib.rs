@@ -58,6 +58,9 @@ pub use selector::{RelaySelector, SelectionInfo};
 pub use target_port::TargetPort;
 pub use usage::RelayUsage;
 
+/// Type alias for a dynamic IsBgpSafeChecker that is Send + Sync.
+pub type DynIsBgpSafeChecker = std::sync::Arc<dyn crate::IsBgpSafeChecker + Send + Sync>;
+
 /// A property that can be provided by relays.
 ///
 /// The predicates that implement this trait are typically lower level ones that
