@@ -45,12 +45,14 @@
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 mod config;
+mod is_bgp_safe;
 mod restriction;
 mod selector;
 mod target_port;
 mod usage;
 
 pub use config::RelaySelectionConfig;
+pub use is_bgp_safe::{IsBgpSafeChecker, IsBgpSafeCheckerCsv, IsBgpSafeCheckerError};
 pub use restriction::{RelayExclusion, RelayRestriction};
 pub use selector::{RelaySelector, SelectionInfo};
 pub use target_port::TargetPort;
