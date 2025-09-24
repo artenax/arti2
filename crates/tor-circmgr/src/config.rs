@@ -397,6 +397,7 @@ define_accessor_trait! {
     // cloning all the fields an extra time.
     pub trait CircMgrConfig: GuardMgrConfig {
         path_rules: PathConfig,
+        is_bgp_safe: IsBgpSafeCheckerConfig,
         circuit_timing: CircuitTiming,
         preemptive_circuits: PreemptiveCircuitConfig,
         +
@@ -427,6 +428,7 @@ pub(crate) mod test_config {
     #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
     pub struct TestConfig {
         pub path_rules: PathConfig,
+        pub is_bgp_safe: IsBgpSafeCheckerConfig,
         pub circuit_timing: CircuitTiming,
         pub preemptive_circuits: PreemptiveCircuitConfig,
         pub guardmgr: tor_guardmgr::TestConfig,
@@ -451,6 +453,9 @@ pub(crate) mod test_config {
     impl CircMgrConfig for TestConfig {
         fn path_rules(&self) -> &PathConfig {
             &self.path_rules
+        }
+        fn is_bgp_safe(&self) -> &IsBgpSafeCheckerConfig {
+            &self.is_bgp_safe
         }
         fn circuit_timing(&self) -> &CircuitTiming {
             &self.circuit_timing
