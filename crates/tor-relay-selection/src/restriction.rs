@@ -50,6 +50,8 @@ enum RestrictionInner<'a> {
     /// Require that the relay has a given country code.
     #[cfg(feature = "geoip")]
     RequireCountry(tor_geoip::CountryCode),
+    /// Require that the relay is from an AS that is BGP safe.
+    RequireIsBgpSafe(crate::DynIsBgpSafeChecker),
 }
 
 impl<'a> RelayRestriction<'a> {
@@ -89,6 +91,13 @@ impl<'a> RelayRestriction<'a> {
         }
     }
 
+    /// Require that the guard is BGP safe.
+    pub fn require_is_bgp_safe(checker: crate::DynIsBgpSafeChecker) -> Self {
+        RelayRestriction {
+            inner: RestrictionInner::RequireIsBgpSafe(checker),
+        }
+    }
+
     /// Return a restriction that represents having "relaxed" this restriction.
     ///
     /// (Relaxing a restriction replaces it with a no-op, or with an almost-no-op.)
@@ -123,6 +132,7 @@ impl<'a> RelayRestriction<'a> {
             HasAddrInSet(_) => Some("not reachable (according to address filter)"),
             #[cfg(feature = "geoip")]
             RequireCountry(_) => Some("not in correct country"),
+            RequireIsBgpSafe(_) => Some("not BGP safe"),
         }
     }
 }
@@ -137,6 +147,10 @@ impl<'a> LowLevelRelayPredicate for RelayRestriction<'a> {
             HasAddrInSet(patterns) => relay_has_addr_in_set(relay, patterns),
             #[cfg(feature = "geoip")]
             RequireCountry(cc) => relay.country_code() == Some(*cc),
+            RequireIsBgpSafe(checker) => relay
+                .addrs()
+                .iter()
+                .any(|addr| checker.is_bgp_safe(&addr.ip())),
         }
     }
 }
