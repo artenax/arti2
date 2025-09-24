@@ -113,8 +113,9 @@ pub use tunnel::{
 pub use usage::{TargetPort, TargetPorts};
 
 pub use config::{
-    CircMgrConfig, CircuitTiming, CircuitTimingBuilder, PathConfig, PathConfigBuilder,
-    PreemptiveCircuitConfig, PreemptiveCircuitConfigBuilder,
+    CircMgrConfig, CircuitTiming, CircuitTimingBuilder, IsBgpSafeCheckerConfig,
+    IsBgpSafeCheckerConfigBuilder, PathConfig, PathConfigBuilder, PreemptiveCircuitConfig,
+    PreemptiveCircuitConfigBuilder,
 };
 
 use crate::isolation::StreamIsolation;
@@ -457,7 +458,14 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> CircMgrInner<B, R> {
             config.preemptive_circuits().clone(),
         )));
 
-        guardmgr.set_filter(config.path_rules().build_guard_filter());
+        let mut filter = config.path_rules().build_guard_filter();
+        match config.is_bgp_safe().build_guard_filter() {
+            Ok(is_bgp_safe_filter) => filter.extend(is_bgp_safe_filter),
+            Err(e) => {
+                panic!("BGP safety filter misconfigured: {}", e);
+            }
+        }
+        guardmgr.set_filter(filter);
 
         let mgr =
             mgr::AbstractTunnelMgr::new(builder, runtime.clone(), config.circuit_timing().clone());
