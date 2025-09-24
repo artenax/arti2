@@ -4,7 +4,10 @@ use tor_linkspec::ChanTarget;
 // TODO(nickm): Conceivably, this type should be exposed from a lower-level crate than
 // tor-netdoc.
 use tor_netdoc::types::policy::AddrPortPattern;
-use tor_relay_selection::{LowLevelRelayPredicate, RelayRestriction, RelaySelector, RelayUsage};
+use tor_relay_selection::{
+    DynIsBgpSafeChecker, IsBgpSafeChecker, LowLevelRelayPredicate, RelayRestriction, RelaySelector,
+    RelayUsage,
+};
 
 /// An object specifying which relays are eligible to be guards.
 ///
@@ -25,14 +28,31 @@ pub struct GuardFilter {
 }
 
 /// A single restriction places upon usable guards.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 enum SingleFilter {
     /// A set of allowable addresses that we are willing to try to connect to.
     ///
     /// This list of patterns has "or" semantics: a guard is permitted by this filter
     /// if ANY pattern in this list permits one of the guard's addresses.
     ReachableAddrs(Vec<AddrPortPattern>),
+
+    /// A set of safe ASNs + ip2asn mapper in a `IsBgpSafeChecker` implementation.
+    IsBgpSafe(DynIsBgpSafeChecker),
 }
+
+impl PartialEq for SingleFilter {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SingleFilter::ReachableAddrs(a), SingleFilter::ReachableAddrs(b)) => a == b,
+            (SingleFilter::IsBgpSafe(a), SingleFilter::IsBgpSafe(b)) => {
+                std::sync::Arc::ptr_eq(a, b)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SingleFilter {}
 
 impl GuardFilter {
     /// Create a new [`GuardFilter`] that doesn't restrict the set of
