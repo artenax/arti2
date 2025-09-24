@@ -150,6 +150,9 @@ impl GuardFilter {
                 SingleFilter::ReachableAddrs(addrs) => {
                     RelayRestriction::require_address(addrs.clone())
                 }
+                SingleFilter::IsBgpSafe(checker) => {
+                    RelayRestriction::require_is_bgp_safe(checker.clone())
+                }
             });
         }
     }
@@ -172,6 +175,10 @@ impl SingleFilter {
                     }
                 })
             }
+            SingleFilter::IsBgpSafe(checker) => match target.chan_method().socket_addrs() {
+                Some(addrs) => addrs.iter().any(|sa| checker.is_bgp_safe(&sa.ip())),
+                None => true,
+            },
         }
     }
 
@@ -210,7 +217,33 @@ impl SingleFilter {
                     .into());
                 }
             }
+            SingleFilter::IsBgpSafe(checker) => {
+                let r = first_hop
+                    .chan_target_mut()
+                    .chan_method_mut()
+                    .retain_addrs(|addr| checker.is_bgp_safe(&addr.ip()));
+
+                if r.is_err() {
+                    // TODO(nickm, nield): The fact that this check needs to be checked
+                    // happen indicates a likely problem in our code design.
+                    // Right now, we have `modify_hop` and `permits` as separate
+                    // methods because our GuardSet logic needs a way to check
+                    // whether a guard will be permitted by a filter without
+                    // actually altering that guard (since another filter might
+                    // be used in the future that would allow the same guard).
+                    //
+                    // To mitigate the risk of hitting this error, we try to
+                    // make sure that modify_hop is always called right after
+                    // (or at least soon after) the filter is checked, with the
+                    // same filter object.
+                    return Err(tor_error::internal!(
+                        "Tried to apply a BGP safety filter to an unsupported guard"
+                    )
+                    .into());
+                }
+            }
         }
+
         Ok(first_hop)
     }
 }
