@@ -33,11 +33,14 @@ pub use tor_guardmgr::bridge::BridgeParseError;
 use tor_guardmgr::bridge::BridgeConfig;
 use tor_keymgr::config::{ArtiKeystoreConfig, ArtiKeystoreConfigBuilder};
 
+use tor_guardmgr::GuardFilter;
+
 /// Types for configuring how Tor circuits are built.
 pub mod circ {
     pub use tor_circmgr::{
-        CircMgrConfig, CircuitTiming, CircuitTimingBuilder, PathConfig, PathConfigBuilder,
-        PreemptiveCircuitConfig, PreemptiveCircuitConfigBuilder,
+        CircMgrConfig, CircuitTiming, CircuitTimingBuilder, IsBgpSafeCheckerConfig,
+        IsBgpSafeCheckerConfigBuilder, PathConfig, PathConfigBuilder, PreemptiveCircuitConfig,
+        PreemptiveCircuitConfigBuilder,
     };
 }
 
@@ -639,6 +642,12 @@ pub struct TorClientConfig {
     #[builder(sub_builder)]
     #[builder_field_attr(serde(default))]
     path_rules: circ::PathConfig,
+
+    /// Configuration for data sources to use BGP safety checking for guards.
+    #[as_ref]
+    #[builder(sub_builder)]
+    #[builder_field_attr(serde(default))]
+    pub(crate) is_bgp_safe: circ::IsBgpSafeCheckerConfig,
 
     /// Information about preemptive circuits.
     #[as_ref]

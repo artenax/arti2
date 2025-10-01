@@ -4,7 +4,10 @@ use tor_linkspec::ChanTarget;
 // TODO(nickm): Conceivably, this type should be exposed from a lower-level crate than
 // tor-netdoc.
 use tor_netdoc::types::policy::AddrPortPattern;
-use tor_relay_selection::{LowLevelRelayPredicate, RelayRestriction, RelaySelector, RelayUsage};
+use tor_relay_selection::{
+    DynIsBgpSafeChecker, IsBgpSafeChecker, LowLevelRelayPredicate, RelayRestriction, RelaySelector,
+    RelayUsage,
+};
 
 /// An object specifying which relays are eligible to be guards.
 ///
@@ -25,14 +28,31 @@ pub struct GuardFilter {
 }
 
 /// A single restriction places upon usable guards.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 enum SingleFilter {
     /// A set of allowable addresses that we are willing to try to connect to.
     ///
     /// This list of patterns has "or" semantics: a guard is permitted by this filter
     /// if ANY pattern in this list permits one of the guard's addresses.
     ReachableAddrs(Vec<AddrPortPattern>),
+
+    /// A set of safe ASNs + ip2asn mapper in a `IsBgpSafeChecker` implementation.
+    IsBgpSafe(DynIsBgpSafeChecker),
 }
+
+impl PartialEq for SingleFilter {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SingleFilter::ReachableAddrs(a), SingleFilter::ReachableAddrs(b)) => a == b,
+            (SingleFilter::IsBgpSafe(a), SingleFilter::IsBgpSafe(b)) => {
+                std::sync::Arc::ptr_eq(a, b)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SingleFilter {}
 
 impl GuardFilter {
     /// Create a new [`GuardFilter`] that doesn't restrict the set of
@@ -41,11 +61,23 @@ impl GuardFilter {
         GuardFilter::default()
     }
 
+    /// Append filters of another `GuardFilter` to this one.
+    pub fn extend(&mut self, other: GuardFilter) {
+        self.filters.extend(other.filters);
+    }
+
     /// Restrict this filter to only permit connections to an address permitted
     /// by one of the patterns in `addrs`.
     pub fn push_reachable_addresses(&mut self, addrs: impl IntoIterator<Item = AddrPortPattern>) {
         self.filters
             .push(SingleFilter::ReachableAddrs(addrs.into_iter().collect()));
+    }
+
+    /// Restrict this filter to only permit connections to guards that are
+    /// BGP-safe according to the ASNs in `is_bgp_safe_checker` .
+    pub fn push_is_bgp_safe_checker(&mut self, is_bgp_safe_checker: DynIsBgpSafeChecker) {
+        self.filters
+            .push(SingleFilter::IsBgpSafe(is_bgp_safe_checker));
     }
 
     /// Return true if this filter permits the provided `target`.
@@ -118,6 +150,9 @@ impl GuardFilter {
                 SingleFilter::ReachableAddrs(addrs) => {
                     RelayRestriction::require_address(addrs.clone())
                 }
+                SingleFilter::IsBgpSafe(checker) => {
+                    RelayRestriction::require_is_bgp_safe(checker.clone())
+                }
             });
         }
     }
@@ -140,6 +175,10 @@ impl SingleFilter {
                     }
                 })
             }
+            SingleFilter::IsBgpSafe(checker) => match target.chan_method().socket_addrs() {
+                Some(addrs) => addrs.iter().any(|sa| checker.is_bgp_safe(&sa.ip())),
+                None => true,
+            },
         }
     }
 
@@ -178,7 +217,33 @@ impl SingleFilter {
                     .into());
                 }
             }
+            SingleFilter::IsBgpSafe(checker) => {
+                let r = first_hop
+                    .chan_target_mut()
+                    .chan_method_mut()
+                    .retain_addrs(|addr| checker.is_bgp_safe(&addr.ip()));
+
+                if r.is_err() {
+                    // TODO(nickm, nield): The fact that this check needs to be checked
+                    // happen indicates a likely problem in our code design.
+                    // Right now, we have `modify_hop` and `permits` as separate
+                    // methods because our GuardSet logic needs a way to check
+                    // whether a guard will be permitted by a filter without
+                    // actually altering that guard (since another filter might
+                    // be used in the future that would allow the same guard).
+                    //
+                    // To mitigate the risk of hitting this error, we try to
+                    // make sure that modify_hop is always called right after
+                    // (or at least soon after) the filter is checked, with the
+                    // same filter object.
+                    return Err(tor_error::internal!(
+                        "Tried to apply a BGP safety filter to an unsupported guard"
+                    )
+                    .into());
+                }
+            }
         }
+
         Ok(first_hop)
     }
 }
