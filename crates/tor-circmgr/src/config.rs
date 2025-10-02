@@ -26,7 +26,7 @@ use std::time::Duration;
 /// paths that are constructed in the future, and prevents requests from being
 /// attached to existing circuits, if the configuration has become more
 /// restrictive.
-#[derive(Debug, Clone, Builder, Eq, PartialEq)]
+#[derive(Debug, Clone, Builder, Eq, PartialEq, getset::CopyGetters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 #[builder(derive(Debug, Serialize, Deserialize))]
 pub struct PathConfig {
@@ -35,6 +35,7 @@ pub struct PathConfig {
     /// Any two relays will be considered to belong to the same family if their
     /// IPv4 addresses share at least this many initial bits.
     #[builder(default = "ipv4_prefix_default()")]
+    #[getset(get_copy)]
     ipv4_subnet_family_prefix: u8,
 
     /// Set the length of a bit-prefix for a default IPv6 subnet-family.
@@ -42,6 +43,7 @@ pub struct PathConfig {
     /// Any two relays will be considered to belong to the same family if their
     /// IPv6 addresses share at least this many initial bits.
     #[builder(default = "ipv6_prefix_default()")]
+    #[getset(get_copy)]
     ipv6_subnet_family_prefix: u8,
 
     /// A set of ports that need to be sent over Stable circuits.
@@ -162,7 +164,7 @@ impl PathConfig {
 /// use [`PreemptiveCircuitConfigBuilder`].
 ///
 /// Except as noted, this configuration can be changed on a running Arti client.
-#[derive(Debug, Clone, Builder, Eq, PartialEq)]
+#[derive(Debug, Clone, Builder, Eq, PartialEq, getset::Getters, getset::CopyGetters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 #[builder(derive(Debug, Serialize, Deserialize))]
 pub struct PreemptiveCircuitConfig {
@@ -170,6 +172,7 @@ pub struct PreemptiveCircuitConfig {
     /// construction of preemptive circuits. whether our available circuits
     /// support our predicted exit ports or not.
     #[builder(default = "default_preemptive_threshold()")]
+    #[getset(get_copy)]
     pub(crate) disable_at_threshold: usize,
 
     /// At startup, which exit ports should we expect that the client will want?
@@ -189,11 +192,13 @@ pub struct PreemptiveCircuitConfig {
     /// available for that port?
     #[builder(default = "default_preemptive_duration()")]
     #[builder_field_attr(serde(default, with = "humantime_serde::option"))]
+    #[getset(get)]
     pub(crate) prediction_lifetime: Duration,
 
     /// How many available circuits should we try to have, at minimum, for each
     /// predicted exit port?
     #[builder(default = "default_preemptive_min_exit_circs_for_port()")]
+    #[getset(get_copy)]
     pub(crate) min_exit_circs_for_port: usize,
 }
 impl_standard_builder! { PreemptiveCircuitConfig }
@@ -211,16 +216,13 @@ impl_standard_builder! { PreemptiveCircuitConfig }
 #[derive(Debug, Clone, Builder, Eq, PartialEq)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 #[builder(derive(Debug, Serialize, Deserialize))]
-// TODO Use a getters derive macro which lets us only generate getters
-// for fields we explicitly request, rather than having to mark the rest with `skip`.
-// (amplify::Getters doesn't allow #[getter(skip)] at the type level)
-#[derive(amplify::Getters)]
+#[derive(getset::Getters, getset::CopyGetters)]
 pub struct CircuitTiming {
     /// How long after a circuit has first been used should we give
     /// it out for new requests?
     #[builder(default = "default_max_dirtiness()")]
     #[builder_field_attr(serde(default, with = "humantime_serde::option"))]
-    #[getter(skip)]
+    #[getset(get)]
     pub(crate) max_dirtiness: Duration,
 
     /// When a circuit is requested, we stop retrying new circuits
@@ -228,14 +230,14 @@ pub struct CircuitTiming {
     // TODO: Impose a maximum or minimum?
     #[builder(default = "default_request_timeout()")]
     #[builder_field_attr(serde(default, with = "humantime_serde::option"))]
-    #[getter(skip)]
+    #[getset(get)]
     pub(crate) request_timeout: Duration,
 
     /// When a circuit is requested, we stop retrying new circuits after
     /// this many attempts.
     // TODO: Impose a maximum or minimum?
     #[builder(default = "default_request_max_retries()")]
-    #[getter(skip)]
+    #[getset(get_copy)]
     pub(crate) request_max_retries: u32,
 
     /// When waiting for requested circuits, wait at least this long
@@ -243,7 +245,7 @@ pub struct CircuitTiming {
     /// request.
     #[builder(default = "default_request_loyalty()")]
     #[builder_field_attr(serde(default, with = "humantime_serde::option"))]
-    #[getter(skip)]
+    #[getset(get)]
     pub(crate) request_loyalty: Duration,
 
     /// When an HS connection is attempted, we stop trying more hsdirs after this many attempts
@@ -253,7 +255,7 @@ pub struct CircuitTiming {
     // This, and `hs_intro_rend_attempts`, fit rather well amongst the other tunings here.
     #[cfg(feature = "hs-client")]
     #[builder(default = "default_hs_max_attempts()")]
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) hs_desc_fetch_attempts: u32,
 
     /// When an HS connection is attempted, we stop trying intro/rendezvous
@@ -262,7 +264,7 @@ pub struct CircuitTiming {
     // This parameter is honoured by tor-hsclient, not here.
     #[cfg(feature = "hs-client")]
     #[builder(default = "default_hs_max_attempts()")]
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     pub(crate) hs_intro_rend_attempts: u32,
 }
 impl_standard_builder! { CircuitTiming }

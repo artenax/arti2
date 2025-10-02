@@ -17,16 +17,16 @@ use tor_hscrypto::pow::v1::{Effort, Seed};
 /// `pow-params` line includes a 32-byte seed with its own expiration
 /// timestamp, and a suggested effort value that clients may use for
 /// their initial request.
-#[derive(Debug, Clone, derive_more::Constructor, amplify::Getters)]
+#[derive(Debug, Clone, derive_more::Constructor, getset::Getters, getset::CopyGetters)]
 pub struct PowParamsV1 {
     /// Time limited [`Seed`]
-    #[getter(as_ref)]
+    #[getset(get = "pub")]
     seed: TimerangeBound<Seed>,
     /// Last known suggested [`Effort`]
     ///
     /// This can be [`Effort::zero()`] if the puzzle is available but the
     /// service doesn't recommend using it for an initial connection attempt.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     suggested_effort: Effort,
 }
 

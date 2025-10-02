@@ -128,7 +128,7 @@ impl Mock {
 }
 
 fn setup(runtime: MockRuntime) -> (TempDir, Bdm, R, M, BridgeKey, rusqlite::Connection) {
-    let sleep = runtime.mock_sleep().clone();
+    let sleep = runtime.get_sleep().clone();
     sleep.jump_wallclock(example_wallclock());
 
     let mut docs = HashMap::new();

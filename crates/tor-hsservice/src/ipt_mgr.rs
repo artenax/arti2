@@ -1964,7 +1964,7 @@ mod test {
         async fn shutdown_check_no_tasks(self, runtime: &MockRuntime) {
             drop(self.shut_tx);
             runtime.progress_until_stalled().await;
-            assert_eq!(runtime.mock_task().n_tasks(), 1); // just us
+            assert_eq!(runtime.task().n_tasks(), 1); // just us
         }
 
         fn estabs_inventory(&self) -> impl Eq + Debug + 'static + use<> {

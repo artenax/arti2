@@ -105,8 +105,8 @@ use derive_more::From;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-use amplify::Getters;
 use derive_more::{Display, Into};
+use getset::{CopyGetters, Getters, MutGetters};
 
 use tor_config_path::CfgPathResolver;
 use tor_error::warn_report;
@@ -184,7 +184,7 @@ impl FromStr for HsClientNickname {
 /// its restricted discovery settings in order for the changes to be applied.
 ///
 /// See the [module-level documentation](self) for more details.
-#[derive(Debug, Clone, Builder, Eq, PartialEq, Getters)]
+#[derive(Debug, Clone, Builder, Eq, PartialEq, Getters, CopyGetters, MutGetters)]
 #[builder(build_fn(error = "ConfigBuildError", name = "build_unvalidated"))]
 #[builder(derive(Serialize, Deserialize, Debug, Deftly))]
 #[non_exhaustive]
@@ -206,7 +206,7 @@ pub struct RestrictedDiscoveryConfig {
     /// If true, the provided `key_dirs` will be watched for changes.
     #[builder(default)]
     #[builder_field_attr(serde(skip))]
-    #[getter(as_mut, as_copy)]
+    #[getset(get_copy = "pub", get_mut = "pub")]
     watch_configuration: bool,
 
     /// Directories containing the client keys, each in the
@@ -216,6 +216,7 @@ pub struct RestrictedDiscoveryConfig {
     /// where `<nickname>` is a valid [`HsClientNickname`].
     #[builder(default, sub_builder(fn_name = "build"))]
     #[builder_field_attr(serde(default))]
+    #[getset(get = "pub")]
     key_dirs: DirectoryKeyProviderList,
 
     /// A static mapping from client nicknames to keys.

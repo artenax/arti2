@@ -5,8 +5,8 @@
 use std::fmt::{Debug, Display};
 use std::ops::ControlFlow;
 
-use amplify::Getters;
 use futures::FutureExt as _;
+use getset::Getters;
 use itertools::chain;
 use strum::IntoEnumIterator as _;
 use void::{ResultVoidExt as _, Void};
@@ -81,16 +81,18 @@ use crate::task::{MockExecutor, SchedulingPolicy};
 ///    unless it is definitively established that it's runtime-agnostic.
 #[derive(Debug, Default, Clone, Getters, Deftly)]
 #[derive_deftly(SomeMockRuntime)]
-#[getter(prefix = "mock_")]
 pub struct MockRuntime {
     /// Tasks
     #[deftly(mock(task, toplevel))]
+    #[getset(get = "pub")]
     task: MockExecutor,
     /// Time provider
     #[deftly(mock(sleep))]
+    #[getset(get = "pub with_prefix")]
     sleep: SimpleMockTimeProvider,
     /// Net provider
     #[deftly(mock(net))]
+    #[getset(get)]
     net: MockNetProvider,
 }
 
@@ -303,7 +305,7 @@ impl MockRuntime {
                             eprintln!(
                                 "warning: MockRuntime advance_* looped >{WARN_AT} (next sleep: {}ms)\n{:?}",
                                 advance.as_millis(),
-                                self.mock_task().as_debug_dump(),
+                                self.task().as_debug_dump(),
                             );
                             None
                         }

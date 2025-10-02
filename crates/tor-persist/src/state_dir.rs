@@ -335,16 +335,18 @@ pub trait InstancePurgeHandler {
 }
 
 /// Information about an instance, passed to [`InstancePurgeHandler::dispose`]
-#[derive(Debug, Clone, amplify::Getters, AsRef)]
+#[derive(Debug, Clone, getset::Getters, AsRef)]
 pub struct InstancePurgeInfo<'i> {
     /// The instance's identity string
     #[as_ref]
+    #[getset(get = "pub")]
     identity: &'i SlugRef,
 
     /// When the instance state was last updated, according to the filesystem timestamps
     ///
     /// See `[InstanceStateHandle::purge_instances]`
     /// for details of what kinds of events count as modifications.
+    #[getset(get = "pub")]
     last_modified: SystemTime,
 }
 

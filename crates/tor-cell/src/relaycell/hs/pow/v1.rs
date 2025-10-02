@@ -7,22 +7,24 @@ use tor_hscrypto::pow::v1::{Effort, Nonce, SeedHead, SolutionByteArray};
 /// Proof of work using the `v1` scheme
 ///
 /// Specified as part of <https://spec.torproject.org/rend-spec/introduction-protocol.html#INTRO1_POW_EXT>
-#[derive(derive_more::Constructor, amplify::Getters, Debug, Clone, PartialEq)]
+#[derive(
+    derive_more::Constructor, Debug, Clone, PartialEq, getset::Getters, getset::CopyGetters,
+)]
 pub struct ProofOfWorkV1 {
     /// Nonce value chosen by the client
-    #[getter(as_ref)]
+    #[getset(get = "pub")]
     nonce: Nonce,
     /// Effort chosen by the client
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     effort: Effort,
     /// Header with which to identify the applicable service-provided seed
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     seed_head: SeedHead,
     /// Proposed solution proof, not validated
     ///
     /// This byte array still needs to be validated first as a well-formed
     /// Equix solution, and then as a proof for a particular puzzle.
-    #[getter(as_ref)]
+    #[getset(get = "pub")]
     solution: SolutionByteArray,
 }
 

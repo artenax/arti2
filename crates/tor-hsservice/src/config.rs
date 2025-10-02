@@ -2,7 +2,6 @@
 
 use crate::internal_prelude::*;
 
-use amplify::Getters;
 use derive_deftly::derive_deftly_adhoc;
 use tor_cell::relaycell::hs::est_intro;
 
@@ -21,7 +20,17 @@ pub mod restricted_discovery;
 pub(crate) mod restricted_discovery;
 
 /// Configuration for one onion service.
-#[derive(Debug, Clone, Builder, Eq, PartialEq, Deftly, Getters)]
+#[derive(
+    Debug,
+    Clone,
+    Builder,
+    Eq,
+    PartialEq,
+    Deftly,
+    getset::Getters,
+    getset::CopyGetters,
+    getset::MutGetters,
+)]
 #[builder(build_fn(error = "ConfigBuildError", validate = "Self::validate"))]
 #[builder(derive(Serialize, Deserialize, Debug, Deftly))]
 #[builder_struct_attr(derive_deftly(tor_config::Flattenable))]
@@ -29,10 +38,12 @@ pub(crate) mod restricted_discovery;
 pub struct OnionServiceConfig {
     /// The nickname used to look up this service's keys, state, configuration, etc.
     #[deftly(publisher_view)]
+    #[getset(get = "pub")]
     pub(crate) nickname: HsNickname,
 
     /// Number of intro points; defaults to 3; max 20.
     #[builder(default = "DEFAULT_NUM_INTRO_POINTS")]
+    #[getset(get_copy = "pub(crate)")]
     pub(crate) num_intro_points: u8,
 
     /// A rate-limit on the acceptable rate of introduction requests.
@@ -52,6 +63,7 @@ pub struct OnionServiceConfig {
     /// How many streams will we allow to be open at once for a single circuit on
     /// this service?
     #[builder(default = "65535")]
+    #[getset(get_copy = "pub(crate)")]
     max_concurrent_streams_per_circuit: u32,
 
     /// If true, we will require proof-of-work when we're under heavy load.
@@ -71,6 +83,7 @@ pub struct OnionServiceConfig {
     // size of external types), it might be somewhat off. The ~32MB value is
     // based on the idea that each RendRequest is 4KB.
     #[builder(default = "8192")]
+    #[getset(get_copy = "pub(crate)")]
     pub(crate) pow_rend_queue_depth: usize,
 
     /// Configure restricted discovery mode.
@@ -80,7 +93,7 @@ pub struct OnionServiceConfig {
     #[builder(sub_builder)]
     #[builder_field_attr(serde(default))]
     #[deftly(publisher_view)]
-    #[getter(as_mut)]
+    #[getset(get_mut = "pub")]
     pub(crate) restricted_discovery: RestrictedDiscoveryConfig,
     // TODO(#727): add support for single onion services
     //
@@ -97,6 +110,7 @@ pub struct OnionServiceConfig {
     /// Whether to use the compiled backend for proof-of-work.
     // TODO: Consider making this a global option instead?
     #[builder(default = "false")]
+    #[getset(get_copy = "pub")]
     disable_pow_compilation: bool,
 }
 
@@ -322,11 +336,13 @@ impl OnionServiceConfigBuilder {
 //
 // TODO: Do we want to parameterize this, or make it always u32?  Do we want to
 // specify "per second"?
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, getset::Getters)]
 pub struct TokenBucketConfig {
     /// The maximum number of items to process per second.
+    #[getset(get_copy = "pub")]
     rate: u32,
     /// The maximum number of items to process in a single burst.
+    #[getset(get_copy = "pub")]
     burst: u32,
 }
 

@@ -20,9 +20,10 @@ use crate::{VanguardMgrError, VanguardMode};
 use super::VanguardParams;
 
 /// A vanguard relay.
-#[derive(Clone, amplify::Getters)]
+#[derive(Clone, getset::Getters)]
 pub struct Vanguard<'a> {
     /// The relay.
+    #[getset(get = "pub")]
     relay: Relay<'a>,
 }
 

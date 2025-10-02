@@ -2,17 +2,17 @@
 
 /// A set of parameters derived from the consensus document,
 /// controlling the KIST behavior of channels.
-#[derive(Debug, Clone, Copy, PartialEq, amplify::Getters)]
+#[derive(Debug, Clone, Copy, PartialEq, getset::CopyGetters)]
 pub struct KistParams {
     /// Whether KIST is enabled.
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     kist_enabled: KistMode,
     /// The value to set for the [`TCP_NOTSENT_LOWAT`] socket option
     /// (on platforms that support it)
     /// if the `KistMode` is [`TcpNotSentLowat`](KistMode::TcpNotSentLowat).
     ///
     /// [`TCP_NOTSENT_LOWAT`]: https://lwn.net/Articles/560082/
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     tcp_notsent_lowat: u32,
 }
 

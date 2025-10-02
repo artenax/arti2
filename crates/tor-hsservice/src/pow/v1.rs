@@ -466,7 +466,7 @@ impl<R: Runtime, Q: MockableRendRequest + Send + 'static> PowManagerGeneric<R, Q
         };
         let instance = Instance::new(blind_id_key?.id(), seed);
         let mut equix = EquiXBuilder::default();
-        if *config.disable_pow_compilation() {
+        if config.disable_pow_compilation() {
             equix.runtime(RuntimeOption::InterpretOnly);
         }
         Some(Verifier::new_with_equix(instance, equix))

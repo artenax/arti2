@@ -232,17 +232,20 @@ pub enum InvalidKeyPathComponentValue {
 /// (_not_ from the key data) by a [`KeyPathInfoExtractor`].
 //
 // TODO  maybe the getters should be combined with the builder, or something?
-#[derive(Debug, Clone, PartialEq, derive_builder::Builder, amplify::Getters)]
+#[derive(Debug, Clone, PartialEq, derive_builder::Builder, getset::Getters)]
+#[getset(get)]
 pub struct KeyPathInfo {
     /// A human-readable summary string describing what the [`KeyPath`] is for.
     ///
     /// This should *not* recapitulate information in the `extra_info`.
+    #[getset(get = "pub")]
     summary: String,
     /// The key role, ie its official name in the Tor Protocols.
     ///
     /// This should usually start with `KS_`.
     //
     // TODO (#1195): see the comment for #[deftly(role)] in derive.rs
+    #[getset(get = "pub")]
     role: String,
     /// Additional information, in the form of key-value pairs.
     ///
@@ -251,6 +254,7 @@ pub struct KeyPathInfo {
     /// `hs/foo/KS_hs_id.expanded_ed25519_private`, the extra information could
     /// be `("kind", "service)`, `("nickname", "foo")`, etc.
     #[builder(default, setter(custom))]
+    #[getset(get = "pub")]
     extra_info: BTreeMap<String, String>,
 }
 

@@ -33,33 +33,33 @@ const DEFAULT_L3_GUARD_LIFETIME_MAX: Duration = Duration::from_secs(3600 * 48);
 //
 // TODO(#1382): vanguards_enabled and vanguards_hs_service are currently unused,
 // because the vanguard mode is read from the VanguardConfig.
-#[derive(Debug, Clone, amplify::Getters)]
+#[derive(Debug, Clone, getset::Getters, getset::CopyGetters)]
 pub struct VanguardParams {
     /// The type of vanguards to use by default when building onion service circuits.
-    #[getter(as_copy)]
+    #[getset(get = "pub")]
     vanguards_enabled: VanguardMode,
     /// If higher than `vanguards-enabled`,
     /// and we are running an onion service,
     /// we use this level for all our onion service circuits.
-    #[getter(as_copy)]
+    #[getset(get = "pub")]
     vanguards_hs_service: VanguardMode,
     /// The number of guards in the L2 guardset
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     l2_pool_size: usize,
     /// The minimum lifetime of L2 guards
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     l2_lifetime_min: Duration,
     /// The maximum lifetime of L2 guards
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     l2_lifetime_max: Duration,
     /// The number of guards in the L3 guardset
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     l3_pool_size: usize,
     /// The minimum lifetime of L3 guards
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     l3_lifetime_min: Duration,
     /// The maximum lifetime of L3 guards
-    #[getter(as_copy)]
+    #[getset(get_copy = "pub")]
     l3_lifetime_max: Duration,
 }
 
