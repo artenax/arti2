@@ -31,7 +31,7 @@ else
 fi
 
 set +e
-options=$("$GETOPT" -oh --long help -- "$@")
+options=$("$GETOPT" -ohu --long help,update -- "$@")
 status="$?"
 set -e
 if test "$status" != 0; then
@@ -39,12 +39,20 @@ if test "$status" != 0; then
     exit 1
 fi
 
+verb="Checking"
+update=0
+
 eval set -- "$options"
 while true; do
     case "$1" in
 	-h | --help)
 	    usage
 	    exit 0
+	    ;;
+	-u | --update)
+	    update=1
+	    verb="Updating"
+	    shift
 	    ;;
 	--)
 	    shift
@@ -56,6 +64,12 @@ done
 
 for subdir in $(git ls-files | sed -n 's/^/.\//;s/Cargo.lock$//p'); do
     echo
-    echo "---- Checking $subdir"
-    (cd "$subdir" && cargo tree --locked > /dev/null)
+    echo "---- ${verb} $subdir"
+    pushd "$subdir" >/dev/null
+    if test "$update" = 1; then
+	cargo update
+    else
+	cargo tree --locked > /dev/null
+    fi
+    popd >/dev/null
 done
