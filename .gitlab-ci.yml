@@ -71,6 +71,11 @@ default:
     # Get some load stats as a crude debugging aid.
     - cat /proc/loadavg
     - for x in cpu io memory ; do echo /proc/pressure/$x; cat /proc/pressure/$x || true; done
+    - "cgroupdir=/sys/fs/cgroup$(cut -d : -f3 < /proc/self/cgroup)"
+    - cat $cgroupdir/cpu.stat || true
+    - cat $cgroupdir/memory.peak || true
+    - cat $cgroupdir/cpu.pressure || true
+    - cat $cgroupdir/memory.pressure || true
     # In every case, if we have a working `cargo` we should clean up
     # our target directory before we exit.  (Leaving big hunks of data
     # on the builders make our admins sad.)
