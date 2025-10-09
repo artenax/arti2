@@ -57,7 +57,7 @@ default:
     # Put 3rd party cloned source (that we don't want in artifacts) in ~/src
     - mkdir -p ~/src
     # Support installing software to ~/.local
-    - mkdir -p ~/.local
+    - mkdir -p ~/.local/bin
     - 'export PATH=$HOME/.local/bin:$PATH'
     # Tell cargo to limit parallelism.
     # See https://gitlab.torproject.org/tpo/tpa/team/-/issues/42283
@@ -71,9 +71,15 @@ default:
     # Get some load stats as a crude debugging aid.
     - cat /proc/loadavg
     - for x in cpu io memory ; do echo /proc/pressure/$x; cat /proc/pressure/$x || true; done
+    - "cgroupdir=/sys/fs/cgroup$(cut -d : -f3 < /proc/self/cgroup)"
+    - cat $cgroupdir/cpu.stat || true
+    - cat $cgroupdir/memory.peak || true
+    - cat $cgroupdir/cpu.pressure || true
+    - cat $cgroupdir/memory.pressure || true
     # In every case, if we have a working `cargo` we should clean up
     # our target directory before we exit.  (Leaving big hunks of data
     # on the builders make our admins sad.)
+    - unset RUSTC_WRAPPER
     - if command -v cargo && test -d ./target; then cargo clean; fi
 
 check-editorconfig:
@@ -234,8 +240,38 @@ rust-recent:
   image: $RECENT_RUST_IMAGE
   # mitigate https://gitlab.torproject.org/tpo/tpa/team/-/issues/42317
   timeout: 2h
+  variables:
+    # Max sccache size. Default is 10G
+    SCCACHE_CACHE_SIZE: "10G"
+    # Where to store sccache.
+    # TODO: consider shared cache in e.g. s3.
+    # https://github.com/mozilla/sccache/blob/main/docs/S3.md
+    SCCACHE_DIR: "$CI_PROJECT_DIR/sccache/cache"
+    # Tell cargo to use sccache
+    RUSTC_WRAPPER: sccache
+    # sccache doesn't work on incrementally compiled crates, and incremental
+    # compilation doesn't help us here anyway.
+    CARGO_INCREMENTAL: false
+    SCCACHE_VERSION: v0.10.0
+    # Increment to force eviction of previous caches, e.g. if the sccache configuration
+    # or usage has changed in a way to make the previous cache not useful.
+    SCCACHE_CACHE_VERSION: 1
+  cache:
+    - key: $CI_JOB_NAME-$RECENT_RUST_IMAGE-sccache-$SCCACHE_CACHE_VERSION
+      paths:
+      - sccache
   script:
+    - mkdir -p "$CI_PROJECT_DIR/sccache/cache"
+    - sccache_name=sccache-$SCCACHE_VERSION-x86_64-unknown-linux-musl
+    - sccache_tgz="$CI_PROJECT_DIR/sccache/$sccache_name.tar.gz"
+    - if [ ! -f "$sccache_tgz" ]; then
+        curl -L https://github.com/mozilla/sccache/releases/download/"$SCCACHE_VERSION"/$(basename "$sccache_tgz")
+          > "$sccache_tgz";
+      fi
+    - (cd "$HOME"/.local/bin && tar xzf "$sccache_tgz" --strip-components=1 "$sccache_name/sccache")
+    - sccache --start-server
     - *rust-recent-script
+    - sccache --show-stats
     - ./maint/preserve target/x86_64-unknown-linux-gnu/$ARTI_CI_PROFILE_PATH/arti target/x86_64-unknown-linux-gnu/release/arti-bench
   artifacts:
     paths:
