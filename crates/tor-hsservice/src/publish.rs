@@ -9,17 +9,18 @@ mod reupload_timer;
 
 use crate::config::restricted_discovery::RestrictedDiscoveryKeys;
 use crate::internal_prelude::*;
+use crate::pow::PowManager;
 
 use backoff::{BackoffError, BackoffSchedule, RetriableError, Runner};
-use descriptor::{build_sign, DescriptorStatus, VersionedDescriptor};
-use reactor::read_blind_id_keypair;
+use descriptor::{DescriptorStatus, VersionedDescriptor, build_sign};
 use reactor::Reactor;
+use reactor::read_blind_id_keypair;
 use reupload_timer::ReuploadTimer;
 
 use tor_config_path::CfgPathResolver;
 
 pub use reactor::UploadError;
-pub(crate) use reactor::{Mockable, Real, OVERALL_UPLOAD_TIMEOUT};
+pub(crate) use reactor::{Mockable, OVERALL_UPLOAD_TIMEOUT, Real};
 
 /// A handle for the Hsdir Publisher for an onion service.
 ///
@@ -51,6 +52,11 @@ pub(crate) struct Publisher<R: Runtime, M: Mockable> {
     status_tx: PublisherStatusSender,
     /// Path resolver for configuration files.
     path_resolver: Arc<CfgPathResolver>,
+    /// Proof-of-work state
+    pow_manager: Arc<PowManager<R>>,
+    /// Queue on which we receive messages from the [`PowManager`] telling us that a seed has
+    /// rotated and thus we need to republish the descriptor for a particular time period.
+    update_from_pow_manager_rx: mpsc::Receiver<TimePeriod>,
 }
 
 impl<R: Runtime, M: Mockable> Publisher<R, M> {
@@ -71,6 +77,8 @@ impl<R: Runtime, M: Mockable> Publisher<R, M> {
         status_tx: PublisherStatusSender,
         keymgr: Arc<KeyMgr>,
         path_resolver: Arc<CfgPathResolver>,
+        pow_manager: Arc<PowManager<R>>,
+        update_from_pow_manager_rx: mpsc::Receiver<TimePeriod>,
     ) -> Self {
         let config = config_rx.borrow().clone();
         Self {
@@ -84,6 +92,8 @@ impl<R: Runtime, M: Mockable> Publisher<R, M> {
             status_tx,
             keymgr,
             path_resolver,
+            pow_manager,
+            update_from_pow_manager_rx,
         }
     }
 
@@ -100,6 +110,8 @@ impl<R: Runtime, M: Mockable> Publisher<R, M> {
             status_tx,
             keymgr,
             path_resolver,
+            pow_manager,
+            update_from_pow_manager_rx: publisher_update_rx,
         } = self;
 
         let reactor = Reactor::new(
@@ -113,6 +125,8 @@ impl<R: Runtime, M: Mockable> Publisher<R, M> {
             status_tx,
             keymgr,
             path_resolver,
+            pow_manager,
+            publisher_update_rx,
         );
 
         runtime
@@ -152,35 +166,36 @@ mod test {
     use std::io;
     use std::path::Path;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::time::Duration;
 
     use async_trait::async_trait;
     use fs_mistrust::Mistrust;
     use futures::{AsyncRead, AsyncWrite};
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
     use test_temp_dir::test_temp_dir;
 
-    use tor_basic_utils::test_rng::{testing_rng, TestingRng};
-    use tor_circmgr::hspool::HsCircKind;
+    use tor_basic_utils::test_rng::{TestingRng, testing_rng};
+
     use tor_hscrypto::pk::{HsBlindId, HsDescSigningKeypair, HsId, HsIdKey, HsIdKeypair};
     use tor_key_forge::ToEncodableKey;
     use tor_keymgr::{ArtiNativeKeystore, KeyMgrBuilder, KeySpecifier};
     use tor_llcrypto::pk::{ed25519, rsa};
     use tor_netdir::testprovider::TestNetDirProvider;
-    use tor_netdir::{testnet, NetDir};
+    use tor_netdir::{NetDir, testnet};
     use tor_netdoc::doc::hsdesc::test_data;
     use tor_rtcompat::ToplevelBlockOn;
     use tor_rtmock::MockRuntime;
 
+    use crate::HsNickname;
     use crate::config::OnionServiceConfigBuilder;
-    use crate::ipt_set::{ipts_channel, IptInSet, IptSet};
-    use crate::publish::reactor::MockableClientCirc;
+    use crate::ipt_set::{IptInSet, IptSet, ipts_channel};
+    use crate::pow::NewPowManager;
+    use crate::publish::reactor::MockableDirTunnel;
     use crate::status::{OnionServiceStatus, StatusSender};
     use crate::test::create_storage_handles;
-    use crate::HsNickname;
     use crate::{
         BlindIdKeypairSpecifier, BlindIdPublicKeySpecifier, DescSigningKeypairSpecifier,
         HsIdKeypairSpecifier, HsIdPublicKeySpecifier,
@@ -234,23 +249,20 @@ mod test {
     #[async_trait]
     impl<I: PollReadIter> Mockable for MockReactorState<I> {
         type Rng = TestingRng;
-        type ClientCirc = MockClientCirc<I>;
+        type Tunnel = MockClientCirc<I>;
 
         fn thread_rng(&self) -> Self::Rng {
             testing_rng()
         }
 
-        async fn get_or_launch_specific<T>(
+        async fn get_or_launch_hs_dir<T>(
             &self,
             _netdir: &tor_netdir::NetDir,
-            kind: HsCircKind,
             target: T,
-        ) -> Result<Arc<Self::ClientCirc>, tor_circmgr::Error>
+        ) -> Result<Self::Tunnel, tor_circmgr::Error>
         where
             T: tor_linkspec::CircTarget + Send + Sync,
         {
-            assert_eq!(kind, HsCircKind::SvcHsDir);
-
             // Look up the next poll_read value to return for this relay.
             let id = target.rsa_identity().unwrap();
             let mut map = self.responses_for_hsdir.lock().unwrap();
@@ -261,8 +273,7 @@ mod test {
             Ok(MockClientCirc {
                 publish_count: Arc::clone(&self.publish_count),
                 poll_read_responses: poll_read_responses.clone(),
-            }
-            .into())
+            })
         }
 
         fn estimate_upload_timeout(&self) -> Duration {
@@ -282,16 +293,20 @@ mod test {
     }
 
     #[async_trait]
-    impl<I: PollReadIter> MockableClientCirc for MockClientCirc<I> {
+    impl<I: PollReadIter> MockableDirTunnel for MockClientCirc<I> {
         type DataStream = MockDataStream<I>;
 
-        async fn begin_dir_stream(self: Arc<Self>) -> Result<Self::DataStream, tor_proto::Error> {
+        async fn begin_dir_stream(&self) -> Result<Self::DataStream, tor_circmgr::Error> {
             Ok(MockDataStream {
                 publish_count: Arc::clone(&self.publish_count),
                 // TODO: this will need to change when we start reusing circuits (currently,
                 // we only ever create one data stream per circuit).
                 poll_read_responses: self.poll_read_responses.clone(),
             })
+        }
+
+        fn source_info(&self) -> tor_proto::Result<Option<tor_dirclient::SourceInfo>> {
+            Ok(None)
         }
     }
 
@@ -322,7 +337,7 @@ mod test {
                         Err(()) => {
                             // Return an error. This should cause the reactor to reattempt the
                             // upload.
-                            Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "test error")))
+                            Poll::Ready(Err(io::Error::other("test error")))
                         }
                     }
                 }
@@ -446,7 +461,7 @@ mod test {
         keymgr: Arc<KeyMgr>,
         pv: IptsPublisherView,
         config_rx: watch::Receiver<Arc<OnionServiceConfig>>,
-        status_tx: PublisherStatusSender,
+        status_tx: StatusSender,
         netdir: NetDir,
         reactor_event: impl FnOnce(),
         poll_read_responses: I,
@@ -464,6 +479,30 @@ mod test {
                 responses_for_hsdir: Arc::new(Mutex::new(Default::default())),
             };
 
+            let temp_dir = test_temp_dir!();
+            let state_dir = temp_dir.subdir_untracked("state_dir");
+            let mistrust = fs_mistrust::Mistrust::new_dangerously_trust_everyone();
+            let state_dir = StateDirectory::new(state_dir, &mistrust).unwrap();
+            let state_handle = state_dir.acquire_instance(&nickname).unwrap();
+            let pow_nonce_dir = state_handle.raw_subdir("pow_nonces").unwrap();
+            let pow_manager_storage_handle = state_handle.storage_handle("pow_manager").unwrap();
+
+            let NewPowManager {
+                pow_manager,
+                rend_req_tx: _,
+                rend_req_rx: _,
+                publisher_update_rx: update_from_pow_manager_rx,
+            } = PowManager::new(
+                runtime.clone(),
+                nickname.clone(),
+                pow_nonce_dir,
+                keymgr.clone(),
+                pow_manager_storage_handle,
+                netdir_provider.clone(),
+                status_tx.clone().into(),
+                config_rx.clone(),
+            )
+            .unwrap();
             let mut status_rx = status_tx.subscribe();
             let publisher: Publisher<MockRuntime, MockReactorState<_>> = Publisher::new(
                 runtime.clone(),
@@ -472,9 +511,11 @@ mod test {
                 circpool,
                 pv,
                 config_rx,
-                status_tx,
+                status_tx.into(),
                 keymgr,
                 Arc::new(CfgPathResolver::default()),
+                pow_manager,
+                update_from_pow_manager_rx,
             );
 
             publisher.launch().unwrap();
@@ -590,7 +631,7 @@ mod test {
         // If any of the uploads fail, they will be retried. Note that the upload failure will
         // affect _each_ hsdir, so the expected number of uploads is a multiple of hsdir_count.
         let expected_upload_count = hsdir_count * multiplier;
-        let status_tx = StatusSender::new(OnionServiceStatus::new_shutdown()).into();
+        let status_tx = StatusSender::new(OnionServiceStatus::new_shutdown());
 
         run_test(
             runtime.clone(),

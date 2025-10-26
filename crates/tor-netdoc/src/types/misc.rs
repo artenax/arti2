@@ -6,19 +6,37 @@
 //! These types shouldn't be exposed outside of the netdoc crate.
 
 pub(crate) use b16impl::*;
-pub(crate) use b64impl::*;
+pub use b64impl::*;
 pub(crate) use curve25519impl::*;
 pub(crate) use ed25519impl::*;
 #[cfg(any(feature = "routerdesc", feature = "hs-common"))]
 pub(crate) use edcert::*;
 pub(crate) use fingerprint::*;
 pub(crate) use rsa::*;
-pub(crate) use timeimpl::*;
+pub use timeimpl::*;
 
-#[cfg(feature = "dangerous-expose-struct-fields")]
+#[cfg(feature = "parse2")]
+use {
+    crate::parse2::multiplicity::{
+        ItemSetMethods, ItemSetSelector, ObjectSetMethods, ObjectSetSelector,
+    },
+    crate::parse2::{ArgumentError, ArgumentStream, ItemArgumentParseable, ItemObjectParseable}, //
+};
+
 pub use nickname::Nickname;
-#[cfg(not(feature = "dangerous-expose-struct-fields"))]
-pub(crate) use nickname::Nickname;
+
+pub use fingerprint::{Base64Fingerprint, Fingerprint};
+
+pub use identified_digest::{DigestName, IdentifiedDigest};
+
+pub use ignored_impl::{Ignored, NotPresent};
+
+use crate::NormalItemArgument;
+use derive_deftly::{Deftly, define_derive_deftly};
+use std::fmt::{self, Display};
+use std::str::FromStr;
+use tor_error::ErrorReport as _;
+use void::{ResultVoidExt as _, Void};
 
 /// Describes a value that van be decoded from a bunch of bytes.
 ///
@@ -37,10 +55,31 @@ pub(crate) trait FromBytes: Sized {
 mod b64impl {
     use crate::{Error, NetdocErrorKind as EK, Pos, Result};
     use base64ct::{Base64, Base64Unpadded, Encoding};
+    use std::fmt::{self, Display};
     use std::ops::RangeBounds;
+    use subtle::{Choice, ConstantTimeEq};
 
     /// A byte array, encoded in base64 with optional padding.
-    pub(crate) struct B64(Vec<u8>);
+    ///
+    /// On output (`Display`), output is unpadded.
+    #[derive(Clone)]
+    #[allow(clippy::derived_hash_with_manual_eq)]
+    #[derive(Hash, derive_more::Debug, derive_more::From, derive_more::Into)]
+    #[debug(r#"B64("{self}")"#)]
+    pub struct B64(Vec<u8>);
+
+    impl ConstantTimeEq for B64 {
+        fn ct_eq(&self, other: &B64) -> Choice {
+            self.0.ct_eq(&other.0)
+        }
+    }
+    /// `B64` is `Eq` via its constant-time implementation.
+    impl PartialEq for B64 {
+        fn eq(&self, other: &B64) -> bool {
+            self.ct_eq(other).into()
+        }
+    }
+    impl Eq for B64 {}
 
     impl std::str::FromStr for B64 {
         type Err = Error;
@@ -58,9 +97,15 @@ mod b64impl {
         }
     }
 
+    impl Display for B64 {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            Display::fmt(&Base64Unpadded::encode_string(&self.0), f)
+        }
+    }
+
     impl B64 {
         /// Return the byte array from this object.
-        pub(crate) fn as_bytes(&self) -> &[u8] {
+        pub fn as_bytes(&self) -> &[u8] {
             &self.0[..]
         }
         /// Return this object if its length is within the provided bounds
@@ -76,16 +121,10 @@ mod b64impl {
         /// Try to convert this object into an array of N bytes.
         ///
         /// Return an error if the length is wrong.
-        pub(crate) fn into_array<const N: usize>(self) -> Result<[u8; N]> {
+        pub fn into_array<const N: usize>(self) -> Result<[u8; N]> {
             self.0
                 .try_into()
                 .map_err(|_| EK::BadObjectVal.with_msg("Invalid length on base64 data"))
-        }
-    }
-
-    impl From<B64> for Vec<u8> {
-        fn from(w: B64) -> Vec<u8> {
-            w.0
         }
     }
 }
@@ -196,21 +235,152 @@ mod ed25519impl {
 
 // ============================================================
 
+/// Dummy types like [`Ignored`]
+mod ignored_impl {
+    use super::*;
+
+    #[cfg(feature = "parse2")]
+    use crate::parse2::ErrorProblem as EP;
+
+    /// Part of a network document, that isn't actually there.
+    ///
+    /// Used as a standin in `ns_type!` calls in various netstatus `each_variety.rs`.
+    /// The effect is as if the field were omitted from the containing type.
+    ///
+    ///  * When used as item(s) (ie, a field type when deriving `NetdocParseable\[Fields\]`):
+    ///    **ignores any number** of items with that field's keyword during parsing,
+    ///    and emits none during encoding.
+    ///
+    ///    (To *reject* documents containing this item, use `Option<Void>`,
+    ///    but note that the spec says unknown items should be ignored,
+    ///    which would normally include items which are merely missing from one variety.)
+    ///
+    ///  * When used as an argument (ie, a field type when deriving `ItemValueParseable`,
+    ///    or with `netdoc(single_arg)`  when deriving `NetdocParseable\[Fields\]`):
+    ///    consumes **no arguments** during parsing, and emits none during encoding.
+    ///
+    ///  * When used as an object field (ie, `netdoc(object)` when deriving `ItemValueParseable`):
+    ///    **rejects** an object - failing the parse if one is present.
+    ///    (Functions similarly to `Option<Void>`, but prefer `NotPresent` as it's clearer.)
+    ///
+    /// There are bespoke impls of the multiplicity traits
+    /// `ItemSetMethods` and `ObjectSetMethods`:
+    /// don't wrap this type in `Option` or `Vec`.
+    //
+    // TODO we'll need to implement ItemArgument etc., for encoding, too.
+    #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Default)]
+    #[allow(clippy::exhaustive_structs)]
+    #[cfg_attr(
+        feature = "parse2",
+        derive(Deftly),
+        derive_deftly(NetdocParseableFields)
+    )]
+    pub struct NotPresent;
+
+    /// Ignored part of a network document.
+    ///
+    /// With `parse2`, can be used as an item, object, or even flattened-fields.
+    ///
+    /// When deriving `parse2` traits, and a field is absent in a particular netstatus variety,
+    /// use `ns_type!` with [`NotPresent`], rather than `Ignored`.
+    ///
+    /// Cannot be encoded.  During encoding, the multiplicity arrangements must ensure that
+    /// no attempt is made to encode an `Ignored`.
+    // TODO there are no derives or multiplicity arrangements for ecoding yet.
+    #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Default)]
+    #[cfg_attr(
+        feature = "parse2",
+        derive(Deftly),
+        derive_deftly(ItemValueParseable, NetdocParseableFields)
+    )]
+    #[allow(clippy::exhaustive_structs)]
+    pub struct Ignored;
+
+    #[cfg(feature = "parse2")]
+    impl ItemSetMethods for ItemSetSelector<NotPresent> {
+        type Each = Ignored;
+        type Field = NotPresent;
+        fn can_accumulate(self, _acc: &Option<NotPresent>) -> Result<(), EP> {
+            Ok(())
+        }
+        fn accumulate(self, _acc: &mut Option<NotPresent>, _item: Ignored) -> Result<(), EP> {
+            Ok(())
+        }
+        fn finish(self, _acc: Option<NotPresent>, _: &'static str) -> Result<NotPresent, EP> {
+            Ok(NotPresent)
+        }
+    }
+
+    #[cfg(feature = "parse2")]
+    impl ItemArgumentParseable for NotPresent {
+        fn from_args(_: &mut ArgumentStream) -> Result<NotPresent, ArgumentError> {
+            Ok(NotPresent)
+        }
+    }
+
+    #[cfg(feature = "parse2")]
+    impl ObjectSetMethods for ObjectSetSelector<NotPresent> {
+        type Field = NotPresent;
+        type Each = Void;
+        fn resolve_option(self, _found: Option<Void>) -> Result<NotPresent, EP> {
+            Ok(NotPresent)
+        }
+    }
+
+    impl FromStr for Ignored {
+        type Err = Void;
+        fn from_str(_s: &str) -> Result<Ignored, Void> {
+            Ok(Ignored)
+        }
+    }
+
+    #[cfg(feature = "parse2")]
+    impl ItemArgumentParseable for Ignored {
+        fn from_args(_: &mut ArgumentStream) -> Result<Ignored, ArgumentError> {
+            Ok(Ignored)
+        }
+    }
+
+    #[cfg(feature = "parse2")]
+    impl ItemObjectParseable for Ignored {
+        fn check_label(_label: &str) -> Result<(), EP> {
+            // allow any label
+            Ok(())
+        }
+        fn from_bytes(_input: &[u8]) -> Result<Self, EP> {
+            Ok(Ignored)
+        }
+    }
+
+    #[cfg(feature = "parse2")]
+    impl ObjectSetMethods for ObjectSetSelector<Ignored> {
+        type Field = Ignored;
+        type Each = Ignored;
+        fn resolve_option(self, _found: Option<Ignored>) -> Result<Ignored, EP> {
+            Ok(Ignored)
+        }
+    }
+}
+
+// ============================================================
+
 /// Types for decoding times and dates
 mod timeimpl {
     use crate::{Error, NetdocErrorKind as EK, Pos, Result};
     use std::time::SystemTime;
     use time::{
-        format_description::FormatItem, macros::format_description, OffsetDateTime,
-        PrimitiveDateTime,
+        OffsetDateTime, PrimitiveDateTime, format_description::FormatItem,
+        macros::format_description,
     };
 
     /// A wall-clock time, encoded in Iso8601 format with an intervening
     /// space between the date and time.
     ///
     /// (Example: "2020-10-09 17:38:12")
-    #[derive(derive_more::Into, derive_more::From)]
-    pub(crate) struct Iso8601TimeSp(SystemTime);
+    #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)] //
+    #[derive(derive_more::Into, derive_more::From, derive_more::Deref)]
+    #[allow(clippy::exhaustive_structs)]
+    pub struct Iso8601TimeSp(pub SystemTime);
 
     /// Formatting object for parsing the space-separated Iso8601 format.
     const ISO_8601SP_FMT: &[FormatItem] =
@@ -256,8 +426,10 @@ mod timeimpl {
     /// The timezone is not included in the string representation; `+0000` is implicit.
     ///
     /// (Example: "2020-10-09T17:38:12")
-    #[derive(derive_more::Into, derive_more::From)]
-    pub(crate) struct Iso8601TimeNoSp(SystemTime);
+    #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash)] //
+    #[derive(derive_more::Into, derive_more::From, derive_more::Deref)]
+    #[allow(clippy::exhaustive_structs)]
+    pub struct Iso8601TimeNoSp(pub SystemTime);
 
     /// Formatting object for parsing the space-separated Iso8601 format.
     const ISO_8601NOSP_FMT: &[FormatItem] =
@@ -280,6 +452,8 @@ mod timeimpl {
             write!(f, "{}", fmt_with(self.0, ISO_8601NOSP_FMT)?)
         }
     }
+
+    impl crate::NormalItemArgument for Iso8601TimeNoSp {}
 }
 
 /// Types for decoding RSA keys
@@ -392,37 +566,172 @@ mod edcert {
     }
 }
 
+/// Digest identifeirs, and digests in the form `ALGORITHM=BASE64U`
+///
+/// As found in a vote's `m` line.
+mod identified_digest {
+    use super::*;
+
+    define_derive_deftly! {
+        /// impl `FromStr` and `Display` for an enum with unit variants but also "unknown"
+        ///
+        /// Expected input: an enum whose variants are either
+        ///  * unit variants, perhaps with `#[deftly(string_repr = "string")]`
+        ///  * singleton tuple variant, containing `String` (or near equivalent)
+        ///
+        /// If `#[deftly(string_repro)]` is not specified,
+        /// the default is snake case of the variant name.
+        //
+        // This macro may seem overkill, but open-coding these impls gives opportunities
+        // for mismatches between FromStr, Display, and the variant name.
+        //
+        // TODO consider putting this in tor-basic-utils (maybe with a better name),
+        // or possibly asking if derive_more want their FromStr to have this.
+        StringReprUnitsOrUnknown for enum, expect items, beta_deftly:
+
+        ${define STRING_REPR {
+            ${vmeta(string_repr)
+              as str,
+              default { ${concat ${snake_case $vname}} }
+            }
+        }}
+
+        impl FromStr for $ttype {
+            type Err = Void;
+            fn from_str(s: &str) -> Result<Self, Void> {
+                $(
+                    ${when v_is_unit}
+                    if s == $STRING_REPR {
+                        return Ok($vtype)
+                    }
+                )
+                $(
+                    ${when not(v_is_unit)} // anything else had better be Unknown
+                    // not using `return ..;` makes this a syntax error if there are several.
+                    Ok($vtype { 0: s.into() })
+                )
+            }
+        }
+        impl Display for $ttype {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                let s: &str = match self {
+                    $(
+                        ${when v_is_unit}
+                        $vtype => $STRING_REPR,
+                    )
+                    $(
+                        ${when not(v_is_unit)}
+                        $vpat => f_0,
+                    )
+                };
+                Display::fmt(s, f)
+            }
+        }
+    }
+
+    /// The name of a digest algorithm.
+    ///
+    /// Can represent an unrecognised algorithm, so it's parsed and reproduced.
+    #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deftly)]
+    #[derive_deftly(StringReprUnitsOrUnknown)]
+    #[non_exhaustive]
+    pub enum DigestName {
+        /// SHA-256
+        Sha256,
+        /// Unknown
+        Unknown(String),
+    }
+
+    /// A single digest made with a nominated digest algorithm, `ALGORITHM=DIGEST`
+    #[derive(Debug, Clone, Eq, PartialEq, Hash, derive_more::Display)]
+    #[display("{alg}={value}")]
+    #[non_exhaustive]
+    pub struct IdentifiedDigest {
+        /// The algorithm name.
+        alg: DigestName,
+
+        /// The digest value.
+        ///
+        /// Invariant: length is correct for `alg`, assuming `alg` is known.
+        value: B64,
+    }
+
+    impl NormalItemArgument for DigestName {}
+    impl NormalItemArgument for IdentifiedDigest {}
+
+    /// Invalid syntax parsing an `IdentifiedDigest`
+    #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, thiserror::Error)]
+    #[error("invalid syntax, espected ALGORITHM=DIGEST: {0}")]
+    pub struct IdentifiedDigestParseError(String);
+
+    impl FromStr for IdentifiedDigest {
+        type Err = IdentifiedDigestParseError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            (|| {
+                let (alg, value) = s.split_once('=').ok_or("missing equals sign")?;
+
+                let alg = alg.parse().void_unwrap();
+                let value = value
+                    .parse::<B64>()
+                    .map_err(|e| format!("bad value: {}", e.report()))?;
+
+                if let Some(exp_len) = (|| {
+                    Some({
+                        use DigestName::*;
+                        match alg {
+                            Sha256 => 32,
+                            Unknown(_) => None?,
+                        }
+                    })
+                })() {
+                    let val_len = value.as_bytes().len();
+                    if val_len != exp_len {
+                        return Err(format!("got {val_len} bytes, expected {exp_len}"));
+                    }
+                }
+
+                Ok(IdentifiedDigest { alg, value })
+            })()
+            .map_err(IdentifiedDigestParseError)
+        }
+    }
+}
+
 /// Types for decoding RSA fingerprints
 mod fingerprint {
     use crate::{Error, NetdocErrorKind as EK, Pos, Result};
+    use base64ct::{Base64Unpadded, Encoding as _};
+    use std::fmt::{self, Display};
     use tor_llcrypto::pk::rsa::RsaIdentity;
 
-    /// A hex-encoded fingerprint with spaces in it.
-    pub(crate) struct SpFingerprint(RsaIdentity);
+    /// A hex-encoded RSA key identity (fingerprint) with spaces in it.
+    ///
+    /// Netdoc parsing adapter for [`RsaIdentity`]
+    #[derive(Debug, Clone, Eq, PartialEq, derive_more::Deref, derive_more::Into)]
+    #[allow(clippy::exhaustive_structs)]
+    pub(crate) struct SpFingerprint(pub RsaIdentity);
 
     /// A hex-encoded fingerprint with no spaces.
-    pub(crate) struct Fingerprint(RsaIdentity);
+    ///
+    /// Netdoc parsing adapter for [`RsaIdentity`]
+    #[derive(Debug, Clone, Eq, PartialEq, derive_more::Deref, derive_more::Into)]
+    #[allow(clippy::exhaustive_structs)]
+    pub struct Fingerprint(pub RsaIdentity);
+
+    /// A base64-encoded fingerprint (unpadded)
+    ///
+    /// Netdoc parsing adapter for [`RsaIdentity`]
+    #[derive(Debug, Clone, Eq, PartialEq, derive_more::Deref, derive_more::Into)]
+    #[allow(clippy::exhaustive_structs)]
+    pub struct Base64Fingerprint(pub RsaIdentity);
 
     /// A "long identity" in the format used for Family members.
-    pub(crate) struct LongIdent(RsaIdentity);
-
-    impl From<SpFingerprint> for RsaIdentity {
-        fn from(f: SpFingerprint) -> RsaIdentity {
-            f.0
-        }
-    }
-
-    impl From<LongIdent> for RsaIdentity {
-        fn from(f: LongIdent) -> RsaIdentity {
-            f.0
-        }
-    }
-
-    impl From<Fingerprint> for RsaIdentity {
-        fn from(f: Fingerprint) -> RsaIdentity {
-            f.0
-        }
-    }
+    ///
+    /// Netdoc parsing adapter for [`RsaIdentity`]
+    #[derive(Debug, Clone, Eq, PartialEq, derive_more::Deref, derive_more::Into)]
+    #[allow(clippy::exhaustive_structs)]
+    pub(crate) struct LongIdent(pub RsaIdentity);
 
     /// Helper: parse an identity from a hexadecimal string
     fn parse_hex_ident(s: &str) -> Result<RsaIdentity> {
@@ -441,11 +750,36 @@ mod fingerprint {
         }
     }
 
+    impl std::str::FromStr for Base64Fingerprint {
+        type Err = Error;
+        fn from_str(s: &str) -> Result<Base64Fingerprint> {
+            let b = s.parse::<super::B64>()?;
+            let ident = RsaIdentity::from_bytes(b.as_bytes()).ok_or_else(|| {
+                EK::BadArgument
+                    .at_pos(Pos::at(s))
+                    .with_msg("Wrong identity length")
+            })?;
+            Ok(Base64Fingerprint(ident))
+        }
+    }
+
+    impl Display for Base64Fingerprint {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            Display::fmt(&Base64Unpadded::encode_string(self.as_bytes()), f)
+        }
+    }
+
     impl std::str::FromStr for Fingerprint {
         type Err = Error;
         fn from_str(s: &str) -> Result<Fingerprint> {
             let ident = parse_hex_ident(s).map_err(|e| e.at_pos(Pos::at(s)))?;
             Ok(Fingerprint(ident))
+        }
+    }
+
+    impl Display for Fingerprint {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            Display::fmt(&hex::encode_upper(self.as_bytes()), f)
         }
     }
 
@@ -462,6 +796,9 @@ mod fingerprint {
             Ok(LongIdent(ident))
         }
     }
+
+    impl crate::NormalItemArgument for Fingerprint {}
+    impl crate::NormalItemArgument for Base64Fingerprint {}
 }
 
 /// A type for relay nicknames
@@ -480,10 +817,8 @@ mod nickname {
     ///
     /// Nicknames are required to be ASCII, alphanumeric, and between 1 and 19
     /// characters inclusive.
-    #[cfg_attr(docsrs, doc(cfg(feature = "dangerous-expose-struct-fields")))]
-    #[cfg_attr(feature = "dangerous-expose-struct-fields", visibility::make(pub))]
     #[derive(Clone, Debug)]
-    pub(crate) struct Nickname(tinystr::TinyAsciiStr<MAX_NICKNAME_LEN>);
+    pub struct Nickname(tinystr::TinyAsciiStr<MAX_NICKNAME_LEN>);
 
     impl Nickname {
         /// Return a view of this nickname as a string slice.
@@ -517,6 +852,8 @@ mod nickname {
             }
         }
     }
+
+    impl crate::NormalItemArgument for Nickname {}
 }
 
 #[cfg(test)]
@@ -535,7 +872,6 @@ mod test {
     #![allow(clippy::needless_pass_by_value)]
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use itertools::Itertools;
-    use std::iter;
 
     use base64ct::Encoding;
 
@@ -563,14 +899,18 @@ mod test {
                 .as_bytes(),
             "🍒🍒🍒🍒🍒🍒".as_bytes()
         );
-        assert!("8J+NkvCfjZLwn42S8J+NkvCfjZLwn42S"
-            .parse::<B64>()?
-            .check_len(24..25)
-            .is_ok());
-        assert!("ppwthHXW8kXD0f9fE7UPYsOAAu4uj5ORwSomCMxKkz8="
-            .parse::<B64>()?
-            .check_len(32..33)
-            .is_ok());
+        assert!(
+            "8J+NkvCfjZLwn42S8J+NkvCfjZLwn42S"
+                .parse::<B64>()?
+                .check_len(24..25)
+                .is_ok()
+        );
+        assert!(
+            "ppwthHXW8kXD0f9fE7UPYsOAAu4uj5ORwSomCMxKkz8="
+                .parse::<B64>()?
+                .check_len(32..33)
+                .is_ok()
+        );
         // Padded:
         assert_eq!("Mi43MTgyOA==".parse::<B64>()?.as_bytes(), &b"2.71828"[..]);
         assert!("Mi43MTgyOA==".parse::<B64>()?.check_len(7..8).is_ok());
@@ -582,9 +922,11 @@ mod test {
         assert!("Mi43!!!!!!".parse::<B64>().is_err());
         // Invalid last character.
         assert!("Mi".parse::<B64>().is_err());
-        assert!("ppwthHXW8kXD0f9fE7UPYsOAAu4uj5ORwSomCMxaaaa"
-            .parse::<B64>()
-            .is_err());
+        assert!(
+            "ppwthHXW8kXD0f9fE7UPYsOAAu4uj5ORwSomCMxaaaa"
+                .parse::<B64>()
+                .is_err()
+        );
         // Invalid length.
         assert!("Mi43MTgyOA".parse::<B64>()?.check_len(8..).is_err());
         Ok(())
@@ -617,10 +959,7 @@ mod test {
         // Check that strings that we accept are precisely ones which
         // can be generated by either Base64 or Base64Unpadded
         for n in 0..=5 {
-            for c_vec in iter::repeat("ACEQg/=".chars())
-                .take(n)
-                .multi_cartesian_product()
-            {
+            for c_vec in std::iter::repeat_n("ACEQg/=".chars(), n).multi_cartesian_product() {
                 let s: String = c_vec.into_iter().collect();
                 #[allow(clippy::print_stderr)]
                 let b = match s.parse::<B64>() {
@@ -671,18 +1010,26 @@ mod test {
         let k1: PublicKey = k1.parse::<Curve25519Public>()?.into();
         assert_eq!(k1, (*k2).into());
 
-        assert!("ppwthHXW8kXD0f9fE7UPYsOAAu4uj5ORwSomCMxKkz"
-            .parse::<Curve25519Public>()
-            .is_err());
-        assert!("ppwthHXW8kXD0f9fE7UPYsOAAu4uj5ORSomCMxKkz"
-            .parse::<Curve25519Public>()
-            .is_err());
-        assert!("ppwthHXW8kXD0f9fE7UPYsOAAu4uj5wSomCMxKkz"
-            .parse::<Curve25519Public>()
-            .is_err());
-        assert!("ppwthHXW8kXD0f9fE7UPYsOAAu4ORwSomCMxKkz"
-            .parse::<Curve25519Public>()
-            .is_err());
+        assert!(
+            "ppwthHXW8kXD0f9fE7UPYsOAAu4uj5ORwSomCMxKkz"
+                .parse::<Curve25519Public>()
+                .is_err()
+        );
+        assert!(
+            "ppwthHXW8kXD0f9fE7UPYsOAAu4uj5ORSomCMxKkz"
+                .parse::<Curve25519Public>()
+                .is_err()
+        );
+        assert!(
+            "ppwthHXW8kXD0f9fE7UPYsOAAu4uj5wSomCMxKkz"
+                .parse::<Curve25519Public>()
+                .is_err()
+        );
+        assert!(
+            "ppwthHXW8kXD0f9fE7UPYsOAAu4ORwSomCMxKkz"
+                .parse::<Curve25519Public>()
+                .is_err()
+        );
 
         Ok(())
     }
@@ -697,19 +1044,27 @@ mod test {
         let k1: Ed25519Identity = k1.parse::<Ed25519Public>()?.into();
         assert_eq!(k1, Ed25519Identity::from_bytes(&k2).unwrap());
 
-        assert!("WVIPQ8oArAqLY4Xzk0!!!!8KsUJHBQhG8SC57qru"
-            .parse::<Ed25519Public>()
-            .is_err());
-        assert!("WVIPQ8oArAqLY4XzkcpIU8KsUJHBQhG8SC57qru"
-            .parse::<Ed25519Public>()
-            .is_err());
-        assert!("WVIPQ8oArAqLY4XzkcpIU8KsUJHBQhG8SC57qr"
-            .parse::<Ed25519Public>()
-            .is_err());
+        assert!(
+            "WVIPQ8oArAqLY4Xzk0!!!!8KsUJHBQhG8SC57qru"
+                .parse::<Ed25519Public>()
+                .is_err()
+        );
+        assert!(
+            "WVIPQ8oArAqLY4XzkcpIU8KsUJHBQhG8SC57qru"
+                .parse::<Ed25519Public>()
+                .is_err()
+        );
+        assert!(
+            "WVIPQ8oArAqLY4XzkcpIU8KsUJHBQhG8SC57qr"
+                .parse::<Ed25519Public>()
+                .is_err()
+        );
         // right length, bad key:
-        assert!("ppwthHXW8kXD0f9fE7UPYsOAAu4uj5ORwSomCMxaaaa"
-            .parse::<Curve25519Public>()
-            .is_err());
+        assert!(
+            "ppwthHXW8kXD0f9fE7UPYsOAAu4uj5ORwSomCMxaaaa"
+                .parse::<Curve25519Public>()
+                .is_err()
+        );
         Ok(())
     }
 
@@ -815,10 +1170,11 @@ mod test {
             .check_subject_key_is(&right_subject_key)
             .unwrap();
         // check wrong type.
-        assert!(cert
-            .clone()
-            .check_cert_type(tor_cert::CertType::RSA_ID_X509)
-            .is_err());
+        assert!(
+            cert.clone()
+                .check_cert_type(tor_cert::CertType::RSA_ID_X509)
+                .is_err()
+        );
         // check wrong key.
         assert!(cert.check_subject_key_is(&wrong_subject_key).is_err());
 
@@ -847,6 +1203,7 @@ mod test {
         assert_eq!(RsaIdentity::from(fp2.parse::<Fingerprint>()?), k);
         assert!(fp3.parse::<Fingerprint>().is_err());
         assert!(fp4.parse::<Fingerprint>().is_err());
+        assert_eq!(Fingerprint(k).to_string(), fp2);
 
         assert!(fp1.parse::<LongIdent>().is_err());
         assert_eq!(RsaIdentity::from(fp2.parse::<LongIdent>()?), k);
@@ -855,6 +1212,11 @@ mod test {
 
         assert!("xxxx".parse::<Fingerprint>().is_err());
         assert!("ffffffffff".parse::<Fingerprint>().is_err());
+
+        let fp_b64 = "dGepfRnNK08rwDiKqZxeZ3EPhH4";
+        assert_eq!(RsaIdentity::from(fp_b64.parse::<Base64Fingerprint>()?), k);
+        assert_eq!(Base64Fingerprint(k).to_string(), fp_b64);
+
         Ok(())
     }
 

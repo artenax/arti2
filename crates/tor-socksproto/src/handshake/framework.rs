@@ -25,7 +25,7 @@ use derive_deftly::define_derive_deftly;
 use educe::Educe;
 
 use tor_bytes::Reader;
-use tor_error::{internal, Bug};
+use tor_error::{Bug, internal};
 
 use crate::SOCKS_BUF_LEN;
 use crate::{Action, Error, Truncated};
@@ -175,7 +175,7 @@ impl<'b, O> Finished<'b, O, PreciseReads> {
     pub fn into_output(self) -> Result<O, Bug> {
         if let Ok(nonzero) = NonZeroUsize::try_from(self.buffer.filled_slice().len()) {
             Err(internal!(
- "handshake complete, but we read too much earlier, and are now misframed by {nonzero} bytes!"
+                "handshake complete, but we read too much earlier, and are now misframed by {nonzero} bytes!"
             ))
         } else {
             Ok(self.output)
@@ -337,10 +337,10 @@ impl<P: ReadPrecision> Buffer<P> {
     ///
     ///  * `buf[..filled]` should contain data already read from the peer
     ///  * `buf[filled..]` should be zero (or other innocuous data),
-    ///                    and will not be used (except if there are bugs)
+    ///    and will not be used (except if there are bugs)
     ///
     /// Using this and `into_parts` to obtain a `Buffer`
-    /// with a differetn the read precision (different `P` type parameter)
+    /// with a different read precision (different `P` type parameter)
     /// can result in malfunctions.
     pub fn from_parts(buf: Box<[u8]>, filled: usize) -> Self {
         Buffer {
@@ -385,7 +385,7 @@ impl<P: ReadPrecision> Buffer<P> {
     ///
     /// (It doesn't make sense to call this with `len == 0`.
     /// If the `0` came from a read call, this indicates EOF -
-    /// but that might not be an error if the protocol implemnetation doesn't need more data.
+    /// but that might not be an error if the protocol implementation doesn't need more data.
     /// [`RecvStep::note_received`] handles this properly.)
     ///
     /// # Panics
@@ -520,7 +520,7 @@ pub(super) trait HandshakeImpl: HasHandshakeState {
                         internal!("protocol implementation drained nothing, replied nothing")
                             .into(),
                     ),
-                )
+                );
             }
             _ => {}
         };
@@ -639,7 +639,7 @@ pub trait Handshake: HandshakeImpl + HasHandshakeOutput<Self::Output> {
                 reply,
                 finished: false,
             })),
-            Ok(ImplNextStep::Finished {}) => Ok(Ok(Action {
+            Ok(ImplNextStep::Finished) => Ok(Ok(Action {
                 drain,
                 reply: vec![],
                 finished: true,

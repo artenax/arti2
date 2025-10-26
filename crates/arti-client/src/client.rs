@@ -10,28 +10,30 @@ use {derive_deftly::Deftly, tor_rpcbase::templates::*};
 
 use crate::address::{IntoTorAddr, ResolveInstructions, StreamInstructions};
 
-use crate::config::{ClientAddrConfig, StreamTimeoutConfig, TorClientConfig};
-use safelog::{sensitive, Sensitive};
+use crate::config::{
+    ClientAddrConfig, SoftwareStatusOverrideConfig, StreamTimeoutConfig, TorClientConfig,
+};
+use safelog::{Sensitive, sensitive};
 use tor_async_utils::{DropNotifyWatchSender, PostageWatchSenderExt};
+use tor_circmgr::ClientDataTunnel;
 use tor_circmgr::isolation::{Isolation, StreamIsolation};
-use tor_circmgr::{isolation::StreamIsolationBuilder, IsolationToken, TargetPort};
+use tor_circmgr::{IsolationToken, TargetPort, isolation::StreamIsolationBuilder};
 use tor_config::MutCfg;
 #[cfg(feature = "bridge-client")]
 use tor_dirmgr::bridgedesc::BridgeDescMgr;
 use tor_dirmgr::{DirMgrStore, Timeliness};
-use tor_error::{error_report, internal, Bug};
+use tor_error::{Bug, error_report, internal};
 use tor_guardmgr::{GuardMgr, RetireCircuits};
 use tor_keymgr::Keystore;
 use tor_memquota::MemoryQuotaTracker;
-use tor_netdir::{params::NetParameters, NetDirProvider};
+use tor_netdir::{NetDirProvider, params::NetParameters};
 #[cfg(feature = "onion-service-service")]
 use tor_persist::state_dir::StateDirectory;
 use tor_persist::{FsStateMgr, StateMgr};
-use tor_proto::circuit::ClientCirc;
-use tor_proto::stream::{DataStream, IpVersionPreference, StreamParameters};
+use tor_proto::client::stream::{DataStream, IpVersionPreference, StreamParameters};
 #[cfg(all(
     any(feature = "native-tls", feature = "rustls"),
-    any(feature = "async-std", feature = "tokio")
+    any(feature = "async-std", feature = "tokio"),
 ))]
 use tor_rtcompat::PreferredRuntime;
 use tor_rtcompat::{Runtime, SleepProviderExt};
@@ -48,7 +50,7 @@ use tor_hsservice::HsIdKeypairSpecifier;
 #[cfg(all(feature = "onion-service-client", feature = "experimental-api"))]
 use {tor_hscrypto::pk::HsId, tor_hscrypto::pk::HsIdKeypair, tor_keymgr::KeystoreSelector};
 
-use tor_keymgr::{config::ArtiKeystoreKind, ArtiNativeKeystore, KeyMgr, KeyMgrBuilder};
+use tor_keymgr::{ArtiNativeKeystore, KeyMgr, KeyMgrBuilder, config::ArtiKeystoreKind};
 
 #[cfg(feature = "ephemeral-keystore")]
 use tor_keymgr::ArtiEphemeralKeystore;
@@ -56,19 +58,19 @@ use tor_keymgr::ArtiEphemeralKeystore;
 #[cfg(feature = "ctor-keystore")]
 use tor_keymgr::{CTorClientKeystore, CTorServiceKeystore};
 
+use futures::StreamExt as _;
 use futures::lock::Mutex as AsyncMutex;
 use futures::task::SpawnExt;
-use futures::StreamExt as _;
 use std::net::IpAddr;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex};
 
 use crate::err::ErrorDetail;
-use crate::{status, util, TorClientBuilder};
+use crate::{TorClientBuilder, status, util};
 #[cfg(feature = "geoip")]
 use tor_geoip::CountryCode;
 use tor_rtcompat::scheduler::TaskHandle;
-use tracing::{debug, info};
+use tracing::{debug, info, instrument};
 
 /// An active client session on the Tor network.
 ///
@@ -168,6 +170,8 @@ pub struct TorClient<R: Runtime> {
     addrcfg: Arc<MutCfg<ClientAddrConfig>>,
     /// Client DNS configuration
     timeoutcfg: Arc<MutCfg<StreamTimeoutConfig>>,
+    /// Software status configuration.
+    software_status_cfg: Arc<MutCfg<SoftwareStatusOverrideConfig>>,
     /// Mutex used to serialize concurrent attempts to reconfigure a TorClient.
     ///
     /// See [`TorClient::reconfigure`] for more information on its use.
@@ -323,7 +327,7 @@ impl InertTorClient {
         selector: KeystoreSelector,
         hsid: HsId,
     ) -> crate::Result<HsClientDescEncKey> {
-        let mut rng = rand::rng();
+        let mut rng = tor_llcrypto::rng::CautiousRng;
         let spec = HsClientDescEncKeypairSpecifier::new(hsid);
         let key = self
             .keymgr
@@ -360,7 +364,7 @@ impl InertTorClient {
         selector: KeystoreSelector,
         hsid: HsId,
     ) -> crate::Result<HsClientDescEncKey> {
-        let mut rng = rand::rng();
+        let mut rng = tor_llcrypto::rng::CautiousRng;
         let spec = HsClientDescEncKeypairSpecifier::new(hsid);
         let key = self
             .keymgr
@@ -470,6 +474,14 @@ impl InertTorClient {
             Some(_) => Ok(Some(())),
             None => Ok(None),
         }
+    }
+
+    /// Getter for keymgr.
+    #[cfg(feature = "onion-service-cli-extra")]
+    pub fn keymgr(&self) -> crate::Result<&KeyMgr> {
+        Ok(self.keymgr.as_ref().ok_or(ErrorDetail::KeystoreRequired {
+            action: "get key manager handle",
+        })?)
     }
 }
 
@@ -656,14 +668,7 @@ impl StreamPrefs {
     /// If `Explicit(true)`, Onion Service connections are enabled.
     ///
     /// If `Auto`, the behaviour depends on the `address_filter.allow_onion_addrs`
-    /// configuration option, which is in turn **disabled** by default.
-    ///
-    /// **Note**: Arti currently lacks the
-    /// "vanguards" feature that Tor uses to prevent guard discovery attacks over time.
-    /// As such, you should probably stick with C Tor if you need to make a large
-    /// number of onion service connections, or if you are using the Tor protocol
-    /// in a way that lets an attacker control how many onion services connections that you make -
-    /// for example, when using Arti's SOCKS support from a web browser such as Tor Browser.
+    /// configuration option, which is in turn enabled by default.
     #[cfg(feature = "onion-service-client")]
     pub fn connect_to_onion_services(
         &mut self,
@@ -782,6 +787,12 @@ impl TorClient<PreferredRuntime> {
     /// If using `async-std`, either take care to ensure Arti is not compiled with Tokio support,
     /// or manually create an `async-std` runtime using [`tor_rtcompat`] and use it with
     /// [`TorClient::with_runtime`].
+    ///
+    /// # Do not fork
+    ///
+    /// The process [**may not fork**](tor_rtcompat#do-not-fork)
+    /// (except, very carefully, before exec)
+    /// after calling this function, because it creates a [`PreferredRuntime`].
     pub async fn create_bootstrapped(config: TorClientConfig) -> crate::Result<Self> {
         let runtime = PreferredRuntime::current()
             .expect("TorClient could not get an asynchronous runtime; are you running in the right context?");
@@ -806,6 +817,12 @@ impl TorClient<PreferredRuntime> {
     /// If using `async-std`, either take care to ensure Arti is not compiled with Tokio support,
     /// or manually create an `async-std` runtime using [`tor_rtcompat`] and use it with
     /// [`TorClient::with_runtime`].
+    ///
+    /// # Do not fork
+    ///
+    /// The process [**may not fork**](tor_rtcompat#do-not-fork)
+    /// (except, very carefully, before exec)
+    /// after calling this function, because it creates a [`PreferredRuntime`].
     pub fn builder() -> TorClientBuilder<PreferredRuntime> {
         let runtime = PreferredRuntime::current()
             .expect("TorClient could not get an asynchronous runtime; are you running in the right context?");
@@ -856,6 +873,7 @@ impl<R: Runtime> TorClient<R> {
         let statemgr = FsStateMgr::from_path_and_mistrust(&state_dir, mistrust)
             .map_err(ErrorDetail::StateMgrSetup)?;
         // Try to take state ownership early, so we'll know if we have it.
+        // Note that this `try_lock()` may return `Ok` even if we can't acquire the lock.
         // (At this point we don't yet care if we have it.)
         let _ignore_status = statemgr.try_lock().map_err(ErrorDetail::StateMgrSetup)?;
 
@@ -871,6 +889,7 @@ impl<R: Runtime> TorClient<R> {
             dormant.into(),
             &NetParameters::from_map(&config.override_net_params),
             memquota.clone(),
+            None,
         ));
         let guardmgr = tor_guardmgr::GuardMgr::new(runtime.clone(), statemgr.clone(), config)
             .map_err(ErrorDetail::GuardMgrSetup)?;
@@ -915,6 +934,34 @@ impl<R: Runtime> TorClient<R> {
                 dir_cfg,
             )
             .map_err(crate::Error::into_detail)?;
+
+        let software_status_cfg = Arc::new(MutCfg::new(config.use_obsolete_software.clone()));
+        let rtclone = runtime.clone();
+        #[allow(clippy::print_stderr)]
+        crate::protostatus::enforce_protocol_recommendations(
+            &runtime,
+            Arc::clone(&dirmgr),
+            crate::software_release_date(),
+            crate::supported_protocols(),
+            Arc::clone(&software_status_cfg),
+            // TODO #1932: It would be nice to have a cleaner shutdown mechanism here,
+            // but that will take some work.
+            |fatal| async move {
+                use tor_error::ErrorReport as _;
+                // We already logged this error, but let's tell stderr too.
+                eprintln!(
+                    "Shutting down because of unsupported software version.\nError was:\n{}",
+                    fatal.report(),
+                );
+                if let Some(hint) = crate::err::Error::from(fatal).hint() {
+                    eprintln!("{}", hint);
+                }
+                // Give the tracing module a while to flush everything, since it has no built-in
+                // flush function.
+                rtclone.sleep(std::time::Duration::new(5, 0)).await;
+                std::process::exit(1);
+            },
+        )?;
 
         let mut periodic_task_handles = circmgr
             .launch_background_tasks(&runtime, &dirmgr, statemgr.clone())
@@ -1012,6 +1059,7 @@ impl<R: Runtime> TorClient<R> {
             #[cfg(feature = "onion-service-service")]
             state_directory,
             path_resolver,
+            software_status_cfg,
         })
     }
 
@@ -1033,6 +1081,7 @@ impl<R: Runtime> TorClient<R> {
     ///
     /// If the bootstrapping process fails, returns an error. This function can safely be called
     /// again later to attempt to bootstrap another time.
+    #[instrument(skip_all, level = "trace")]
     pub async fn bootstrap(&self) -> crate::Result<()> {
         self.bootstrap_inner().await.map_err(ErrorDetail::into)
     }
@@ -1107,6 +1156,7 @@ impl<R: Runtime> TorClient<R> {
     ///
     /// Check whether a bootstrap is in progress; if one is, wait until it finishes
     /// and then return. (Otherwise, return immediately.)
+    #[instrument(skip_all, level = "trace")]
     async fn wait_for_bootstrap(&self) -> StdResult<(), ErrorDetail> {
         match self.should_bootstrap {
             BootstrapBehavior::OnDemand => {
@@ -1155,6 +1205,7 @@ impl<R: Runtime> TorClient<R> {
     /// Changing some options do not take effect immediately on all open streams
     /// and circuits, but rather affect only future streams and circuits.  Those
     /// are also explicitly documented.
+    #[instrument(skip_all, level = "trace")]
     pub fn reconfigure(
         &self,
         new_config: &TorClientConfig,
@@ -1245,6 +1296,8 @@ impl<R: Runtime> TorClient<R> {
 
         self.addrcfg.replace(addr_cfg.clone());
         self.timeoutcfg.replace(timeout_cfg.clone());
+        self.software_status_cfg
+            .replace(new_config.use_obsolete_software.clone());
 
         Ok(())
     }
@@ -1334,6 +1387,7 @@ impl<R: Runtime> TorClient<R> {
     /// # Ok(())
     /// # }
     /// ```
+    #[instrument(skip_all, level = "trace")]
     pub async fn connect<A: IntoTorAddr>(&self, target: A) -> crate::Result<DataStream> {
         self.connect_with_prefs(target, &self.connect_prefs).await
     }
@@ -1344,6 +1398,7 @@ impl<R: Runtime> TorClient<R> {
     /// Note that because Tor prefers to do DNS resolution on the remote
     /// side of the network, this function takes its address as a string.
     /// (See [`TorClient::connect()`] for more information.)
+    #[instrument(skip_all, level = "trace")]
     pub async fn connect_with_prefs<A: IntoTorAddr>(
         &self,
         target: A,
@@ -1351,19 +1406,41 @@ impl<R: Runtime> TorClient<R> {
     ) -> crate::Result<DataStream> {
         let addr = target.into_tor_addr().map_err(wrap_err)?;
         let mut stream_parameters = prefs.stream_parameters();
+        // This macro helps prevent code duplication in the match below.
+        //
+        // Ideally, the match should resolve to a tuple consisting of the
+        // tunnel, and the address, port and stream params,
+        // but that's not currently possible because
+        // the Exit and Hs branches use different tunnel types.
+        //
+        // TODO: replace with an async closure (when our MSRV allows it),
+        // or with a more elegant approach.
+        macro_rules! begin_stream {
+            ($tunnel:expr, $addr:expr, $port:expr, $stream_params:expr) => {{
+                let fut = $tunnel.begin_stream($addr, $port, $stream_params);
+                self.runtime
+                    .timeout(self.timeoutcfg.get().connect_timeout, fut)
+                    .await
+                    .map_err(|_| ErrorDetail::ExitTimeout)?
+                    .map_err(|cause| ErrorDetail::StreamFailed {
+                        cause,
+                        kind: "data",
+                    })
+            }};
+        }
 
-        let (circ, addr, port) = match addr.into_stream_instructions(&self.addrcfg.get(), prefs)? {
+        let stream = match addr.into_stream_instructions(&self.addrcfg.get(), prefs)? {
             StreamInstructions::Exit {
                 hostname: addr,
                 port,
             } => {
                 let exit_ports = [prefs.wrap_target_port(port)];
-                let circ = self
-                    .get_or_launch_exit_circ(&exit_ports, prefs)
+                let tunnel = self
+                    .get_or_launch_exit_tunnel(&exit_ports, prefs)
                     .await
                     .map_err(wrap_err)?;
                 debug!("Got a circuit for {}:{}", sensitive(&addr), port);
-                (circ, addr, port)
+                begin_stream!(tunnel, &addr, port, Some(stream_parameters))
             }
 
             #[cfg(not(feature = "onion-service-client"))]
@@ -1380,6 +1457,8 @@ impl<R: Runtime> TorClient<R> {
                 hostname,
                 port,
             } => {
+                use safelog::DisplayRedacted as _;
+
                 self.wait_for_bootstrap().await?;
                 let netdir = self.netdir(Timeliness::Timely, "connect to a hidden service")?;
 
@@ -1388,15 +1467,14 @@ impl<R: Runtime> TorClient<R> {
                 if let Some(keymgr) = &self.inert_client.keymgr {
                     let desc_enc_key_spec = HsClientDescEncKeypairSpecifier::new(hsid);
 
-                    // TODO hs: refactor to reduce code duplication.
-                    //
-                    // The code that reads ks_hsc_desc_enc and ks_hsc_intro_auth and builds the
-                    // HsClientSecretKeys is very repetitive and should be refactored.
                     let ks_hsc_desc_enc =
                         keymgr.get::<HsClientDescEncKeypair>(&desc_enc_key_spec)?;
 
                     if let Some(ks_hsc_desc_enc) = ks_hsc_desc_enc {
-                        debug!("Found descriptor decryption key for {hsid}");
+                        debug!(
+                            "Found descriptor decryption key for {}",
+                            hsid.display_redacted()
+                        );
                         hs_client_secret_keys_builder.ks_hsc_desc_enc(ks_hsc_desc_enc);
                     }
                 };
@@ -1405,19 +1483,16 @@ impl<R: Runtime> TorClient<R> {
                     .build()
                     .map_err(ErrorDetail::Configuration)?;
 
-                let circ = self
+                let tunnel = self
                     .hsclient
-                    .get_or_launch_circuit(
+                    .get_or_launch_tunnel(
                         &netdir,
                         hsid,
                         hs_client_secret_keys,
                         self.isolation(prefs),
                     )
                     .await
-                    .map_err(|cause| ErrorDetail::ObtainHsCircuit {
-                        cause,
-                        hsid: hsid.into(),
-                    })?;
+                    .map_err(|cause| ErrorDetail::ObtainHsCircuit { cause, hsid })?;
                 // On connections to onion services, we have to suppress
                 // everything except the port from the BEGIN message.  We also
                 // disable optimistic data.
@@ -1425,23 +1500,12 @@ impl<R: Runtime> TorClient<R> {
                     .suppress_hostname()
                     .suppress_begin_flags()
                     .optimistic(false);
-                (circ, hostname, port)
+
+                begin_stream!(tunnel, &hostname, port, Some(stream_parameters))
             }
         };
 
-        let stream_future = circ.begin_stream(&addr, port, Some(stream_parameters));
-        // This timeout is needless but harmless for optimistic streams.
-        let stream = self
-            .runtime
-            .timeout(self.timeoutcfg.get().connect_timeout, stream_future)
-            .await
-            .map_err(|_| ErrorDetail::ExitTimeout)?
-            .map_err(|cause| ErrorDetail::StreamFailed {
-                cause,
-                kind: "data",
-            })?;
-
-        Ok(stream)
+        Ok(stream?)
     }
 
     /// Sets the default preferences for future connections made with this client.
@@ -1468,11 +1532,13 @@ impl<R: Runtime> TorClient<R> {
     }
 
     /// On success, return a list of IP addresses.
+    #[instrument(skip_all, level = "trace")]
     pub async fn resolve(&self, hostname: &str) -> crate::Result<Vec<IpAddr>> {
         self.resolve_with_prefs(hostname, &self.connect_prefs).await
     }
 
     /// On success, return a list of IP addresses, but use prefs.
+    #[instrument(skip_all, level = "trace")]
     pub async fn resolve_with_prefs(
         &self,
         hostname: &str,
@@ -1485,7 +1551,7 @@ impl<R: Runtime> TorClient<R> {
 
         match addr.into_resolve_instructions(&self.addrcfg.get(), prefs)? {
             ResolveInstructions::Exit(hostname) => {
-                let circ = self.get_or_launch_exit_circ(&[], prefs).await?;
+                let circ = self.get_or_launch_exit_tunnel(&[], prefs).await?;
 
                 let resolve_future = circ.resolve(&hostname);
                 let addrs = self
@@ -1507,6 +1573,7 @@ impl<R: Runtime> TorClient<R> {
     /// Perform a remote DNS reverse lookup with the provided IP address.
     ///
     /// On success, return a list of hostnames.
+    #[instrument(skip_all, level = "trace")]
     pub async fn resolve_ptr(&self, addr: IpAddr) -> crate::Result<Vec<String>> {
         self.resolve_ptr_with_prefs(addr, &self.connect_prefs).await
     }
@@ -1519,7 +1586,7 @@ impl<R: Runtime> TorClient<R> {
         addr: IpAddr,
         prefs: &StreamPrefs,
     ) -> crate::Result<Vec<String>> {
-        let circ = self.get_or_launch_exit_circ(&[], prefs).await?;
+        let circ = self.get_or_launch_exit_tunnel(&[], prefs).await?;
 
         let resolve_ptr_future = circ.resolve_ptr(addr);
         let hostnames = self
@@ -1611,17 +1678,18 @@ impl<R: Runtime> TorClient<R> {
 
     /// Get or launch an exit-suitable circuit with a given set of
     /// exit ports.
-    async fn get_or_launch_exit_circ(
+    #[instrument(skip_all, level = "trace")]
+    async fn get_or_launch_exit_tunnel(
         &self,
         exit_ports: &[TargetPort],
         prefs: &StreamPrefs,
-    ) -> StdResult<Arc<ClientCirc>, ErrorDetail> {
+    ) -> StdResult<ClientDataTunnel, ErrorDetail> {
         // TODO HS probably this netdir ought to be made in connect_with_prefs
         // like for StreamInstructions::Hs.
         self.wait_for_bootstrap().await?;
         let dir = self.netdir(Timeliness::Timely, "build a circuit")?;
 
-        let circ = self
+        let tunnel = self
             .circmgr
             .get_or_launch_exit(
                 dir.as_ref().into(),
@@ -1637,7 +1705,7 @@ impl<R: Runtime> TorClient<R> {
             })?;
         drop(dir); // This decreases the refcount on the netdir.
 
-        Ok(circ)
+        Ok(tunnel)
     }
 
     /// Return an overall [`Isolation`] for this `TorClient` and a `StreamPrefs`.
@@ -1674,12 +1742,13 @@ impl<R: Runtime> TorClient<R> {
     /// If you want to forward all the requests from an onion service to a set
     /// of local ports, you may want to use the `tor-hsrproxy` crate.
     #[cfg(feature = "onion-service-service")]
+    #[instrument(skip_all, level = "trace")]
     pub fn launch_onion_service(
         &self,
         config: tor_hsservice::OnionServiceConfig,
     ) -> crate::Result<(
         Arc<tor_hsservice::RunningOnionService>,
-        impl futures::Stream<Item = tor_hsservice::RendRequest>,
+        impl futures::Stream<Item = tor_hsservice::RendRequest> + use<R>,
     )> {
         let keymgr = self
             .inert_client
@@ -1689,7 +1758,6 @@ impl<R: Runtime> TorClient<R> {
                 action: "launch onion service",
             })?
             .clone();
-        // NOTE: Intended usage is via StateDirectory::acquire_instance(), but OnionServiceBuilder requires ownership.
         let state_dir = self.state_directory.clone();
 
         let service = tor_hsservice::OnionService::builder()
@@ -1736,13 +1804,14 @@ impl<R: Runtime> TorClient<R> {
     /// If you want to forward all the requests from an onion service to a set
     /// of local ports, you may want to use the `tor-hsrproxy` crate.
     #[cfg(all(feature = "onion-service-service", feature = "experimental-api"))]
+    #[instrument(skip_all, level = "trace")]
     pub fn launch_onion_service_with_hsid(
         &self,
         config: tor_hsservice::OnionServiceConfig,
         id_keypair: HsIdKeypair,
     ) -> crate::Result<(
         Arc<tor_hsservice::RunningOnionService>,
-        impl futures::Stream<Item = tor_hsservice::RendRequest>,
+        impl futures::Stream<Item = tor_hsservice::RendRequest> + use<R>,
     )> {
         let nickname = config.nickname();
         let hsid_spec = HsIdKeypairSpecifier::new(nickname.clone());
@@ -1944,9 +2013,24 @@ impl<R: Runtime> TorClient<R> {
     /// [`OnionService`](tor_hsservice::OnionService)
     /// using the given configuration.
     ///
+    /// This is useful for managing an onion service without needing to start a `TorClient` or the
+    /// onion service itself.
+    /// If you only wish to run the onion service, see
+    /// [`TorClient::launch_onion_service()`]
+    /// which allows you to launch an onion service from a running `TorClient`.
+    ///
     /// The returned `OnionService` can be launched using
     /// [`OnionService::launch()`](tor_hsservice::OnionService::launch).
+    /// Note that `launch()` requires a [`NetDirProvider`],
+    /// [`HsCircPool`](tor_circmgr::hspool::HsCircPool), etc,
+    /// which you should obtain from a running `TorClient`.
+    /// But these are only accessible from a `TorClient` if the "experimental-api" feature is
+    /// enabled.
+    /// The behaviour is not specified if you create the `OnionService` with
+    /// `create_onion_service()` using one [`TorClientConfig`],
+    /// but launch it using a `TorClient` generated from a different `TorClientConfig`.
     #[cfg(feature = "onion-service-service")]
+    #[instrument(skip_all, level = "trace")]
     pub fn create_onion_service(
         config: &TorClientConfig,
         svc_config: tor_hsservice::OnionServiceConfig,
@@ -1965,8 +2049,7 @@ impl<R: Runtime> TorClient<R> {
             .keymgr(keymgr)
             .state_dir(state_dir)
             .build()
-            // TODO: do we need an ErrorDetail::CreateOnionService?
-            .map_err(ErrorDetail::LaunchOnionService)?)
+            .map_err(ErrorDetail::OnionServiceSetup)?)
     }
 
     /// Return a current [`status::BootstrapStatus`] describing how close this client
@@ -2001,10 +2084,13 @@ impl<R: Runtime> TorClient<R> {
             .borrow_mut() = Some(mode);
     }
 
-    /// Return a [`Future`](futures::Future) which resolves
+    /// Return a [`Future`] which resolves
     /// once this TorClient has stopped.
     #[cfg(feature = "experimental-api")]
-    pub fn wait_for_stop(&self) -> impl futures::Future<Output = ()> + Send + Sync + 'static {
+    #[instrument(skip_all, level = "trace")]
+    pub fn wait_for_stop(
+        &self,
+    ) -> impl futures::Future<Output = ()> + Send + Sync + 'static + use<R> {
         // We defer to the "wait for unlock" handle on our statemgr.
         //
         // The statemgr won't actually be unlocked until it is finally
@@ -2097,6 +2183,19 @@ mod test {
                 .create_unbootstrapped()
                 .unwrap();
         });
+        tor_rtcompat::test_with_one_runtime!(|rt| async {
+            let state_dir = tempfile::tempdir().unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cfg = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
+                .build()
+                .unwrap();
+            let _ = TorClient::with_runtime(rt)
+                .config(cfg)
+                .bootstrap_behavior(BootstrapBehavior::Manual)
+                .create_unbootstrapped_async()
+                .await
+                .unwrap();
+        });
     }
 
     #[test]
@@ -2107,10 +2206,30 @@ mod test {
             let cfg = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
                 .build()
                 .unwrap();
+            // Test sync
             let client = TorClient::with_runtime(rt)
                 .config(cfg)
                 .bootstrap_behavior(BootstrapBehavior::Manual)
                 .create_unbootstrapped()
+                .unwrap();
+            let result = client.connect("example.com:80").await;
+            assert!(result.is_err());
+            assert_eq!(result.err().unwrap().kind(), ErrorKind::BootstrapRequired);
+        });
+        // Need a separate test for async because Runtime and TorClientConfig are consumed by the
+        // builder
+        tor_rtcompat::test_with_one_runtime!(|rt| async {
+            let state_dir = tempfile::tempdir().unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cfg = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
+                .build()
+                .unwrap();
+            // Test sync
+            let client = TorClient::with_runtime(rt)
+                .config(cfg)
+                .bootstrap_behavior(BootstrapBehavior::Manual)
+                .create_unbootstrapped_async()
+                .await
                 .unwrap();
             let result = client.connect("example.com:80").await;
             assert!(result.is_err());
@@ -2207,6 +2326,22 @@ mod test {
                 .config(cfg.clone())
                 .bootstrap_behavior(BootstrapBehavior::Manual)
                 .create_unbootstrapped()
+                .unwrap();
+            tor_client
+                .reconfigure(&cfg, Reconfigure::AllOrNothing)
+                .unwrap();
+        });
+        tor_rtcompat::test_with_one_runtime!(|rt| async {
+            let state_dir = tempfile::tempdir().unwrap();
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cfg = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
+                .build()
+                .unwrap();
+            let tor_client = TorClient::with_runtime(rt)
+                .config(cfg.clone())
+                .bootstrap_behavior(BootstrapBehavior::Manual)
+                .create_unbootstrapped_async()
+                .await
                 .unwrap();
             tor_client
                 .reconfigure(&cfg, Reconfigure::AllOrNothing)

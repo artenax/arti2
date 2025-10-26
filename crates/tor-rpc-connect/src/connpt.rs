@@ -3,8 +3,8 @@
 use serde::Deserialize;
 use std::{fmt::Debug, path::PathBuf, str::FromStr};
 use tor_config_path::{
-    addr::{CfgAddr, CfgAddrError},
     CfgPath, CfgPathError, CfgPathResolver,
+    addr::{CfgAddr, CfgAddrError},
 };
 use tor_general_addr::general;
 
@@ -110,7 +110,7 @@ pub enum ResolveError {
     /// (This can only happen if somebody adds new variants to `general::SocketAddr`.)
     #[error("Address type not recognized")]
     AddressTypeNotRecognized,
-    /// The name of a file or unix socket address was a relative path.
+    /// The name of a file or AF_UNIX socket address was a relative path.
     #[error("Path was not absolute")]
     PathNotAbsolute,
 }
@@ -260,7 +260,7 @@ impl Connect<Resolved> {
         use general::SocketAddr::{Inet, Unix};
         match (self.socket.as_ref(), &self.auth) {
             (Inet(addr), _) if !addr.ip().is_loopback() => {
-                return Err(ResolveError::AddressNotLoopback)
+                return Err(ResolveError::AddressNotLoopback);
             }
             (Inet(_), Auth::None) => return Err(ResolveError::AuthNotCompatible),
             (_, Auth::Unrecognized(_)) => return Err(ResolveError::AuthNotRecognized),
@@ -365,7 +365,7 @@ where
     /// The string representation of the address.
     ///
     /// For inet addresses, this is the value that appeared in the configuration.
-    /// For unix addresses, this is the value that appeared in the configuration,
+    /// For unix domain sockets, this is the value that appeared in the configuration,
     /// after shell expansion.
     string: String,
     /// The address itself.

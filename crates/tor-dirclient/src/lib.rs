@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 // TODO probably remove this at some point - see tpo/core/arti#1060
@@ -65,10 +66,10 @@ use async_compression::futures::bufread::ZlibDecoder;
 #[cfg(feature = "zstd")]
 use async_compression::futures::bufread::ZstdDecoder;
 
+use futures::FutureExt;
 use futures::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
-use futures::FutureExt;
 use memchr::memchr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,7 +121,7 @@ where
     R: Runtime,
     SP: SleepProvider,
 {
-    let circuit = circ_mgr.get_or_launch_dir(dirinfo).await?;
+    let tunnel = circ_mgr.get_or_launch_dir(dirinfo).await?;
 
     if req.anonymized() == AnonymizedRequest::Anonymized {
         return Err(bad_api_usage!("Tried to use get_resource for an anonymized request").into());
@@ -128,20 +129,28 @@ where
 
     // TODO(nickm) This should be an option, and is too long.
     let begin_timeout = Duration::from_secs(5);
-    let source = SourceInfo::from_circuit(&circuit);
+    let source = match SourceInfo::from_tunnel(&tunnel) {
+        Ok(source) => source,
+        Err(e) => {
+            return Err(Error::RequestFailed(RequestFailedError {
+                source: None,
+                error: e.into(),
+            }));
+        }
+    };
 
     let wrap_err = |error| {
         Error::RequestFailed(RequestFailedError {
-            source: Some(source.clone()),
+            source: source.clone(),
             error,
         })
     };
 
-    req.check_circuit(&circuit).await.map_err(wrap_err)?;
+    req.check_circuit(&tunnel).await.map_err(wrap_err)?;
 
     // Launch the stream.
     let mut stream = runtime
-        .timeout(begin_timeout, circuit.begin_dir_stream())
+        .timeout(begin_timeout, tunnel.begin_dir_stream())
         .await
         .map_err(RequestError::from)
         .map_err(wrap_err)?
@@ -150,10 +159,10 @@ where
 
     // TODO: Perhaps we want separate timeouts for each phase of this.
     // For now, we just use higher-level timeouts in `dirmgr`.
-    let r = send_request(runtime, req, &mut stream, Some(source.clone())).await;
+    let r = send_request(runtime, req, &mut stream, source.clone()).await;
 
     if should_retire_circ(&r) {
-        retire_circ(&circ_mgr, &source, "Partial response");
+        retire_circ(&circ_mgr, &tunnel.unique_id(), "Partial response");
     }
 
     r
@@ -273,6 +282,11 @@ where
     Ok(DirResponse::new(200, None, ok.err(), result, source))
 }
 
+/// Maximum length for the HTTP headers in a single request or response.
+///
+/// Chosen more or less arbitrarily.
+const MAX_HEADERS_LEN: usize = 16384;
+
 /// Read and parse HTTP/1 headers from `stream`.
 async fn read_headers<S>(stream: &mut S) -> RequestResult<HeaderStatus>
 where
@@ -299,9 +313,8 @@ where
                     return Err(RequestError::TruncatedHeaders);
                 }
 
-                // TODO(nickm): Pick a better maximum
-                if buf.len() >= 16384 {
-                    return Err(httparse::Error::TooManyHeaders.into());
+                if buf.len() >= MAX_HEADERS_LEN {
+                    return Err(RequestError::HeadersTooLong(buf.len()));
                 }
             }
             httparse::Status::Complete(n_parsed) => {
@@ -427,11 +440,10 @@ where
 }
 
 /// Retire a directory circuit because of an error we've encountered on it.
-fn retire_circ<R>(circ_mgr: &Arc<CircMgr<R>>, source_info: &SourceInfo, error: &str)
+fn retire_circ<R>(circ_mgr: &Arc<CircMgr<R>>, id: &tor_proto::circuit::UniqId, error: &str)
 where
     R: Runtime,
 {
-    let id = source_info.unique_circ_id();
     info!(
         "{}: Retiring circuit because of directory failure: {}",
         &id, &error
@@ -775,7 +787,7 @@ mod test {
 
         let request = request?;
         assert!(request[..].starts_with(
-            b"GET /tor/micro/d/CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk.z HTTP/1.0\r\n"
+            b"GET /tor/micro/d/CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk HTTP/1.0\r\n"
         ));
 
         let response = response.unwrap();
@@ -870,7 +882,7 @@ mod test {
         assert!(matches!(
             response,
             Err(Error::RequestFailed(RequestFailedError {
-                error: RequestError::HttparseError(_),
+                error: RequestError::HeadersTooLong(_),
                 ..
             }))
         ));

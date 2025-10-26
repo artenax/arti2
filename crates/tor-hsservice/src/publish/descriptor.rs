@@ -3,6 +3,7 @@
 use super::*;
 use crate::config::OnionServiceConfigPublisherView;
 use tor_cell::chancell::msg::HandshakeType;
+use tor_llcrypto::rng::EntropicRng;
 
 /// Build the descriptor.
 ///
@@ -12,15 +13,18 @@ use tor_cell::chancell::msg::HandshakeType;
 /// Note: `blind_id_kp` is the blinded hidden service signing keypair used to sign descriptor
 /// signing keys (KP_hs_blind_id, KS_hs_blind_id).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_sign<Rng: RngCore + CryptoRng>(
+pub(super) fn build_sign<Rng: RngCore + CryptoRng, KeyRng: RngCore + EntropicRng, R: Runtime>(
     keymgr: &Arc<KeyMgr>,
+    pow_manager: &Arc<PowManager<R>>,
     config: &Arc<OnionServiceConfigPublisherView>,
     authorized_clients: Option<&RestrictedDiscoveryKeys>,
     ipt_set: &IptSet,
     period: TimePeriod,
     revision_counter: RevisionCounter,
     rng: &mut Rng,
+    key_rng: &mut KeyRng,
     now: SystemTime,
+    max_hsdesc_len: usize,
 ) -> Result<VersionedDescriptor, FatalError> {
     // TODO: should this be configurable? If so, we should read it from the svc config.
     //
@@ -62,7 +66,7 @@ pub(super) fn build_sign<Rng: RngCore + CryptoRng>(
     let hs_desc_sign = keymgr.get_or_generate::<HsDescSigningKeypair>(
         &hs_desc_sign_key_spec,
         keystore_selector,
-        rng,
+        key_rng,
     )?;
 
     // TODO #1028: support introduction-layer authentication.
@@ -113,8 +117,10 @@ pub(super) fn build_sign<Rng: RngCore + CryptoRng>(
         "failed to sign the descriptor signing key"
     ))?;
 
-    let desc = HsDescBuilder::default()
-        .blinded_id(&(&blind_id_kp).into())
+    let blind_id_kp = (&blind_id_kp).into();
+
+    let mut desc = HsDescBuilder::default()
+        .blinded_id(&blind_id_kp)
         .hs_desc_sign(hs_desc_sign.as_ref())
         .hs_desc_sign_cert(desc_signing_key_cert)
         .create2_formats(CREATE2_FORMATS)
@@ -127,8 +133,28 @@ pub(super) fn build_sign<Rng: RngCore + CryptoRng>(
         .revision_counter(revision_counter)
         .subcredential(subcredential)
         .auth_clients(auth_clients.as_deref())
-        .build_sign(rng)
-        .map_err(|e| into_internal!("failed to build descriptor")(e))?;
+        .max_generated_len(max_hsdesc_len);
+
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "hs-pow-full")] {
+            let pow_params = pow_manager.get_pow_params(period, &mut rand::rng());
+            match pow_params {
+                Ok(ref pow_params) => {
+                    if config.enable_pow {
+                        desc = desc.pow_params(Some(pow_params));
+                    }
+                },
+                Err(err) => {
+                    warn!(?err, "Couldn't get PoW params");
+                }
+            }
+        }
+    }
+
+    let desc = desc.build_sign(rng).map_err(|e| match e {
+        tor_bytes::EncodeError::BadLengthValue => FatalError::HsDescTooLong,
+        e => into_internal!("failed to build descriptor")(e).into(),
+    })?;
 
     Ok(VersionedDescriptor {
         desc,

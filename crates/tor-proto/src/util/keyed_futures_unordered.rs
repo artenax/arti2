@@ -4,7 +4,7 @@
 #![allow(unreachable_pub)]
 
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{HashMap, hash_map},
     hash::Hash,
     pin::Pin,
     sync::Arc,
@@ -13,8 +13,8 @@ use std::{
 
 use futures::future::FutureExt;
 use futures::{
-    channel::mpsc::{UnboundedReceiver, UnboundedSender},
     Future,
+    channel::mpsc::{UnboundedReceiver, UnboundedSender},
 };
 use pin_project::pin_project;
 
@@ -42,7 +42,7 @@ where
                     return;
                 }
                 // Shouldn't happen, but probably no need to `panic`.
-                tracing::error!("Unexpected send error: {e:?}");
+                tracing::error!("Bug: Unexpected send error: {e:?}");
             });
     }
 }
@@ -256,7 +256,7 @@ mod tests {
 
     use std::task::Waker;
 
-    use futures::{executor::block_on, future::poll_fn, StreamExt as _};
+    use futures::{StreamExt as _, executor::block_on, future::poll_fn};
     use oneshot_fused_workaround as oneshot;
     use tor_rtmock::MockRuntime;
 

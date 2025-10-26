@@ -7,9 +7,11 @@ use tor_persist::slug::BadSlug;
 
 use std::error::Error as StdError;
 use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::KeyPathError;
+use crate::raw::RawKeystoreEntry;
+use crate::{KeyPathError, KeystoreId};
 
 /// An Error type for this crate.
 #[derive(thiserror::Error, Debug, Clone)]
@@ -42,6 +44,12 @@ pub enum Error {
     #[error("{0}")]
     InvalidCert(#[from] tor_key_forge::InvalidCertError),
 
+    /// An error returned when the [`KeyMgr`](crate::KeyMgr) is unable to
+    /// find a [`Keystore`](crate::Keystore) matching a given [`KeystoreId`]
+    /// in either its `primary_store` field or the `secondary_stores` collection.
+    #[error("Keystore {0} not found")]
+    KeystoreNotFound(KeystoreId),
+
     /// An internal error.
     #[error("Internal error")]
     Bug(#[from] tor_error::Bug),
@@ -55,13 +63,14 @@ pub trait KeystoreError:
 
 impl HasKind for Error {
     fn kind(&self) -> tor_error::ErrorKind {
-        use tor_error::ErrorKind as EK;
         use Error as E;
+        use tor_error::ErrorKind as EK;
 
         match self {
             E::Keystore(e) => e.kind(),
             E::Corruption(_) => EK::KeystoreCorrupted,
             E::KeyAlreadyExists => EK::BadApiUsage, // TODO: not strictly right
+            E::KeystoreNotFound(_) => EK::BadApiUsage, // TODO: not strictly right
             E::KeyForge(_) => EK::BadApiUsage,
             E::InvalidCert(_) => EK::BadApiUsage, // TODO: not strictly right
             E::Bug(e) => e.kind(),
@@ -117,6 +126,48 @@ pub enum KeystoreCorruptionError {
 pub struct UnknownKeyTypeError {
     /// The extension used for keys of this type in an Arti keystore.
     pub(crate) arti_extension: String,
+}
+
+/// An unrecognized keystore entry.
+#[derive(Clone, Debug, amplify::Getters, thiserror::Error)]
+#[error("Unrecognized keystore entry")]
+pub struct UnrecognizedEntryError {
+    /// An identifier of the entry that caused the error.
+    entry: UnrecognizedEntry,
+    /// The underlying error that occurred.
+    // TODO: This should be an `Error` specific for the situation.
+    //
+    // [`KeystoreError`] is a provvisory solution that presents
+    // some issues, for example:
+    //
+    // * not all variants of `KeystoreError` are relevant
+    // * redundancy with some other Error types like
+    // [`MalformedServiceKeyError::NotAKey`](crate::keystore::ctor::err::MalformedServiceKeyError)
+    // * [`Keystore::list`](crate::Keystore) returns
+    // `StdResult<Vec<StdResult<(KeyPath, KeystoreItemType), UnrecognizedEntryError>>, KeystoreError>`,
+    // `KeystoreError` presents itself twice at 2 different levels, there is ambiguity
+    #[source]
+    error: Arc<dyn KeystoreError>,
+}
+
+impl UnrecognizedEntryError {
+    /// Create a new instance of `KeystoreListError` given an `UnrecognizedEntry`
+    /// and an `Arc<dyn KeystoreError>`.
+    pub(crate) fn new(entry: UnrecognizedEntry, error: Arc<dyn KeystoreError>) -> Self {
+        Self { entry, error }
+    }
+}
+
+/// The opaque identifier of an unrecognized key inside a [`Keystore`](crate::Keystore).
+#[derive(Debug, Clone, PartialEq, derive_more::From, derive_more::Into)]
+pub struct UnrecognizedEntry(RawKeystoreEntry);
+
+#[cfg(feature = "onion-service-cli-extra")]
+impl Deref for UnrecognizedEntry {
+    type Target = RawKeystoreEntry;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 #[cfg(test)]

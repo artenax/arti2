@@ -11,7 +11,7 @@ use retry_error::RetryError;
 use safelog::{Redacted, Sensitive};
 use tor_cell::relaycell::hs::IntroduceAckStatus;
 use tor_error::define_asref_dyn_std_error;
-use tor_error::{internal, Bug, ErrorKind, ErrorReport as _, HasKind, HasRetryTime, RetryTime};
+use tor_error::{Bug, ErrorKind, ErrorReport as _, HasKind, HasRetryTime, RetryTime, internal};
 use tor_linkspec::RelayIds;
 use tor_llcrypto::pk::ed25519::Ed25519Identity;
 use tor_netdir::Relay;
@@ -387,15 +387,16 @@ impl HasKind for DescriptorError {
 
 impl HasKind for DescriptorErrorDetail {
     fn kind(&self) -> ErrorKind {
-        use tor_dirclient::RequestError as RE;
         use DescriptorErrorDetail as DED;
         use ErrorKind as EK;
+        use tor_dirclient::RequestError as RE;
         match self {
             DED::Timeout => EK::TorNetworkTimeout,
             DED::Circuit(e) => e.kind(),
             DED::Stream(e) => e.kind(),
             DED::Directory(RE::HttpStatus(st, _)) if *st == 404 => EK::OnionServiceNotFound,
             DED::Directory(RE::ResponseTooLong(_)) => EK::OnionServiceProtocolViolation,
+            DED::Directory(RE::HeadersTooLong(_)) => EK::OnionServiceProtocolViolation,
             DED::Directory(RE::Utf8Encoding(_)) => EK::OnionServiceProtocolViolation,
             DED::Directory(other_re) => other_re.kind(),
             DED::Descriptor(e) => e.kind(),
@@ -477,4 +478,20 @@ pub(crate) enum ProofOfWorkError {
     #[error("Unexpectedly lost contact with solver task")]
     #[allow(dead_code)]
     SolverDisconnected,
+}
+
+impl DescriptorErrorDetail {
+    /// Return true if this error is one that we should report as a suspicious event,
+    /// along with the dirserver and description of the relevant document.
+    pub(crate) fn should_report_as_suspicious(&self) -> bool {
+        use DescriptorErrorDetail as E;
+        match self {
+            E::Timeout => false,
+            E::Circuit(_) => false,
+            E::Stream(_) => false, // TODO prop360
+            E::Directory(e) => e.should_report_as_suspicious_if_anon(),
+            E::Descriptor(e) => e.should_report_as_suspicious(),
+            E::Bug(_) => false,
+        }
+    }
 }

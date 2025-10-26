@@ -45,7 +45,7 @@ define_derive_deftly! {
 
         fn reenter_block_on<F>(&self, future: F) -> F::Output
         where
-            F: Future + Send + 'static,
+            F: Future,
             F::Output: Send + 'static
         {
             self.$fname.reenter_block_on(future)
@@ -87,10 +87,10 @@ define_derive_deftly! {
         type Listener = FakeListener<tor_general_addr::unix::SocketAddr>;
 
         async fn connect(&self, _addr: &tor_general_addr::unix::SocketAddr) -> IoResult<Self::Stream> {
-            Err(tor_general_addr::unix::NoUnixAddressSupport::default().into())
+            Err(tor_general_addr::unix::NoAfUnixSocketSupport::default().into())
         }
         async fn listen(&self, _addr: &tor_general_addr::unix::SocketAddr) -> IoResult<Self::Listener> {
-            Err(tor_general_addr::unix::NoUnixAddressSupport::default().into())
+            Err(tor_general_addr::unix::NoAfUnixSocketSupport::default().into())
         }
     }
 
@@ -155,6 +155,7 @@ define_derive_deftly! {
  )
 
    // TODO this wants to be assert_impl but it fails at generics
+   #[allow(unused)]
    const _: fn() = || {
        fn x(_: impl Runtime) { }
        fn check_impl_runtime<$tgens>(t: $ttype) { x(t) }
@@ -175,14 +176,14 @@ define_derive_deftly! {
 pub(crate) mod impl_runtime_prelude {
     pub(crate) use async_trait::async_trait;
     pub(crate) use derive_deftly::Deftly;
-    pub(crate) use futures::task::{FutureObj, Spawn, SpawnError};
     pub(crate) use futures::Future;
+    pub(crate) use futures::task::{FutureObj, Spawn, SpawnError};
     pub(crate) use std::io::Result as IoResult;
     pub(crate) use std::net::SocketAddr;
     pub(crate) use std::time::{Duration, Instant, SystemTime};
     pub(crate) use tor_rtcompat::{
-        unimpl::FakeListener, unimpl::FakeStream, Blocking, CoarseInstant, CoarseTimeProvider,
-        NetStreamProvider, Runtime, SleepProvider, TlsProvider, ToplevelBlockOn, UdpProvider,
+        Blocking, CoarseInstant, CoarseTimeProvider, NetStreamProvider, Runtime, SleepProvider,
+        TlsProvider, ToplevelBlockOn, UdpProvider, unimpl::FakeListener, unimpl::FakeStream,
     };
 }
 

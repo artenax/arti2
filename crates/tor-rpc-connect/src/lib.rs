@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,7 +41,11 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
+
+// TODO #1645 (either remove this, or decide to have it everywhere)
+#![cfg_attr(not(all(feature = "full")), allow(unused))]
 
 pub mod auth;
 #[cfg(feature = "rpc-client")]
@@ -82,12 +86,12 @@ impl HasClientErrorAction for tor_config_path::CfgPathError {
 }
 impl HasClientErrorAction for tor_config_path::addr::CfgAddrError {
     fn client_action(&self) -> ClientErrorAction {
-        use tor_config_path::addr::CfgAddrError as CAE;
         use ClientErrorAction as A;
+        use tor_config_path::addr::CfgAddrError as CAE;
         match self {
-            CAE::NoUnixAddressSupport(_) => A::Decline,
+            CAE::NoAfUnixSocketSupport(_) => A::Decline,
             CAE::Path(cfg_path_error) => cfg_path_error.client_action(),
-            CAE::ConstructUnixAddress(_) => A::Abort,
+            CAE::ConstructAfUnixAddress(_) => A::Abort,
             // No variants are currently captured in this pattern, but they _could_ be in the future.
             _ => A::Abort,
         }
@@ -99,8 +103,8 @@ impl HasClientErrorAction for tor_config_path::addr::CfgAddrError {
 /// Note that this is not an implementation of `HasClientErrorAction`:
 /// We want to decline on a different set of errors for network operation.
 fn fs_error_action(err: &std::io::Error) -> ClientErrorAction {
-    use std::io::ErrorKind as EK;
     use ClientErrorAction as A;
+    use std::io::ErrorKind as EK;
     match err.kind() {
         EK::NotFound => A::Decline,
         EK::PermissionDenied => A::Decline,
@@ -113,20 +117,20 @@ fn fs_error_action(err: &std::io::Error) -> ClientErrorAction {
 /// Note that this is not an implementation of `HasClientErrorAction`:
 /// We want to decline on a different set of errors for fs operation.
 fn net_error_action(err: &std::io::Error) -> ClientErrorAction {
-    use std::io::ErrorKind as EK;
     use ClientErrorAction as A;
+    use std::io::ErrorKind as EK;
     match err.kind() {
         EK::ConnectionRefused => A::Decline,
         EK::ConnectionReset => A::Decline,
-        // TODO Rust 1.83; revisit once some of `io_error_more` is stabilized.
+        // TODO MSRV 1.83; revisit once some of `io_error_more` is stabilized.
         // see https://github.com/rust-lang/rust/pull/128316
         _ => A::Abort,
     }
 }
 impl HasClientErrorAction for fs_mistrust::Error {
     fn client_action(&self) -> ClientErrorAction {
-        use fs_mistrust::Error as E;
         use ClientErrorAction as A;
+        use fs_mistrust::Error as E;
         match self {
             E::Multiple(errs) => {
                 if errs.iter().any(|e| e.client_action() == A::Abort) {
@@ -176,12 +180,9 @@ pub enum ConnectError {
     /// We were told to connect using an auth type that we don't support.
     #[error("Unsupported authentication type")]
     UnsupportedAuthType,
-    /// We were told to use a Unix address for which we could not extract a parent directory.
-    #[error("Invalid unix address")]
-    InvalidUnixAddress,
-    /// Unable to access the location of a Unix address.
-    #[error("Unix address access")]
-    UnixAddressAccess(#[from] fs_mistrust::Error),
+    /// Unable to access the location of an AF\_UNIX socket.
+    #[error("Unix domain socket path access")]
+    AfUnixSocketPathAccess(#[from] fs_mistrust::Error),
     /// Another process was holding a lock for this connect point,
     /// so we couldn't bind to it.
     #[error("Could not acquire lock: Another process is listening on this connect point")]
@@ -203,8 +204,7 @@ impl crate::HasClientErrorAction for ConnectError {
             E::LoadCookie(err) => err.client_action(),
             E::UnsupportedSocketType => A::Decline,
             E::UnsupportedAuthType => A::Decline,
-            E::InvalidUnixAddress => A::Decline,
-            E::UnixAddressAccess(err) => err.client_action(),
+            E::AfUnixSocketPathAccess(err) => err.client_action(),
             E::AlreadyLocked => A::Abort, // (This one can't actually occur for clients.)
         }
     }

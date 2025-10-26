@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 // TODO #1645 (either remove this, or decide to have it everywhere)
@@ -54,6 +55,7 @@
 
 use futures::channel::mpsc;
 use futures::task::SpawnExt;
+use itertools::Either;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -65,12 +67,12 @@ use tor_linkspec::{OwnedChanTarget, OwnedCircTarget, RelayId, RelayIdSet};
 use tor_netdir::NetDirProvider;
 use tor_proto::ClockSkew;
 use tor_units::BoundedInt32;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
+use tor_config::{ExplicitOrAuto, impl_standard_builder};
+use tor_config::{ReconfigureError, impl_not_auto_value};
 use tor_config::{define_list_builder_accessors, define_list_builder_helper};
-use tor_config::{impl_not_auto_value, ReconfigureError};
-use tor_config::{impl_standard_builder, ExplicitOrAuto};
-use tor_netdir::{params::NetParameters, NetDir, Relay};
+use tor_netdir::{NetDir, Relay, params::NetParameters};
 use tor_persist::{DynStorageHandle, StateMgr};
 use tor_rtcompat::Runtime;
 
@@ -865,6 +867,7 @@ impl GuardMgrInner {
     /// Update the status of all guards in the active set, based on the passage
     /// of time, our configuration, and the relevant Universe for our active
     /// set.
+    #[instrument(skip_all, level = "trace")]
     fn update(&mut self, wallclock: SystemTime, now: Instant) {
         self.with_opt_netdir(|this, netdir| {
             // Here we update our parameters from the latest NetDir, and check
@@ -1019,9 +1022,8 @@ impl GuardMgrInner {
             // But due to the other check in `netdir_is_sufficient`, we
             // shouldn't be installing a netdir until it has microdescs for all
             // of the (non-bridge) primary guards that it lists. - nickm
-            if active_guards.n_primary_without_id_info_in(universe) > 0
-                && universe_type == UniverseType::NetDir
-            {
+            let n = active_guards.n_primary_without_id_info_in(universe);
+            if n > 0 && universe_type == UniverseType::NetDir {
                 // We are missing the information from a NetDir needed to see
                 // whether our primary guards are listed, so we shouldn't update
                 // our guard status.
@@ -1032,11 +1034,16 @@ impl GuardMgrInner {
                 // (When a bridge desc is missing, the bridge could be down or
                 // unreachable, and nobody else can help us. But if a microdesc
                 // is missing, we just need to find a cache that has it.)
+                trace!(
+                    n_primary_without_id_info = n,
+                    "Not extending guardset, missing information."
+                );
                 return ExtendedStatus::No;
             }
             active_guards.update_status_from_dir(universe);
             active_guards.extend_sample_as_needed(now, params, universe)
         } else {
+            trace!("Not extending guardset, no universe given.");
             ExtendedStatus::No
         };
 
@@ -1120,8 +1127,8 @@ impl GuardMgrInner {
 
             if frac_permitted < self.params.extreme_threshold {
                 warn!(
-                      "The number of guards permitted is smaller than the recommended minimum of {:.0}%.",
-                      self.params.extreme_threshold * 100.0,
+                    "The number of guards permitted is smaller than the recommended minimum of {:.0}%.",
+                    self.params.extreme_threshold * 100.0,
                 );
             }
         }
@@ -1140,7 +1147,9 @@ impl GuardMgrInner {
         // back online" event more than once.
         let interval = self.params.internet_down_timeout;
         if self.last_primary_retry_time + interval <= now {
-            debug!("Successfully reached a guard after a while off the internet; marking all primary guards retriable.");
+            debug!(
+                "Successfully reached a guard after a while off the internet; marking all primary guards retriable."
+            );
             self.guards
                 .active_guards_mut()
                 .mark_primary_guards_retriable();
@@ -1426,6 +1435,7 @@ impl GuardMgrInner {
 
     /// Run any periodic events that update guard status, and return a
     /// duration after which periodic events should next be run.
+    #[instrument(skip_all, level = "trace")]
     pub(crate) fn run_periodic_events(&mut self, wallclock: SystemTime, now: Instant) -> Duration {
         self.update(wallclock, now);
         self.expire_and_answer_pending_requests(now);
@@ -1534,10 +1544,12 @@ impl GuardMgrInner {
     ) -> Result<(sample::ListKind, FirstHop), PickGuardError> {
         let filt = self.guards.active_guards().filter();
 
-        let fallback = self
-            .fallbacks
-            .choose(&mut rand::rng(), now, filt)?
-            .as_guard();
+        let fallback = crate::FirstHop {
+            sample: None,
+            inner: crate::FirstHopInner::Chan(OwnedChanTarget::from_chan_target(
+                self.fallbacks.choose(&mut rand::rng(), now, filt)?,
+            )),
+        };
         let fallback = filt.modify_hop(fallback)?;
         Ok((sample::ListKind::Fallback, fallback))
     }
@@ -1753,10 +1765,10 @@ impl FirstHop {
 
 // This is somewhat redundant with the implementations in crate::guard::Guard.
 impl tor_linkspec::HasAddrs for FirstHop {
-    fn addrs(&self) -> &[SocketAddr] {
+    fn addrs(&self) -> impl Iterator<Item = SocketAddr> {
         match &self.inner {
-            FirstHopInner::Chan(ct) => ct.addrs(),
-            FirstHopInner::Circ(ct) => ct.addrs(),
+            FirstHopInner::Chan(ct) => Either::Left(ct.addrs()),
+            FirstHopInner::Circ(ct) => Either::Right(ct.addrs()),
         }
     }
 }
@@ -1964,7 +1976,7 @@ mod test {
     }
 
     fn init<R: Runtime>(rt: R) -> (GuardMgr<R>, TestingStateMgr, NetDir) {
-        use tor_netdir::{testnet, MdReceiver, PartialNetDir};
+        use tor_netdir::{MdReceiver, PartialNetDir, testnet};
         let statemgr = TestingStateMgr::new();
         let have_lock = statemgr.try_lock().unwrap();
         assert!(have_lock.held());
@@ -2088,7 +2100,7 @@ mod test {
             guardmgr.install_test_netdir(&netdir);
             let (guard, _mon, _usable) = guardmgr.select_guard(u).unwrap();
             // Make sure that the filter worked.
-            let addr = guard.addrs()[0];
+            let addr = guard.addrs().next().unwrap();
             assert_eq!(addr, "2.0.0.3:9001".parse().unwrap());
         });
     }

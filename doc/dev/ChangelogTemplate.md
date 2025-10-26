@@ -72,10 +72,9 @@ but please do so judiciously.
 
 Thanks to everybody who's contributed to this release, including
 <!-- (output of ./maint/thanks goes here) -->.
-Also welcome to Alyssa P Hacker as she joins the team!
+Also welcome to <!-- new employee name goes here --> as she joins the team!
 
 Also, our deep thanks to
-[Zcash Community Grants],
 the [Bureau of Democracy, Human Rights and Labor],
 and our [other sponsors]
 for funding the development of Arti!

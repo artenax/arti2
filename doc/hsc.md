@@ -14,19 +14,25 @@ state directory, which you might have overridden in the configuration.
 ## Generating a service discovery key
 
 Client service discovery keys (previously known as "client authorization" keys)
-can be generated and/or retrieved using the
-`arti hsc key get` command, the user will be prompted for an onion
-address of the form `<SVC>.onion`.
-By default `key get` will generate a new keypair for use with `<SVC>.onion`,
-if one does not already exist, and output its public part in the file specified
-with the `--output` option. If such a keypair already exists, a new one will
-**not** be generated.
+can be generated and/or retrieved using the `arti hsc key get` command.
+
+`key get` prompts the user for an onion address (`<SVC>.onion`). If no keypair
+exists for that service, it will first be generated. It then outputs the public
+part of that service's key to the file specified with the --output option.
 
 ```ignore
 $ arti -c hsc.toml hsc key get --output -
 Enter an onion address: mnyizjj7m3hpcr7i5afph3zt7maa65johyu2ruis6z7cmnjmaj3h6tad.onion
 descriptor:x25519:RWWKYMW5EXDUZ2ESDDC7FQJCG6ROAR34LXNSTXFSY6JMQOWNDVNQ
 
+```
+
+If you are running this command non-interactively, you can suppress the prompt
+with `--batch`:
+
+```ignore
+$ echo "mnyizjj7m3hpcr7i5afph3zt7maa65johyu2ruis6z7cmnjmaj3h6tad.onion" | arti -c hsc.toml hsc key get --output - --batch
+descriptor:x25519:RWWKYMW5EXDUZ2ESDDC7FQJCG6ROAR34LXNSTXFSY6JMQOWNDVNQ
 ```
 
 > NOTE: the public part of the generated keypair must be shared with the
@@ -70,7 +76,6 @@ To remove a service discovery key:
 $ arti -c hsc.toml hsc key remove
 Enter an onion address: mnyizjj7m3hpcr7i5afph3zt7maa65johyu2ruis6z7cmnjmaj3h6tad.onion
 remove client restricted discovery key for mnyizjj7m3hpcr7i5afph3zt7maa65johyu2ruis6z7cmnjmaj3h6tad.onion? (type YES or no): YES
-descriptor:x25519:4E4B6CILWAAM2JFSVTOTCANCCUIMSOOSXZWONSR52ETXSTCKIYIA
 ```
 
 As with `hsc key rotate`, you can disable the confirmation prompt and force

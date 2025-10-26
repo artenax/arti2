@@ -41,19 +41,19 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 // TODO #1645 (either remove this, or decide to have it everywhere)
 #![cfg_attr(not(all(feature = "full")), allow(unused))]
 
 pub use crate::err::Error;
-use once_cell::sync::OnceCell;
 use rangemap::RangeInclusiveMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::net::{IpAddr, Ipv6Addr};
-use std::num::{NonZeroU32, NonZeroU8, TryFromIntError};
+use std::num::{NonZeroU8, NonZeroU32, TryFromIntError};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 mod err;
 
@@ -70,7 +70,7 @@ static EMBEDDED_DB_V6: &str = include_str!("../data/geoip6");
 
 /// A parsed copy of the embedded database.
 #[cfg(feature = "embedded-db")]
-static EMBEDDED_DB_PARSED: OnceCell<Arc<GeoipDb>> = OnceCell::new();
+static EMBEDDED_DB_PARSED: OnceLock<Arc<GeoipDb>> = OnceLock::new();
 
 /// A two-letter country code.
 ///

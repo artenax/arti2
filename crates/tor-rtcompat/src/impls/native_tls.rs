@@ -6,13 +6,17 @@ use async_trait::async_trait;
 use futures::{AsyncRead, AsyncWrite};
 use native_tls_crate as native_tls;
 use std::io::{Error as IoError, Result as IoResult};
+use tracing::instrument;
 
 /// A [`TlsProvider`] that uses `native_tls`.
 ///
 /// It supports wrapping any reasonable stream type that implements `AsyncRead` + `AsyncWrite`.
 #[cfg_attr(
     docsrs,
-    doc(cfg(all(feature = "native-tls", any(feature = "tokio", feature = "async-std"))))
+    doc(cfg(all(
+        feature = "native-tls",
+        any(feature = "tokio", feature = "async-std", feature = "smol")
+    )))
 )]
 #[derive(Default, Clone)]
 #[non_exhaustive]
@@ -26,13 +30,11 @@ where
         let cert = self.peer_certificate();
         match cert {
             Ok(Some(c)) => {
-                let der = c
-                    .to_der()
-                    .map_err(|e| IoError::new(std::io::ErrorKind::Other, e))?;
+                let der = c.to_der().map_err(IoError::other)?;
                 Ok(Some(der))
             }
             Ok(None) => Ok(None),
-            Err(e) => Err(IoError::new(std::io::ErrorKind::Other, e)),
+            Err(e) => Err(IoError::other(e)),
         }
     }
 
@@ -74,12 +76,13 @@ where
 {
     type Conn = async_native_tls::TlsStream<S>;
 
+    #[instrument(skip_all, level = "trace")]
     async fn negotiate_unvalidated(&self, stream: S, sni_hostname: &str) -> IoResult<Self::Conn> {
         let conn = self
             .connector
             .connect(sni_hostname, stream)
             .await
-            .map_err(|e| IoError::new(std::io::ErrorKind::Other, e))?;
+            .map_err(IoError::other)?;
         Ok(conn)
     }
 }

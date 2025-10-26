@@ -44,7 +44,7 @@ pub use {inner::HsDescInner, middle::HsDescMiddle, outer::HsDescOuter};
 
 #[cfg(feature = "hs-service")]
 #[cfg_attr(docsrs, doc(cfg(feature = "hs-service")))]
-pub use build::{create_desc_sign_key_cert, HsDescBuilder};
+pub use build::{HsDescBuilder, create_desc_sign_key_cert};
 
 /// Metadata about an onion service descriptor, as stored at an HsDir.
 ///
@@ -419,8 +419,8 @@ pub enum HsDescError {
 
 impl tor_error::HasKind for HsDescError {
     fn kind(&self) -> tor_error::ErrorKind {
-        use tor_error::ErrorKind as EK;
         use HsDescError as E;
+        use tor_error::ErrorKind as EK;
         match self {
             E::OuterParsing(_) | E::OuterValidation(_) => EK::TorProtocolViolation,
             E::MissingDecryptionKey => EK::OnionServiceMissingClientAuth,
@@ -429,6 +429,39 @@ impl tor_error::HasKind for HsDescError {
                 EK::OnionServiceProtocolViolation
             }
             E::Bug(e) => e.kind(),
+        }
+    }
+}
+
+impl HsDescError {
+    /// Return true if this error is one that we should report as a suspicious event.
+    ///
+    /// Note that this is a defense-in-depth check
+    /// for resisting descriptor-length inflation attacks:
+    /// Our limits on total download size and/or total cell counts are the defense
+    /// that really matters.
+    /// (See prop360 for more information.)
+    pub fn should_report_as_suspicious(&self) -> bool {
+        use crate::NetdocErrorKind as EK;
+        use HsDescError as E;
+        #[allow(clippy::match_like_matches_macro)]
+        match self {
+            E::OuterParsing(e) => match e.netdoc_error_kind() {
+                EK::ExtraneousSpace => true,
+                EK::WrongEndingToken => true,
+                EK::MissingKeyword => true,
+                _ => false,
+            },
+            E::OuterValidation(e) => match e.netdoc_error_kind() {
+                EK::BadSignature => true,
+                _ => false,
+            },
+            E::MissingDecryptionKey => false,
+            E::WrongDecryptionKey => false,
+            E::DecryptionFailed => false,
+            E::InnerParsing(_) => false,
+            E::InnerValidation(_) => false,
+            E::Bug(_) => false,
         }
     }
 }

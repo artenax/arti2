@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,8 +41,12 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
+// TODO #2010: Remove this global allow, and either propagate it to the functions that need it,
+// or make those functions less complex.
+#![allow(clippy::cognitive_complexity)]
 // TODO #1645 (either remove this, or decide to have it everywhere)
 #![cfg_attr(
     not(all(feature = "full", feature = "experimental")),
@@ -52,28 +56,45 @@
 #[cfg(feature = "bench")]
 pub mod bench_utils;
 pub mod channel;
+pub mod circuit;
+pub mod client;
+pub(crate) mod conflux;
 mod congestion;
 mod crypto;
 pub mod memquota;
-pub mod stream;
+mod stream;
+pub(crate) mod streammap;
 pub(crate) mod tunnel;
 mod util;
+
+#[cfg(feature = "relay")]
+pub(crate) mod relay;
+#[cfg(feature = "relay")]
+pub use relay::channel::{RelayChannelBuilder, RelayIdentities};
 
 pub use util::err::{Error, ResolveError};
 pub use util::skew::ClockSkew;
 
 pub use channel::params::ChannelPaddingInstructions;
+pub use client::{ClientTunnel, HopLocation, TargetHop};
 pub use congestion::params as ccparams;
 pub use crypto::cell::{HopNum, HopNumDisplay};
-pub use tunnel::circuit;
+pub use stream::flow_ctrl::params::{CellCount, FlowCtrlParameters};
+#[cfg(feature = "send-control-msg")]
+#[cfg_attr(docsrs, doc(cfg(feature = "send-control-msg")))]
+pub use {
+    crate::client::Conversation,
+    crate::client::msghandler::{MsgHandler, UserMsgHandler},
+    crate::client::reactor::MetaCellDisposition,
+};
 
 /// A Result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
 use std::fmt::Debug;
 use tor_memquota::{
-    mq_queue::{self, ChannelSpec as _},
     HasMemoryCost,
+    mq_queue::{self, ChannelSpec as _},
 };
 use tor_rtcompat::DynTimeProvider;
 
@@ -127,4 +148,65 @@ pub(crate) fn fake_mpsc<T: HasMemoryCost + Debug + Send>(
             &tor_memquota::Account::new_noop(),
         )
         .expect("create fake mpsc")
+}
+
+/// Return a list of the protocols [supported](tor_protover::doc_supported)
+/// by this crate, running as a client.
+pub fn supported_client_protocols() -> tor_protover::Protocols {
+    use tor_protover::named::*;
+    // WARNING: REMOVING ELEMENTS FROM THIS LIST CAN BE DANGEROUS!
+    // SEE [`tor_protover::doc_changing`]
+    let mut protocols = vec![
+        LINK_V4,
+        LINK_V5,
+        LINKAUTH_ED25519_SHA256_EXPORTER,
+        FLOWCTRL_AUTH_SENDME,
+        RELAY_NTOR,
+        RELAY_EXTEND_IPv6,
+        RELAY_NTORV3,
+        RELAY_NEGOTIATE_SUBPROTO,
+    ];
+    #[cfg(feature = "flowctl-cc")]
+    protocols.push(FLOWCTRL_CC);
+    #[cfg(feature = "counter-galois-onion")]
+    protocols.push(RELAY_CRYPT_CGO);
+
+    protocols.into_iter().collect()
+}
+
+#[cfg(test)]
+mod test {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_duration_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+
+    use cfg_if::cfg_if;
+
+    use super::*;
+
+    #[test]
+    fn protocols() {
+        let pr = supported_client_protocols();
+        cfg_if! {
+            if #[cfg(all(feature="flowctl-cc", feature="counter-galois-onion"))] {
+                let expected = "FlowCtrl=1-2 Link=4-5 LinkAuth=3 Relay=2-6".parse().unwrap();
+            } else if #[cfg(feature="flowctl-cc")] {
+                let expected = "FlowCtrl=1-2 Link=4-5 LinkAuth=3 Relay=2-5".parse().unwrap();
+                // (Note that we don't have to check for cgo without cc, since that isn't possible.)
+            } else {
+                let expected = "FlowCtrl=1 Link=4-5 LinkAuth=3 Relay=2-5".parse().unwrap();
+            }
+        }
+        assert_eq!(pr, expected);
+    }
 }

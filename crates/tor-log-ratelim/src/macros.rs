@@ -160,7 +160,7 @@ macro_rules! log_ratelim {
       // happened and not worry about the rate-limiting.
       match &$result {
         #[allow(clippy::redundant_pattern)]
-        Err(ref the_error @ $err_pat) => {
+        Err(the_error @ $err_pat) => {
           tracing::event!(
             tracing::Level::$err_level,
             concat!($act_fmt, $(": ", $err_fmt, )? ": {}"),
@@ -229,8 +229,8 @@ macro_rules! log_ratelim {
     // The strong reference for each RateLim is held by a task that flushes
     // the logger as appropriate, and drops the strong reference once it's
     // quiescent.
-    static LOGGERS: Lazy<Mutex<WeakValueHashMap<String, Weak<RateLim<Lg>>>>> =
-      Lazy::new(|| Mutex::new(WeakValueHashMap::new()));
+    static LOGGERS: LazyLock<Mutex<WeakValueHashMap<String, Weak<RateLim<Lg>>>>> =
+    LazyLock::new(|| Mutex::new(WeakValueHashMap::new()));
 
     // We assign a separate rate limit for each activity.
     // For now, this is string-ly typed.
@@ -239,7 +239,7 @@ macro_rules! log_ratelim {
 
     match &$result {
       #[allow(clippy::redundant_pattern)]
-      Err(ref the_error @ $err_pat) => {
+      Err(the_error @ $err_pat) => {
         // The operation failed.
         //
         // 1) Create a rate-limited logger for this activity if one  did not

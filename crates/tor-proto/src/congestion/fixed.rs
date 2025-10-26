@@ -7,9 +7,10 @@
 use crate::Result;
 
 use super::{
+    CongestionControlAlgorithm, CongestionSignals, CongestionWindow, State,
+    params::{Algorithm, FixedWindowParams},
     rtt::RoundtripTimeEstimator,
     sendme::{self, WindowParams},
-    CongestionControlAlgorithm, CongestionSignals, CongestionWindow, State,
 };
 
 /// Fixed window algorithm which is essentially the SENDME v0 with fixed receive and send window
@@ -20,21 +21,33 @@ pub(crate) struct FixedWindow {
     recvwindow: sendme::CircRecvWindow,
     /// Window used to say how many cells we can send.
     sendwindow: sendme::CircSendWindow,
+    /// The params from the consensus.
+    params: FixedWindowParams,
 }
 
 impl FixedWindow {
     /// Create a new `FixedWindow` form a given initial sendwindow size.
     ///
     /// Note: the initial recvwindow size is given by [`sendme::CircParams::start`].
-    pub(crate) fn new(initial_window: u16) -> Self {
+    pub(crate) fn new(params: FixedWindowParams) -> Self {
+        let initial_window = params.circ_window_start();
         Self {
             recvwindow: sendme::CircRecvWindow::new(sendme::CircParams::start()),
             sendwindow: sendme::CircSendWindow::new(initial_window),
+            params,
         }
     }
 }
 
 impl CongestionControlAlgorithm for FixedWindow {
+    fn uses_stream_sendme(&self) -> bool {
+        true
+    }
+
+    fn uses_xon_xoff(&self) -> bool {
+        false
+    }
+
     fn is_next_cell_sendme(&self) -> bool {
         self.sendwindow.should_record_tag()
     }
@@ -69,8 +82,17 @@ impl CongestionControlAlgorithm for FixedWindow {
         self.sendwindow.take()
     }
 
+    #[cfg(feature = "conflux")]
+    fn inflight(&self) -> Option<u32> {
+        None
+    }
+
     #[cfg(test)]
     fn send_window(&self) -> u32 {
         u32::from(self.sendwindow.window())
+    }
+
+    fn algorithm(&self) -> Algorithm {
+        Algorithm::FixedWindow(self.params)
     }
 }

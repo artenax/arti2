@@ -9,7 +9,7 @@ of the [Tor](https://www.torproject.org/) anonymity protocols in the
 ## Links:
 
 This is the README for the Arti project as a whole.
-If you want find more practical information
+If you want to find more practical information
 you might want to check out these links:
 
    * [The Arti website](https://arti.torproject.org)
@@ -59,11 +59,11 @@ needlessly hard to understand and improve.
 Arti can connect to the Tor network, bootstrap a
 view of the Tor directory, and make anonymized connections over the network.
 Now that Arti has reached version 1.0.0, we believe it is suitable for
-actual use to anonymise connections.
+actual use to anonymize connections.
 
 There are a number of areas (especially at the lower layers) where APIs
 (especially internal APIs) are not stable,
-and are likely to change them.
+and we are likely to change them.
 Right now that includes the command line interface to the `arti` program.
 
 And of course it's still very new so there are likely to be bugs.
@@ -95,6 +95,11 @@ because it includes your username), you will want to take steps
 to prevent this.  See [`doc/safer-build.md`](doc/safer-build.md)
 for more information.
 
+⚠ **Safety Note**: when building `arti` for "production use",
+you should always use the `-p arti` option as documented above.
+While a `cargo build` without specifying the `-p arti` will still build `arti`,
+it may also enable unintended features (including experimental features)
+due to cargo feature unification.
 
 If you run into any trouble building the program, please have a
 look at [the troubleshooting guide](doc/TROUBLESHOOTING.md).
@@ -119,7 +124,7 @@ That library's API will allow you to
 make connections over the Tor network,
 and obtain streams/sinks usable from async Rust.
 
-We make fairly frequent semver bumps the Arti library API,
+We make fairly frequent semver bumps to the Arti library API,
 and to our lower-level crates.
 However, in practice, we don't often make disruptive changes
 that aren't easy to sort out in a dependency.
@@ -132,7 +137,7 @@ for more details.
 
 ## Minimum supported Rust Version
 
-Our current Minimum Supported Rust Version (MSRV) is 1.77.
+Our current Minimum Supported Rust Version (MSRV) is 1.86.
 
 When increasing this MSRV, we won't require any Rust version released in the
 last six months. (That is, we'll only require Rust versions released at least
@@ -143,10 +148,6 @@ We will not increase MSRV on PATCH releases, though our dependencies might.
 We won't increase MSRV just because we can: we'll only do so when we have a
 reason. (We don't guarantee that you'll agree with our reasoning; only that
 it will exist.)
-
-## Helping out
-
-Have a look at our [contributor guidelines](./CONTRIBUTING.md).
 
 ## Roadmap
 
@@ -214,8 +215,8 @@ don't already have an account there, you can either
 
 ## How can I help out?
 
-See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for a few ideas for how to get
-started.
+Have a look at our [contributor guidelines](./CONTRIBUTING.md) for a few ideas
+on how to get started.
 
 ## License
 

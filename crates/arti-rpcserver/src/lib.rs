@@ -40,7 +40,11 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
+
+// TODO #1645 (either remove this, or decide to have it everywhere)
+#![cfg_attr(not(all(feature = "full", feature = "experimental")), allow(unused))]
 
 mod cancel;
 mod codecs;
@@ -53,7 +57,7 @@ mod objmap;
 mod session;
 mod stream;
 
-pub use connection::{auth::RpcAuthentication, Connection, ConnectionError};
+pub use connection::{Connection, ConnectionError, auth::RpcAuthentication};
 pub use mgr::RpcMgr;
 pub use session::RpcSession;
 

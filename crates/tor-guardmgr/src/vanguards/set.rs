@@ -3,8 +3,8 @@
 use std::cmp;
 use std::time::{Duration, SystemTime};
 
-use derive_deftly::{derive_deftly_adhoc, Deftly};
-use rand::{seq::IndexedRandom as _, RngCore};
+use derive_deftly::{Deftly, derive_deftly_adhoc};
+use rand::{RngCore, seq::IndexedRandom as _};
 use serde::{Deserialize, Serialize};
 
 use tor_basic_utils::RngExt as _;
@@ -271,7 +271,7 @@ impl VanguardSet {
         &self,
         rng: &mut R,
         netdir: &'a NetDir,
-        neighbor_exclusion: &RelayExclusion<'a>,
+        relay_selector: &RelaySelector<'a>,
     ) -> Option<Vanguard<'a>> {
         let good_relays = self
             .vanguards
@@ -279,7 +279,7 @@ impl VanguardSet {
             .filter_map(|vanguard| {
                 // Skip over any unusable relays
                 let relay = netdir.by_ids(&vanguard.id)?;
-                neighbor_exclusion
+                relay_selector
                     .low_level_predicate_permits_relay(&relay)
                     .then_some(relay)
             })

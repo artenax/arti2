@@ -1,8 +1,8 @@
 //! A wrapper around an RPC Object that can be used as a connection target.
 
 use arti_client::{
-    rpc::{ClientConnectionResult, ConnectWithPrefs, ResolvePtrWithPrefs, ResolveWithPrefs},
     DataStream, StreamPrefs, TorAddr, TorClient,
+    rpc::{ClientConnectionResult, ConnectWithPrefs, ResolvePtrWithPrefs, ResolveWithPrefs},
 };
 use std::{net::IpAddr, sync::Arc};
 use tor_error::into_internal;
@@ -22,7 +22,7 @@ pub(crate) enum ConnTarget<R: Runtime> {
         context: Arc<dyn rpc::Context>,
     },
     /// A Tor client, without RPC information
-    Client(TorClient<R>),
+    Client(Box<TorClient<R>>),
 }
 
 impl<R: Runtime> ConnTarget<R> {

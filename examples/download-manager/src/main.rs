@@ -12,14 +12,14 @@ use arti_client::{TorAddr, TorClient, TorClientConfig};
 use clap::Parser;
 use http_body_util::{BodyExt, Empty};
 use hyper::{
-    body::Bytes, client::conn::http1::SendRequest, header, http::uri::Scheme, Method, Request,
-    StatusCode, Uri,
+    Method, Request, StatusCode, Uri, body::Bytes, client::conn::http1::SendRequest, header,
+    http::uri::Scheme,
 };
 use hyper_util::rt::TokioIo;
 use sha2::{Digest, Sha256};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 use tor_rtcompat::PreferredRuntime;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Tor Browser Bundle download manager
 ///
@@ -30,7 +30,7 @@ struct Args {
     #[arg(long, short, default_value = "1")]
     connections: NonZeroU8,
     /// Version of the Tor Browser to download
-    #[clap(default_value = "14.0.4")]
+    #[clap(default_value = "14.0.7")]
     version: String,
 }
 
@@ -39,7 +39,7 @@ async fn connect_to_url(
     client: &TorClient<PreferredRuntime>,
     uri: &Uri,
 ) -> anyhow::Result<SendRequest<Empty<Bytes>>> {
-    // isolated client makes each connection run on a seperate circuit
+    // isolated client makes each connection run on a separate circuit
     let isolated = client.isolated_client();
 
     // Create TLS connector
@@ -76,7 +76,7 @@ async fn connect_to_url(
     // Spawn task to drive HTTP state forward
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            tracing::debug!("Connection closed: {}", e);
+            tracing::debug!("Connection closed: {e}");
         }
     });
 
@@ -98,21 +98,21 @@ async fn get_content_length(
         .header(header::HOST, host)
         .uri(uri)
         .body(Empty::new())?;
-    tracing::debug!("Sending request to server: {:?}", request);
+    tracing::debug!("Sending request to server: {request:?}");
 
     let response = http.send_request(request).await?;
-    tracing::debug!("Received response from server: {:?}", response);
+    tracing::debug!("Received response from server: {response:?}");
 
     // Check that request succeeded
     if !response.status().is_success() {
-        return Err(anyhow::anyhow!("HEAD Request failed: {:?}", response));
+        return Err(anyhow::anyhow!("HEAD Request failed: {response:?}"));
     };
 
     // Get the Content-Length header
     match response.headers().get(header::CONTENT_LENGTH) {
         Some(header) => {
             let length: u64 = header.to_str()?.parse()?;
-            tracing::debug!("Content-Length of resource: {}", length);
+            tracing::debug!("Content-Length of resource: {length}");
             Ok(length)
         }
         None => Err(anyhow::anyhow!("Missing Content-Length header")),
@@ -176,7 +176,7 @@ async fn request_range(
         .method(Method::GET)
         .uri(uri)
         .header(header::HOST, host)
-        .header(header::RANGE, format!("bytes={}-{}", start, end))
+        .header(header::RANGE, format!("bytes={start}-{end}"))
         .body(Empty::new())?;
 
     let mut response = http.send_request(request).await?;
@@ -205,11 +205,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Warn user when using more than 8 connections
     if connections > 8 {
-        tracing::warn!("The Tor network has limited bandwidth, it is recommended to use less than 8 connections");
+        tracing::warn!(
+            "The Tor network has limited bandwidth, it is recommended to use less than 8 connections"
+        );
     };
 
     // Generate download and checksum URL from Tor version
     let filename = format!("tor-browser-linux-x86_64-{}.tar.xz", args.version);
+
+    // Check if the file already exists
+    if tokio::fs::try_exists(&filename).await? {
+        tracing::info!("File already exists, skipping download");
+        return Err(anyhow::anyhow!("File {filename} already exists"));
+    }
+
     let url = format!(
         "https://dist.torproject.org/torbrowser/{}/{}",
         args.version, filename
@@ -221,12 +230,6 @@ async fn main() -> anyhow::Result<()> {
     );
     let checksum_uri = Uri::from_str(checksum_url.as_str())?;
 
-    // Check if the file already exists
-    if tokio::fs::try_exists(&filename).await? {
-        tracing::info!("File already exists, skipping download");
-        return Err(anyhow::anyhow!("File {filename} already exists"));
-    }
-
     // Create the tor client
     let config = TorClientConfig::default();
 
@@ -236,7 +239,7 @@ async fn main() -> anyhow::Result<()> {
     // Fetch Tor Browser Bundle size using isolated tor client
     let mut connection = connect_to_url(&client, &uri).await?;
     let length = get_content_length(&mut connection, &uri).await?;
-    tracing::info!("Tor Browser Bundle has size: {} bytes", length);
+    tracing::info!("Tor Browser Bundle has size: {length} bytes");
 
     tracing::info!("Fetching checksum");
     let checksums = get_checksums(&mut connection, checksum_uri).await?;
@@ -263,7 +266,7 @@ async fn main() -> anyhow::Result<()> {
         start = end + 1;
     }
 
-    tracing::info!("Creating {} connections", connections);
+    tracing::info!("Creating {connections} connections");
     let connections = ranges.iter().map(|(start, end)| async {
         // Create new connection for chunk
         let connection = connect_to_url(&client, &uri).await?;

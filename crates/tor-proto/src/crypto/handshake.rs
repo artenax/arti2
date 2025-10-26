@@ -14,7 +14,6 @@ pub(crate) mod fast;
 #[cfg(feature = "hs-common")]
 pub mod hs_ntor;
 pub(crate) mod ntor;
-#[cfg(feature = "ntor_v3")]
 pub(crate) mod ntor_v3;
 
 use std::borrow::Borrow;
@@ -145,6 +144,7 @@ impl KeyGenerator for TapKeyGenerator {
 }
 
 /// Generates keys based on SHAKE-256.
+#[cfg_attr(feature = "bench", visibility::make(pub))]
 pub(crate) struct ShakeKeyGenerator {
     /// Seed for the key generator
     seed: SecretBuf,
@@ -153,6 +153,7 @@ pub(crate) struct ShakeKeyGenerator {
 impl ShakeKeyGenerator {
     /// Create a key generator based on a provided seed
     #[allow(dead_code)] // We'll construct these for v3 onion services
+    #[cfg_attr(feature = "bench", visibility::make(pub))]
     pub(crate) fn new(seed: SecretBuf) -> Self {
         ShakeKeyGenerator { seed }
     }

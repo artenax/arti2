@@ -10,13 +10,14 @@ use futures::task::SpawnExt;
 use safelog::sensitive;
 use std::io::Result as IoResult;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-#[cfg(feature = "rpc")]
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 #[allow(unused)]
 use arti_client::HasKind;
 use arti_client::{ErrorKind, IntoTorAddr as _, StreamPrefs, TorClient};
+#[cfg(feature = "rpc")]
+use arti_rpcserver::RpcMgr;
 use tor_config::Listen;
 use tor_error::warn_report;
 #[cfg(feature = "rpc")]
@@ -27,6 +28,11 @@ use tor_socksproto::{Handshake as _, SocksAddr, SocksAuth, SocksCmd, SocksReques
 use anyhow::{anyhow, Context, Result};
 
 use crate::rpc::RpcProxySupport;
+
+/// Placeholder type when RPC is disabled at compile time.
+#[cfg(not(feature = "rpc"))]
+#[cfg_attr(feature = "experimental-api", visibility::make(pub))]
+pub(crate) enum RpcMgr {}
 
 /// Payload to return when an HTTP connection arrive on a Socks port
 const WRONG_PROTOCOL_PAYLOAD: &[u8] = br#"HTTP/1.0 501 Tor is not an HTTP Proxy
@@ -319,12 +325,9 @@ fn interpret_socks_auth(auth: &SocksAuth) -> Result<AuthInterpretation> {
         let Some(remainder) = username.strip_prefix(SOCKS_EXT_CONST_ANY) else {
             return Ok(Uname::Legacy);
         };
-        if remainder.is_empty() {
-            return Err(anyhow!("Extended SOCKS information without format code."));
-        }
-        // TODO MSRV 1.80: use split_at_checked instead.
-        // This won't panic since we checked for an empty string above.
-        let (format_code, remainder) = remainder.split_at(1);
+        let (format_code, remainder) = remainder
+            .split_at_checked(1)
+            .ok_or_else(|| anyhow!("Extended SOCKS information without format code."))?;
         Ok(Uname::Extended(format_code[0], remainder))
     }
 
@@ -432,7 +435,7 @@ impl<R: Runtime> SocksConnContext<R> {
 
         let client = self.tor_client.clone();
         #[cfg(feature = "rpc")]
-        let client = ConnTarget::Client(client);
+        let client = ConnTarget::Client(Box::new(client));
 
         Ok((prefs, client))
     }
@@ -444,6 +447,8 @@ impl<R: Runtime> SocksConnContext<R> {
 /// Uses `isolation_info` to decide which circuits this connection
 /// may use.  Requires that `isolation_info` is a pair listing the listener
 /// id and the source address for the socks request.
+#[allow(clippy::cognitive_complexity)] // TODO: Refactor
+#[instrument(skip_all, level = "trace")]
 async fn handle_socks_conn<R, S>(
     runtime: R,
     context: SocksConnContext<R>,
@@ -711,6 +716,7 @@ where
 /// This function assumes that the writer might need to be flushed for
 /// any buffered data to be sent.  It tries to minimize the number of
 /// flushes, however, by only flushing the writer when the reader has no data.
+#[instrument(skip_all, level = "trace")]
 async fn copy_interactive<R, W>(mut reader: R, mut writer: W) -> IoResult<()>
 where
     R: AsyncRead + Unpin,
@@ -787,6 +793,8 @@ fn accept_err_is_fatal(err: &IoError) -> bool {
 /// timeouts, and a `tor_client` to use in connecting over the Tor
 /// network.
 #[cfg_attr(feature = "experimental-api", visibility::make(pub))]
+#[allow(clippy::cognitive_complexity)] // TODO: Refactor
+#[instrument(skip_all, level = "trace")]
 pub(crate) async fn run_socks_proxy<R: Runtime>(
     runtime: R,
     tor_client: TorClient<R>,
@@ -801,6 +809,8 @@ pub(crate) async fn run_socks_proxy<R: Runtime>(
         }) => (Some(rpc_mgr), Some(rpc_state_sender)),
         None => (None, None),
     };
+    #[cfg(not(feature = "rpc"))]
+    let rpc_mgr = None;
 
     if !listen.is_localhost_only() {
         warn!("Configured to listen for SOCKS on non-local addresses. This is usually insecure! We recommend listening on localhost only.");
@@ -850,6 +860,17 @@ pub(crate) async fn run_socks_proxy<R: Runtime>(
         }
     }
 
+    run_socks_proxy_with_listeners(tor_client, listeners, rpc_mgr).await
+}
+
+/// Launch a SOCKS proxy from a given set of already bound listeners.
+#[cfg_attr(feature = "experimental-api", visibility::make(pub))]
+#[instrument(skip_all, level = "trace")]
+pub(crate) async fn run_socks_proxy_with_listeners<R: Runtime>(
+    tor_client: TorClient<R>,
+    listeners: Vec<<R as tor_rtcompat::NetStreamProvider>::Listener>,
+    rpc_mgr: Option<Arc<RpcMgr>>,
+) -> Result<()> {
     // Create a stream of (incoming socket, listener_id) pairs, selected
     // across all the listeners.
     let mut incoming = futures::stream::select_all(
@@ -881,8 +902,8 @@ pub(crate) async fn run_socks_proxy<R: Runtime>(
             #[cfg(feature = "rpc")]
             rpc_mgr: rpc_mgr.clone(),
         };
-        let runtime_copy = runtime.clone();
-        runtime.spawn(async move {
+        let runtime_copy = tor_client.runtime().clone();
+        tor_client.runtime().spawn(async move {
             let res =
                 handle_socks_conn(runtime_copy, socks_context, stream, (sock_id, addr.ip())).await;
             if let Err(e) = res {

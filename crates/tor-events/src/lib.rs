@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,27 +41,28 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 pub mod events;
 
 use crate::events::{TorEvent, TorEventKind};
 use async_broadcast::{InactiveReceiver, Receiver, Sender, TrySendError};
+use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::future::Either;
-use futures::StreamExt;
-use once_cell::sync::OnceCell;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use thiserror::Error;
 use tracing::{error, warn};
 
 /// Pointer to an `UnboundedSender`, used to send events into the `EventReactor`.
-static EVENT_SENDER: OnceCell<UnboundedSender<TorEvent>> = OnceCell::new();
+static EVENT_SENDER: OnceLock<UnboundedSender<TorEvent>> = OnceLock::new();
 /// An inactive receiver for the currently active broadcast channel, if there is one.
-static CURRENT_RECEIVER: OnceCell<InactiveReceiver<TorEvent>> = OnceCell::new();
+static CURRENT_RECEIVER: OnceLock<InactiveReceiver<TorEvent>> = OnceLock::new();
 /// The number of `TorEventKind`s there are.
 const EVENT_KIND_COUNT: usize = 1;
 /// An array containing one `AtomicUsize` for each `TorEventKind`, used to track subscriptions.
@@ -305,10 +306,9 @@ mod test {
     #![allow(clippy::needless_pass_by_value)]
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use crate::{
-        broadcast, event_has_subscribers, EventReactor, StreamExt, TorEvent, TorEventKind,
+        EventReactor, StreamExt, TorEvent, TorEventKind, broadcast, event_has_subscribers,
     };
-    use once_cell::sync::OnceCell;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
     use tokio::runtime::Runtime;
 
@@ -318,7 +318,7 @@ mod test {
     //            the need to have a background singleton EventReactor.
     //
     //            To hack around this, we just have a global runtime protected by a mutex!
-    static TEST_MUTEX: OnceCell<Mutex<Runtime>> = OnceCell::new();
+    static TEST_MUTEX: OnceLock<Mutex<Runtime>> = OnceLock::new();
 
     /// Locks the mutex, and makes sure the event reactor is initialized.
     fn test_setup() -> MutexGuard<'static, Runtime> {

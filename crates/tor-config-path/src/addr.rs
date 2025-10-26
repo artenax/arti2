@@ -27,7 +27,7 @@ pub struct CfgAddr(AddrInner);
 enum AddrInner {
     /// An internet address (which will not be expanded).
     Inet(net::SocketAddr),
-    /// A unix path.
+    /// A unix domain socket path.
     Unix(CfgPath),
 }
 
@@ -35,13 +35,14 @@ impl CfgAddr {
     /// Create a new [`CfgAddr`] that will produce an `AF_UNIX` address
     /// corresponding to the provided path.
     ///
-    /// Note that not all platforms support AF_UNIX addresses;
+    /// Note that not all platforms support AF\_UNIX addresses;
     /// on Windows, notably, expanding this path will produce an error.
     pub fn new_unix(path: CfgPath) -> Self {
         CfgAddr(AddrInner::Unix(path))
     }
 
     /// Return the [`general::SocketAddr`] produced by expanding this `CfgAddr`.
+    #[cfg_attr(not(unix), expect(unused_variables))]
     pub fn address(
         &self,
         path_resolver: &crate::CfgPathResolver,
@@ -55,12 +56,12 @@ impl CfgAddr {
                 #[cfg(not(unix))]
                 {
                     // Give this error early on non-unix platforms, so that we don't confuse the user.
-                    return Err(unix::NoUnixAddressSupport::default().into());
+                    return Err(unix::NoAfUnixSocketSupport::default().into());
                 }
                 #[cfg(unix)]
                 {
                     let addr = unix::SocketAddr::from_pathname(cfg_path.path(path_resolver)?)
-                        .map_err(|e| CfgAddrError::ConstructUnixAddress(Arc::new(e)))?;
+                        .map_err(|e| CfgAddrError::ConstructAfUnixAddress(Arc::new(e)))?;
                     Ok(addr.into())
                 }
             }
@@ -69,7 +70,7 @@ impl CfgAddr {
 
     /// Return true if this address is of a type to which variable substitutions will apply.
     ///
-    /// Currently, substitutions apply to Unix addresses but not to Inet addresses.
+    /// Currently, substitutions apply to AF\_UNIX addresses but not to Inet addresses.
     pub fn substitutions_will_apply(&self) -> bool {
         match &self.0 {
             AddrInner::Inet(_) => false,
@@ -79,7 +80,7 @@ impl CfgAddr {
 
     /// Helper: if possible, format this address as a String.
     ///
-    /// (This will return Err(p) if this path is a literal unix path
+    /// (This will return Err(p) if this path is a literal unix domain socket path
     /// that can't be represented as a string.)
     //
     // This is a separate function so that it can form the basis of a "display_lossy"
@@ -106,15 +107,15 @@ impl CfgAddr {
 pub enum CfgAddrError {
     /// Tried to expand a `unix:` address on a platform where we don't support `AF_UNIX` addresses.
     #[error("No support for AF_UNIX addresses on this platform")]
-    NoUnixAddressSupport(#[from] unix::NoUnixAddressSupport),
+    NoAfUnixSocketSupport(#[from] unix::NoAfUnixSocketSupport),
     /// Unable to expand the underlying `CfgPath`, likely due to syntax or missing variables.
     #[error("Could not expand path")]
     Path(#[from] CfgPathError),
     /// Unable to create an AF_UNIX address from a path.
     ///
     /// (This can happen if the path is too long, or contains internal NULs.)
-    #[error("Could not construct unix address")]
-    ConstructUnixAddress(#[source] Arc<io::Error>),
+    #[error("Could not construct AF_UNIX address")]
+    ConstructAfUnixAddress(#[source] Arc<io::Error>),
 }
 
 impl FromStr for CfgAddr {
@@ -123,7 +124,7 @@ impl FromStr for CfgAddr {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // NOTE: This logic is mostly duplicated from <FromStr for general::SocketAddr>;
         // I don't see an easy way to deduplicate it.
-        if s.starts_with(|c: char| (c.is_ascii_digit() || c == '[')) {
+        if s.starts_with(|c: char| c.is_ascii_digit() || c == '[') {
             // This looks like an inet address, and cannot be a qualified address.
             Ok(s.parse::<net::SocketAddr>()?.into())
         } else if let Some((schema, remainder)) = s.split_once(':') {
@@ -164,13 +165,13 @@ impl TryFrom<unix::SocketAddr> for CfgAddr {
     }
 }
 // NOTE that we deliberately _don't_ implement From<Path> or From<CfgPath>;
-// we want to keep open the possibility that there may be non-Unix path-based
+// we want to keep open the possibility that there may be non-AF\_UNIX path-based
 // addresses in the future!
 
 /// Error returned when trying to convert a non-path `unix::SocketAddr` into a `CfgAddr` .
 #[derive(Clone, Debug, Default, thiserror::Error)]
 #[non_exhaustive]
-#[error("Unix address was not a path.")]
+#[error("Unix domain socket address was not a path.")]
 pub struct UnixAddrNotAPath;
 
 /// Serde helper: We convert CfgAddr through this format in order to serialize and deserialize it.
@@ -179,7 +180,7 @@ pub struct UnixAddrNotAPath;
 enum CfgAddrSerde {
     /// We serialize most types as a string.
     Str(String),
-    /// We have another format for representing unix address literals
+    /// We have another format for representing AF\_UNIX address literals
     /// that can't be represented as a string.
     UnixLiteral {
         /// A path that won't be expanded.
@@ -231,7 +232,7 @@ mod test {
     use assert_matches::assert_matches;
     use std::path::PathBuf;
 
-    use crate::{home, CfgPathResolver};
+    use crate::{CfgPathResolver, home};
 
     #[test]
     fn parse_inet_ok() {
@@ -280,6 +281,7 @@ mod test {
     }
 
     #[test]
+    #[cfg_attr(not(unix), expect(unused_variables))]
     fn unix_literal() {
         let resolv = CfgPathResolver::from_pairs([("USER_HOME", home().unwrap())]);
         let pb = PathBuf::from("${USER_HOME}/.local/socket");
@@ -293,16 +295,17 @@ mod test {
                     // can't use assert_eq because these types are not Debug.
                     assert!(socket_addr.as_pathname() == Some(pb.as_ref()));
                 }
-                _ => panic!("Expected a unix address"),
+                _ => panic!("Expected a unix domain socket address"),
             }
         }
         #[cfg(not(unix))]
         assert_matches!(
             a1.address(&resolv),
-            Err(CfgAddrError::NoUnixAddressSupport(_))
+            Err(CfgAddrError::NoAfUnixSocketSupport(_))
         );
     }
 
+    #[cfg_attr(not(unix), expect(unused_variables))]
     fn try_unix(addr: &str, want: &str, path_resolver: &CfgPathResolver) {
         let p = CfgPath::new(want.to_string());
         let expansion = p.path(path_resolver).unwrap();
@@ -318,7 +321,7 @@ mod test {
         {
             assert_matches!(
                 cfg_addr.address(path_resolver),
-                Err(CfgAddrError::NoUnixAddressSupport(_))
+                Err(CfgAddrError::NoAfUnixSocketSupport(_))
             );
         }
     }

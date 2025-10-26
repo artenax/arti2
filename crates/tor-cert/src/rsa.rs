@@ -4,7 +4,7 @@
 //! key speaks for a given (deprecated) RSA identity.
 
 use tor_bytes::Reader;
-use tor_checkable::{timed::TimerangeBound, ExternallySigned};
+use tor_checkable::{ExternallySigned, timed::TimerangeBound};
 use tor_llcrypto as ll;
 
 use digest::Digest;
@@ -34,6 +34,11 @@ impl RsaCrosscert {
     pub fn expiry(&self) -> std::time::SystemTime {
         let d = std::time::Duration::new(u64::from(self.exp_hours) * 3600, 0);
         std::time::SystemTime::UNIX_EPOCH + d
+    }
+
+    /// Return a reference to the digest.
+    pub fn digest(&self) -> &[u8; 32] {
+        &self.digest
     }
 
     /// Return true if the subject key in this certificate matches `other`

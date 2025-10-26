@@ -2,6 +2,7 @@
 
 use tor_basic_utils::retry::RetryDelay;
 
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -12,8 +13,8 @@ use crate::dirstatus::DirStatus;
 use crate::sample::Candidate;
 use crate::skew::SkewObservation;
 use crate::util::randomize_time;
-use crate::{ids::GuardId, GuardParams, GuardRestriction, GuardUsage};
-use crate::{sample, ExternalActivity, GuardSetSelector, GuardUsageKind};
+use crate::{ExternalActivity, GuardSetSelector, GuardUsageKind, sample};
+use crate::{GuardParams, GuardRestriction, GuardUsage, ids::GuardId};
 
 #[cfg(feature = "bridge-client")]
 use safelog::Redactable as _;
@@ -296,7 +297,7 @@ impl Guard {
 
         Self::new(
             GuardId::from_relay_ids(relay),
-            relay.addrs().into(),
+            relay.addrs().collect_vec(),
             pt_target,
             added_at,
         )
@@ -435,6 +436,7 @@ impl Guard {
     }
 
     /// Change the reachability status for this guard.
+    #[allow(clippy::cognitive_complexity)]
     fn set_reachable(&mut self, r: Reachable) {
         use Reachable as R;
 
@@ -442,10 +444,17 @@ impl Guard {
             // High-level logs, if change is interesting to user.
             match (self.reachable, r) {
                 (_, R::Reachable) => info!("We have found that guard {} is usable.", self),
-                (R::Untried | R::Reachable, R::Unreachable) => warn!(
-                    "Could not connect to guard {}. We'll retry later, and let you know if it succeeds.",
-                    self
-                ),
+                (R::Untried | R::Reachable, R::Unreachable) => match self.retry_at {
+                    Some(retry_at) => warn!(
+                        "Could not connect to guard {}. Retrying in {:?}.",
+                        self,
+                        humantime::format_duration(retry_at - Instant::now()),
+                    ),
+                    None => warn!(
+                        "Could not connect to guard {}. Next retry time unknown.",
+                        self
+                    ),
+                },
                 (_, _) => {} // not interesting.
             }
             //
@@ -566,7 +575,7 @@ impl Guard {
                 sensitivity,
             }) => {
                 // Update address information.
-                self.orports = owned_target.addrs().into();
+                self.orports = owned_target.addrs().collect_vec();
                 // Update Pt information.
                 self.pt_targets = match owned_target.chan_method() {
                     #[cfg(feature = "pt-client")]
@@ -659,9 +668,6 @@ impl Guard {
     ///
     /// If `is_primary` is true, this is a primary guard (q.v.).
     pub(crate) fn record_failure(&mut self, now: Instant, is_primary: bool) {
-        self.set_reachable(Reachable::Unreachable);
-        self.exploratory_circ_pending = false;
-
         let mut rng = rand::rng();
         let retry_interval = self
             .retry_schedule
@@ -670,6 +676,9 @@ impl Guard {
 
         // TODO-SPEC: Document this behavior in guard-spec.
         self.retry_at = Some(now + retry_interval);
+
+        self.set_reachable(Reachable::Unreachable);
+        self.exploratory_circ_pending = false;
 
         self.circ_history.n_failures += 1;
     }
@@ -804,8 +813,8 @@ impl Guard {
 }
 
 impl tor_linkspec::HasAddrs for Guard {
-    fn addrs(&self) -> &[SocketAddr] {
-        &self.orports[..]
+    fn addrs(&self) -> impl Iterator<Item = SocketAddr> {
+        self.orports.iter().copied()
     }
 }
 
@@ -906,7 +915,7 @@ pub(crate) struct CircHistory {
 }
 
 impl CircHistory {
-    /// If we hae seen enough, return the fraction of circuits that have
+    /// If we have seen enough, return the fraction of circuits that have
     /// "died under mysterious circumstances".
     fn indeterminate_ratio(&self) -> Option<f64> {
         // TODO: This should probably not be hardwired
@@ -970,7 +979,10 @@ mod test {
 
         assert_eq!(g.guard_id(), &id);
         assert!(g.same_relay_ids(&FirstHopId::in_sample(GuardSetSelector::Default, id)));
-        assert_eq!(g.addrs(), &["127.0.0.7:7777".parse().unwrap()]);
+        assert_eq!(
+            g.addrs().collect_vec(),
+            &["127.0.0.7:7777".parse().unwrap()]
+        );
         assert_eq!(g.reachable(), Reachable::Untried);
         assert_eq!(g.reachable(), Reachable::default());
 
@@ -1244,14 +1256,14 @@ mod test {
         assert_eq!(guard22.listed_in(&netdir), Some(true));
         guard22.update_from_universe(&netdir);
         assert_eq!(guard22.unlisted_since, None); // It's listed.
-        assert_eq!(&guard22.orports, relay22.addrs()); // Addrs are set.
+        assert_eq!(guard22.orports, relay22.addrs().collect_vec()); // Addrs are set.
         assert_eq!(guard22.listed_in(&netdir2), Some(false));
         guard22.update_from_universe(&netdir2);
         assert_eq!(
             guard22.unlisted_since,
             Some(netdir2.lifetime().valid_after())
         );
-        assert_eq!(&guard22.orports, relay22.addrs()); // Addrs still set.
+        assert_eq!(guard22.orports, relay22.addrs().collect_vec()); // Addrs still set.
         assert!(!guard22.dir_info_missing);
 
         // Now see what happens for a guard that's in the consensus, but missing an MD.

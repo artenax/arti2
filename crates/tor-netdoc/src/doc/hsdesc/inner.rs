@@ -7,19 +7,19 @@ use crate::batching_split_before::IteratorExt as _;
 use crate::doc::hsdesc::pow::PowParamSet;
 use crate::parse::tokenize::{ItemResult, NetDocReader};
 use crate::parse::{keyword::Keyword, parser::SectionRules};
-use crate::types::misc::{UnvalidatedEdCert, B64};
+use crate::types::misc::{B64, UnvalidatedEdCert};
 use crate::{NetdocErrorKind as EK, Result};
 
 use itertools::Itertools as _;
-use once_cell::sync::Lazy;
 use smallvec::SmallVec;
+use std::sync::LazyLock;
+use tor_checkable::Timebound;
 use tor_checkable::signed::SignatureGated;
 use tor_checkable::timed::TimerangeBound;
-use tor_checkable::Timebound;
-use tor_hscrypto::pk::{HsIntroPtSessionIdKey, HsSvcNtorKey};
 use tor_hscrypto::NUM_INTRO_POINT_MAX;
+use tor_hscrypto::pk::{HsIntroPtSessionIdKey, HsSvcNtorKey};
 use tor_llcrypto::pk::ed25519::Ed25519Identity;
-use tor_llcrypto::pk::{curve25519, ed25519, ValidatableSignature};
+use tor_llcrypto::pk::{ValidatableSignature, curve25519, ed25519};
 
 /// The contents of the inner document of an onion service descriptor.
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ decl_keyword! {
 
 /// Rules about how keywords appear in the header part of an onion service
 /// descriptor.
-static HS_INNER_HEADER_RULES: Lazy<SectionRules<HsInnerKwd>> = Lazy::new(|| {
+static HS_INNER_HEADER_RULES: LazyLock<SectionRules<HsInnerKwd>> = LazyLock::new(|| {
     use HsInnerKwd::*;
 
     let mut rules = SectionRules::builder();
@@ -78,7 +78,7 @@ static HS_INNER_HEADER_RULES: Lazy<SectionRules<HsInnerKwd>> = Lazy::new(|| {
 
 /// Rules about how keywords appear in each introduction-point section of an
 /// onion service descriptor.
-static HS_INNER_INTRO_RULES: Lazy<SectionRules<HsInnerKwd>> = Lazy::new(|| {
+static HS_INNER_INTRO_RULES: LazyLock<SectionRules<HsInnerKwd>> = LazyLock::new(|| {
     use HsInnerKwd::*;
 
     let mut rules = SectionRules::builder();
@@ -496,7 +496,8 @@ mod test {
                 .1,
         );
         for n in NUM_INTRO_POINT_MAX..NUM_INTRO_POINT_MAX + 2 {
-            let many = chain!(iter::once(&*none), iter::repeat(&*ipt).take(n),).collect::<String>();
+            let many =
+                chain!(iter::once(&*none), std::iter::repeat_n(&*ipt, n),).collect::<String>();
             let desc = HsDescInner::parse(&many).unwrap();
             let desc = desc
                 .1

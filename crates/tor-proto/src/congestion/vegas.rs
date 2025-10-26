@@ -5,8 +5,9 @@
 //! Spec: prop324 section 3.3 (TOR_VEGAS)
 
 use super::{
-    params::VegasParams, rtt::RoundtripTimeEstimator, CongestionControlAlgorithm,
-    CongestionSignals, CongestionWindow, State,
+    CongestionControlAlgorithm, CongestionSignals, CongestionWindow, State,
+    params::{Algorithm, VegasParams},
+    rtt::RoundtripTimeEstimator,
 };
 use crate::Result;
 
@@ -54,10 +55,12 @@ impl BdpEstimator {
             // higher than the current cwnd, it will underestimate it.
             //
             // To clarify this is equivalent to: cwnd * min_rtt / ewma_rtt.
+            let min_rtt_usec = rtt.min_rtt_usec().unwrap_or(u32::MAX);
+            let ewma_rtt_usec = rtt.ewma_rtt_usec().unwrap_or(u32::MAX);
             self.bdp = cwnd
                 .get()
-                .saturating_mul(rtt.min_rtt_usec())
-                .saturating_div(rtt.ewma_rtt_usec());
+                .saturating_mul(min_rtt_usec)
+                .saturating_div(ewma_rtt_usec);
         }
     }
 }
@@ -100,9 +103,9 @@ pub(crate) struct Vegas {
 
 impl Vegas {
     /// Create a new [`Vegas`] from the specified parameters, state, and cwnd.
-    pub(crate) fn new(params: &VegasParams, state: &State, cwnd: CongestionWindow) -> Self {
+    pub(crate) fn new(params: VegasParams, state: &State, cwnd: CongestionWindow) -> Self {
         Self {
-            params: params.clone(),
+            params,
             bdp: BdpEstimator::default(),
             num_cell_until_sendme: cwnd.sendme_inc(),
             num_inflight: 0,
@@ -115,6 +118,15 @@ impl Vegas {
 }
 
 impl CongestionControlAlgorithm for Vegas {
+    fn uses_stream_sendme(&self) -> bool {
+        // Not allowed as in Vegas doesn't need them.
+        false
+    }
+
+    fn uses_xon_xoff(&self) -> bool {
+        true
+    }
+
     fn is_next_cell_sendme(&self) -> bool {
         // Matching inflight number to the SENDME increment, time to send a SENDME. Contrary to
         // C-tor, this is called after num_inflight is incremented.
@@ -300,14 +312,22 @@ impl CongestionControlAlgorithm for Vegas {
         Ok(())
     }
 
+    #[cfg(feature = "conflux")]
+    fn inflight(&self) -> Option<u32> {
+        Some(self.num_inflight)
+    }
+
     #[cfg(test)]
     fn send_window(&self) -> u32 {
         self.cwnd.get()
     }
+
+    fn algorithm(&self) -> Algorithm {
+        Algorithm::Vegas(self.params)
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::print_stderr)]
 pub(crate) mod test {
     // @@ begin test lint list maintained by maint/add_warning @@
     #![allow(clippy::bool_assert_comparison)]
@@ -402,7 +422,7 @@ pub(crate) mod test {
             Self {
                 params,
                 rtt: new_rtt_estimator(),
-                vegas: Vegas::new(&build_vegas_params(), &state, new_cwnd()),
+                vegas: Vegas::new(build_vegas_params(), &state, new_cwnd()),
                 state,
             }
         }
@@ -429,8 +449,8 @@ pub(crate) mod test {
                 .sendme_received(&mut self.state, &mut self.rtt, signals);
             assert!(ret.is_ok());
 
-            assert_eq!(self.rtt.ewma_rtt_usec(), p.ewma_rtt_usec_out);
-            assert_eq!(self.rtt.min_rtt_usec(), p.min_rtt_usec_out);
+            assert_eq!(self.rtt.ewma_rtt_usec().unwrap(), p.ewma_rtt_usec_out);
+            assert_eq!(self.rtt.min_rtt_usec().unwrap(), p.min_rtt_usec_out);
             assert_eq!(self.vegas.cwnd().expect("No CWND").get(), p.cwnd_out);
             assert_eq!(
                 self.vegas.cwnd().expect("No CWND").is_full(),

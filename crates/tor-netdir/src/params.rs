@@ -26,7 +26,7 @@ use tor_units::{
 /// Upper limit for channel padding timeouts
 ///
 /// This is just a safety catch which might help prevent integer overflow,
-/// and also might prevent a client getting permantently stuck in a state
+/// and also might prevent a client getting permanently stuck in a state
 /// where it ought to send padding but never does.
 ///
 /// The actual value is stolen from C Tor as per
@@ -43,46 +43,110 @@ pub trait FromInt32Saturating {
     /// valid.  If `val` is too high, treat it as the highest value that
     /// would be valid.
     fn from_saturating(val: i32) -> Self;
+
+    /// Try to construct an instance of this object from `val`.
+    ///
+    /// If `val` is out of range, return an error instead.
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized;
 }
 
 impl FromInt32Saturating for i32 {
     fn from_saturating(val: i32) -> Self {
         val
     }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(val)
+    }
 }
 impl<const L: i32, const H: i32> FromInt32Saturating for BoundedInt32<L, H> {
     fn from_saturating(val: i32) -> Self {
         Self::saturating_new(val)
+    }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Self::checked_new(val)
     }
 }
 impl<T: Copy + Into<f64> + FromInt32Saturating> FromInt32Saturating for Percentage<T> {
     fn from_saturating(val: i32) -> Self {
         Self::new(T::from_saturating(val))
     }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(T::from_checked(val)?))
+    }
 }
 impl<T: FromInt32Saturating + TryInto<u64>> FromInt32Saturating for IntegerMilliseconds<T> {
     fn from_saturating(val: i32) -> Self {
         Self::new(T::from_saturating(val))
+    }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(T::from_checked(val)?))
     }
 }
 impl<T: FromInt32Saturating + TryInto<u64>> FromInt32Saturating for IntegerSeconds<T> {
     fn from_saturating(val: i32) -> Self {
         Self::new(T::from_saturating(val))
     }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(T::from_checked(val)?))
+    }
 }
 impl<T: FromInt32Saturating + TryInto<u64>> FromInt32Saturating for IntegerMinutes<T> {
     fn from_saturating(val: i32) -> Self {
         Self::new(T::from_saturating(val))
+    }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(T::from_checked(val)?))
     }
 }
 impl<T: FromInt32Saturating + TryInto<u64>> FromInt32Saturating for IntegerDays<T> {
     fn from_saturating(val: i32) -> Self {
         Self::new(T::from_saturating(val))
     }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        Ok(Self::new(T::from_checked(val)?))
+    }
 }
 impl FromInt32Saturating for SendMeVersion {
     fn from_saturating(val: i32) -> Self {
         Self::new(val.clamp(0, 255) as u8)
+    }
+
+    fn from_checked(val: i32) -> Result<Self, tor_units::Error>
+    where
+        Self: Sized,
+    {
+        let val = BoundedInt32::<0, 255>::checked_new(val)?;
+        Ok(Self::new(val.get() as u8))
     }
 }
 
@@ -129,7 +193,13 @@ macro_rules! declare_net_parameters {
                 match key {
                     $( $p_string => self.$p_name = {
                         type T = $p_type;
-                        T::from_saturating(val)
+                        match T::from_checked(val) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("For key {key}, clamping out of range value: {e:?}");
+                                T::from_saturating(val)
+                            }
+                        }
                     }, )*
                     _ => return false,
                 }
@@ -199,11 +269,7 @@ pub struct NetParameters {
 
     /// Specifies which congestion control algorithm clients should use.
     /// Current values are 0 for the fixed window algorithm and 2 for Vegas.
-    ///
-    /// TODO: Flip this to 2 once CC circuit negotiation and Flow Control is in which would be the
-    /// same default as C-tor. Reason is that we can't have it to 2 for now else it makes the
-    /// consensus download fails.
-    pub cc_alg: BoundedInt32<0, 2> = (0)
+    pub cc_alg: BoundedInt32<0, 2> = (2)
         from "cc_alg",
 
     /// Vegas only. This parameter defines the integer number of 'cc_sendme_inc' multiples
@@ -297,6 +363,39 @@ pub struct NetParameters {
     /// congestion window increments are reduced. The MAX disables RFC3742.
     pub cc_vegas_sscap_onion: BoundedInt32<100, { i32::MAX }> = (475)
         from "cc_sscap_onion",
+
+    // Stream flow control parameters.
+    // TODO: There is a `circwindow` for circuit flow control, but is there a similar package window
+    // parameter for pre-cc stream flow control?
+
+    /// The outbuf length, in relay cell multiples, before we send an XOFF.
+    /// Used by clients (including onion services).
+    ///
+    /// See prop 324.
+    pub cc_xoff_client: BoundedInt32<1, 10_000> = (500)
+        from "cc_xoff_client",
+    /// The outbuf length, in relay cell multiples, before we send an XOFF.
+    /// Used by exits.
+    ///
+    /// See prop 324.
+    pub cc_xoff_exit: BoundedInt32<1, 10_000> = (500)
+        from "cc_xoff_exit",
+    /// Specifies how many full packed cells of bytes must arrive before we can compute a rate,
+    /// as well as how often we can send XONs.
+    ///
+    /// See prop 324.
+    pub cc_xon_rate: BoundedInt32<1, 5000> = (500)
+        from "cc_xon_rate",
+    /// Specifies how much the edge drain rate can change before we send another advisory cell.
+    ///
+    /// See prop 324.
+    pub cc_xon_change_pct: BoundedInt32<1, 99> = (25)
+        from "cc_xon_change_pct",
+    /// Specifies the `N` in the `N_EWMA` of rates.
+    ///
+    /// See prop 324.
+    pub cc_xon_ewma_cnt: BoundedInt32<2, 100> = (2)
+        from "cc_xon_ewma_cnt",
 
     /// The maximum cell window size?
     pub circuit_window: BoundedInt32<100, 1000> = (1_000)
@@ -438,12 +537,22 @@ pub struct NetParameters {
     pub hs_intro_num_extra_intropoints: BoundedInt32<0, 128> = (2)
         from "hs_intro_num_extra",
 
+    /// Largest number of allowable relay cells received
+    /// in reply to an hsdir download attempt.
+    pub hsdir_dl_max_reply_cells: BoundedInt32<2, 2304> = (110)
+        from "hsdir_dl_max_reply_cells",
+
+    /// Largest number of allowable relay cells received
+    /// in reply to an hsdir upload attempt.
+    pub hsdir_ul_max_reply_cells: BoundedInt32<2, 1024> = (8)
+        from "hsdir_ul_max_reply_cells",
+
     /// The duration of a time period, as used in the onion service directory
     /// protocol.
     ///
     /// During each "time period", each onion service gets a different blinded
     /// ID, and the hash ring gets a new layout.
-    pub hsdir_timeperiod_length: IntegerMinutes<BoundedInt32<30, 14400>> = (1440)
+    pub hsdir_timeperiod_length: IntegerMinutes<BoundedInt32<5, 14400>> = (1440)
         from "hsdir_interval",
 
     /// The number of positions at the hash ring where an onion service
@@ -492,6 +601,30 @@ pub struct NetParameters {
     /// <https://spec.torproject.org/param-spec.html#HiddenServiceEnableIntroDoSRatePerSec>
     pub hs_intro_dos_rate: BoundedInt32<0, {i32::MAX}> = (25)
         from  "HiddenServiceEnableIntroDoSRatePerSec",
+
+    /// Maximum Proof-of-Work V1 effort clients should send. Services will cap higher efforts to
+    /// this value.
+    ///
+    /// See
+    /// <https://spec.torproject.org/proposals/362-update-pow-control-loop.html>
+    // TODO POW: Make u32, or change spec.
+    pub hs_pow_v1_max_effort: BoundedInt32<0, {i32::MAX}> = (10_000)
+        from "HiddenServiceProofOfWorkV1MaxEffort",
+
+    /// The maximum age for items in the onion service intro queue, when Proof-of-Work V1 is
+    /// enabled.
+    ///
+    /// See
+    /// <https://spec.torproject.org/proposals/362-update-pow-control-loop.html>
+    pub hs_pow_v1_service_intro_timeout: IntegerSeconds<BoundedInt32<1, {i32::MAX}>> = (300)
+        from "HiddenServiceProofOfWorkV1ServiceIntroTimeoutSeconds",
+
+    /// The default Proof-of-Work V1 decay adjustment value.
+    ///
+    /// See
+    /// <https://spec.torproject.org/proposals/362-update-pow-control-loop.html>
+    pub hs_pow_v1_default_decay_adjustment: Percentage<BoundedInt32<0, 99>> = (0)
+        from "HiddenServiceProofOfWorkV1ServiceDefaultDecayAdjustment",
 
     /// The type of vanguards to use by default when building onion service circuits:
     ///
@@ -622,7 +755,10 @@ impl NetParameters {
     /// Unrecognized parameters are ignored.
     pub fn from_map(p: &tor_netdoc::doc::netstatus::NetParams<i32>) -> Self {
         let mut params = NetParameters::default();
-        let _ = params.saturating_update(p.iter());
+        let unrecognized = params.saturating_update(p.iter());
+        for u in unrecognized {
+            tracing::debug!("Ignored unrecognized net param: {u}");
+        }
         params
     }
 
@@ -649,7 +785,6 @@ impl NetParameters {
 
 #[cfg(test)]
 #[allow(clippy::many_single_char_names)]
-#[allow(clippy::unwrap_used)]
 #[allow(clippy::cognitive_complexity)]
 mod test {
     // @@ begin test lint list maintained by maint/add_warning @@
@@ -787,9 +922,6 @@ mod test {
     }
 
     #[test]
-    // TODO remove when this upstream bug is fixed
-    ///  https://github.com/rust-lang/rust-clippy/issues/11764
-    #[allow(clippy::map_identity)]
     fn all_parameters() {
         use std::time::Duration;
         let mut p = NetParameters::default();

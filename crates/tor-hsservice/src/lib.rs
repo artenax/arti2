@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 // TODO #1645 (either remove this, or decide to have it everywhere)
@@ -63,6 +64,7 @@ mod ipt_lid;
 mod ipt_mgr;
 mod ipt_set;
 mod keys;
+mod pow;
 mod publish;
 mod rend_handshake;
 mod replay;
@@ -88,6 +90,8 @@ pub mod time_store_for_doctests_unstable_no_semver_guarantees {
     pub use crate::time_store::*;
 }
 
+use std::pin::Pin;
+
 use internal_prelude::*;
 
 // ---------- public exports ----------
@@ -96,16 +100,22 @@ pub use anon_level::Anonymity;
 pub use config::OnionServiceConfig;
 pub use err::{ClientError, EstablishSessionError, FatalError, IntroRequestError, StartupError};
 pub use ipt_mgr::IptError;
+use keys::HsTimePeriodKeySpecifier;
 pub use keys::{
     BlindIdKeypairSpecifier, BlindIdPublicKeySpecifier, DescSigningKeypairSpecifier,
     HsIdKeypairSpecifier, HsIdPublicKeySpecifier,
 };
+use pow::{NewPowManager, PowManager};
 pub use publish::UploadError as DescUploadError;
 pub use req::{RendRequest, StreamRequest};
 pub use tor_hscrypto::pk::HsId;
+use tor_keymgr::KeystoreEntry;
 pub use tor_persist::hsnickname::{HsNickname, InvalidNickname};
 
 pub use helpers::handle_rend_requests;
+
+#[cfg(feature = "onion-service-cli-extra")]
+use tor_netdir::NetDir;
 
 //---------- top-level service implementation (types and methods) ----------
 
@@ -120,8 +130,9 @@ pub(crate) type NtorPublicKey = curve25519::PublicKey;
 
 /// A handle to a running instance of an onion service.
 //
-// TODO (#1228): Write more.
-// TODO (#1247): Choose a better name for this struct
+/// To construct a `RunningOnionService`, use [`OnionServiceBuilder`]
+/// to build an [`OnionService`], and then call its
+/// [``.launch()``](OnionService::launch) method.
 //
 // (APIs should return Arc<OnionService>)
 #[must_use = "a hidden service object will terminate the service when dropped"]
@@ -147,8 +158,9 @@ struct SvcInner {
     status_tx: StatusSender,
 
     /// Handles that we'll take ownership of when launching the service.
+    #[allow(clippy::type_complexity)]
     unlaunched: Option<(
-        mpsc::Receiver<RendRequest>,
+        Pin<Box<dyn Stream<Item = RendRequest> + Send + Sync>>,
         Box<dyn Launchable + Send + Sync>,
     )>,
 }
@@ -173,6 +185,9 @@ struct ForLaunch<R: Runtime> {
     ///
     ///
     ipt_mgr_view: IptsManagerView,
+
+    /// Proof-of-work manager.
+    pow_manager: Arc<PowManager<R>>,
 }
 
 /// Private trait used to type-erase `ForLaunch<R>`, so that we don't need to
@@ -186,6 +201,7 @@ impl<R: Runtime> Launchable for ForLaunch<R> {
     fn launch(self: Box<Self>) -> Result<(), StartupError> {
         self.ipt_mgr.launch_background_tasks(self.ipt_mgr_view)?;
         self.publisher.launch()?;
+        self.pow_manager.launch()?;
 
         Ok(())
     }
@@ -209,7 +225,7 @@ impl From<oneshot::Canceled> for ShutdownStatus {
     }
 }
 
-/// A handle to an instance of an onion service, which may or may not be running.
+/// A handle to an instance of an onion service.
 ///
 /// To construct an `OnionService`, use [`OnionServiceBuilder`].
 /// It will not start handling requests until you call its
@@ -292,17 +308,35 @@ impl OnionService {
             .storage_handle("iptpub")
             .map_err(StartupError::StateDirectoryInaccessible)?;
 
-        // If the HS implementation is stalled somehow, this is a local problem.
-        // We shouldn't kill the HS even if this is the oldest data in the system.
-        let (rend_req_tx, rend_req_rx) = mpsc_channel_no_memquota(32);
+        let status_tx = StatusSender::new(OnionServiceStatus::new_shutdown());
+        let (config_tx, config_rx) = postage::watch::channel_with(Arc::new(config));
+
+        let pow_manager_storage_handle = state_handle
+            .storage_handle("pow_manager")
+            .map_err(StartupError::StateDirectoryInaccessible)?;
+        let pow_nonce_dir = state_handle
+            .raw_subdir("pow_nonces")
+            .map_err(StartupError::StateDirectoryInaccessible)?;
+        let NewPowManager {
+            pow_manager,
+            rend_req_tx,
+            rend_req_rx,
+            publisher_update_rx,
+        } = PowManager::new(
+            runtime.clone(),
+            nickname.clone(),
+            pow_nonce_dir,
+            keymgr.clone(),
+            pow_manager_storage_handle,
+            netdir_provider.clone(),
+            status_tx.clone().into(),
+            config_rx.clone(),
+        )?;
 
         let (shutdown_tx, shutdown_rx) = broadcast::channel(0);
-        let (config_tx, config_rx) = postage::watch::channel_with(Arc::new(config));
 
         let (ipt_mgr_view, publisher_view) =
             crate::ipt_set::ipts_channel(&runtime, iptpub_storage_handle)?;
-
-        let status_tx = StatusSender::new(OnionServiceStatus::new_shutdown());
 
         let ipt_mgr = IptManager::new(
             runtime.clone(),
@@ -329,6 +363,8 @@ impl OnionService {
             status_tx.clone().into(),
             Arc::clone(&keymgr),
             path_resolver,
+            pow_manager.clone(),
+            publisher_update_rx,
         );
 
         let svc = Arc::new(RunningOnionService {
@@ -344,6 +380,7 @@ impl OnionService {
                         publisher,
                         ipt_mgr,
                         ipt_mgr_view,
+                        pow_manager,
                     }),
                 )),
             }),
@@ -397,6 +434,22 @@ impl OnionService {
         let offline_hsid = false;
 
         maybe_generate_hsid(&self.keymgr, &self.config.nickname, offline_hsid, selector)
+    }
+
+    /// List the no-longer-relevant keys of this service.
+    ///
+    /// Returns the [`KeystoreEntry`]s associated with time periods that are not
+    /// "relevant" according to the specified [`NetDir`],
+    /// (i.e. the keys associated with time periods
+    /// the service is not publishing descriptors for).
+    // TODO: unittest
+    #[cfg(feature = "onion-service-cli-extra")]
+    pub fn list_expired_keys(&self, netdir: &NetDir) -> tor_keymgr::Result<Vec<KeystoreEntry>> {
+        list_expired_keys_for_service(
+            &netdir.hs_all_time_periods(),
+            self.config.nickname(),
+            &self.keymgr,
+        )
     }
 }
 
@@ -462,7 +515,7 @@ impl RunningOnionService {
     ///
     /// You can turn the resulting stream into a stream of [`StreamRequest`]
     /// using the [`handle_rend_requests`] helper function.
-    fn launch(self: &Arc<Self>) -> Result<impl Stream<Item = RendRequest>, StartupError> {
+    fn launch(self: &Arc<Self>) -> Result<impl Stream<Item = RendRequest> + use<>, StartupError> {
         let (rend_req_rx, launch) = {
             let mut inner = self.inner.lock().expect("poisoned lock");
             inner
@@ -540,7 +593,7 @@ fn maybe_generate_hsid(
             cause,
         })?;
 
-    let mut rng = rand::rng();
+    let mut rng = tor_llcrypto::rng::CautiousRng;
     let (hsid, generated) = match kp {
         Some(kp) => (kp.id(), false),
         None => {
@@ -562,14 +615,14 @@ fn maybe_generate_hsid(
     if generated {
         info!(
             "Generated a new identity for service {nickname}: {}",
-            sensitive(hsid)
+            hsid.display_redacted()
         );
     } else {
         // TODO: We may want to downgrade this to trace once we have a CLI
         // for extracting it.
         info!(
             "Using existing identity for service {nickname}: {}",
-            sensitive(hsid)
+            hsid.display_redacted()
         );
     }
 
@@ -596,6 +649,71 @@ fn onion_address(keymgr: &KeyMgr, nickname: &HsNickname) -> Option<HsId> {
         .map(|hsid| hsid.id())
 }
 
+/// Return a list of the protocols[supported](tor_protover::doc_supported)
+/// by this crate, running as a hidden service.
+pub fn supported_hsservice_protocols() -> tor_protover::Protocols {
+    use tor_protover::named::*;
+    // WARNING: REMOVING ELEMENTS FROM THIS LIST CAN BE DANGEROUS!
+    // SEE [`tor_protover::doc_changing`]
+    [
+        //
+        HSINTRO_V3,
+        HSINTRO_RATELIM,
+        HSREND_V3,
+        HSDIR_V3,
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Returns all the keys (as [`KeystoreEntry`]) of the service
+/// identified by `nickname` that are expired according to the
+/// provided [`HsDirParams`].
+fn list_expired_keys_for_service<'a>(
+    relevant_periods: &[HsDirParams],
+    nickname: &HsNickname,
+    keymgr: &'a KeyMgr,
+) -> tor_keymgr::Result<Vec<KeystoreEntry<'a>>> {
+    let arti_pat = tor_keymgr::KeyPathPattern::Arti(format!("hss/{}/*", nickname));
+    let possibly_relevant_keys = keymgr.list_matching(&arti_pat)?;
+    let mut expired_keys = Vec::new();
+
+    for entry in possibly_relevant_keys {
+        let key_path = entry.key_path();
+        let mut append_if_expired = |spec: &dyn HsTimePeriodKeySpecifier| {
+            if spec.nickname() != nickname {
+                return Err(internal!(
+                    "keymgr gave us key {spec:?} that doesn't match our pattern {arti_pat:?}"
+                )
+                .into());
+            }
+            let is_expired = relevant_periods
+                .iter()
+                .all(|p| &p.time_period() != spec.period());
+
+            if is_expired {
+                expired_keys.push(entry.clone());
+            }
+
+            tor_keymgr::Result::Ok(())
+        };
+
+        macro_rules! append_if_expired {
+            ($K:ty) => {{
+                if let Ok(spec) = <$K>::try_from(key_path) {
+                    append_if_expired(&spec)?;
+                }
+            }};
+        }
+
+        append_if_expired!(BlindIdPublicKeySpecifier);
+        append_if_expired!(BlindIdKeypairSpecifier);
+        append_if_expired!(DescSigningKeypairSpecifier);
+    }
+
+    Ok(expired_keys)
+}
+
 #[cfg(test)]
 pub(crate) mod test {
     // @@ begin test lint list maintained by maint/add_warning @@
@@ -617,7 +735,7 @@ pub(crate) mod test {
     use std::path::Path;
 
     use fs_mistrust::Mistrust;
-    use test_temp_dir::{test_temp_dir, TestTempDir, TestTempDirGuard};
+    use test_temp_dir::{TestTempDir, TestTempDirGuard, test_temp_dir};
 
     use tor_basic_utils::test_rng::testing_rng;
     use tor_keymgr::{ArtiNativeKeystore, KeyMgrBuilder};
@@ -630,6 +748,13 @@ pub(crate) mod test {
 
     /// The nickname of the test service.
     const TEST_SVC_NICKNAME: &str = "test-svc";
+
+    #[test]
+    fn protocols() {
+        let pr = supported_hsservice_protocols();
+        let expected = "HSIntro=4-5 HSRend=2 HSDir=2".parse().unwrap();
+        assert_eq!(pr, expected);
+    }
 
     /// Make a fresh `KeyMgr` (containing no keys) using files in `temp_dir`
     pub(crate) fn create_keymgr(temp_dir: &TestTempDir) -> TestTempDirGuard<Arc<KeyMgr>> {
@@ -790,13 +915,15 @@ pub(crate) mod test {
             .insert(hsid_public, &pub_hsid_spec, KeystoreSelector::Primary, true)
             .unwrap();
 
-        assert!(maybe_generate_hsid(
-            &keymgr,
-            &nickname,
-            false, /* offline_hsid */
-            Default::default()
-        )
-        .is_err());
+        assert!(
+            maybe_generate_hsid(
+                &keymgr,
+                &nickname,
+                false, /* offline_hsid */
+                Default::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]

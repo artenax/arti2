@@ -12,9 +12,8 @@
 //! For more information on the exact algorithms and their rationales,
 //! see [`path-spec.txt`](https://gitlab.torproject.org/tpo/core/torspec/-/blob/master/path-spec.txt).
 
-use bounded_vec_deque::BoundedVecDeque;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 use tor_netdir::params::NetParameters;
 
@@ -48,15 +47,14 @@ impl MsecDuration {
     }
 }
 
-/// Module to hold calls to const_assert.
+/// Module to hold const assertions.
 ///
 /// This is a separate module so we can change the clippy warnings on it.
 #[allow(clippy::checked_conversions)]
 mod assertion {
-    use static_assertions::const_assert;
     // If this assertion is untrue, then we can't safely use u16 fields in
     // time_histogram.
-    const_assert!(super::TIME_HISTORY_LEN <= u16::MAX as usize);
+    const _: () = assert!(super::TIME_HISTORY_LEN <= u16::MAX as usize);
 }
 
 /// A history of circuit timeout observations, used to estimate our
@@ -68,7 +66,7 @@ struct History {
     /// For the purpose of this estimator, a circuit counts as
     /// "constructed" when a certain "significant" hop (typically the third)
     /// is completed.
-    time_history: BoundedVecDeque<MsecDuration>,
+    time_history: BoundedDeque<MsecDuration>,
 
     /// A histogram representation of the values in [`History::time_history`].
     ///
@@ -83,16 +81,16 @@ struct History {
     /// Each `true` value represents a successfully completed circuit
     /// (all hops).  Each `false` value represents a circuit that
     /// timed out after having completed at least one hop.
-    success_history: BoundedVecDeque<bool>,
+    success_history: BoundedDeque<bool>,
 }
 
 impl History {
     /// Initialize a new empty `History` with no observations.
     fn new_empty() -> Self {
         History {
-            time_history: BoundedVecDeque::new(TIME_HISTORY_LEN),
+            time_history: BoundedDeque::new(TIME_HISTORY_LEN),
             time_histogram: BTreeMap::new(),
-            success_history: BoundedVecDeque::new(SUCCESS_HISTORY_DEFAULT_LEN),
+            success_history: BoundedDeque::new(SUCCESS_HISTORY_DEFAULT_LEN),
         }
     }
 
@@ -106,10 +104,6 @@ impl History {
     /// Change the number of successes to record in our success
     /// history to `n`.
     fn set_success_history_len(&mut self, n: usize) {
-        if n < self.success_history.len() {
-            self.success_history
-                .drain(0..(self.success_history.len() - n));
-        }
         self.success_history.set_max_len(n);
     }
 
@@ -117,6 +111,12 @@ impl History {
     /// our time history to `n`.
     ///
     /// This is a testing-only function.
+    ///
+    /// # Limitations
+    ///
+    /// This method doesn't update time_histogram based on removed entries.
+    /// That doesn't matter for the tests that use it,
+    /// but if we ever try to use it in production, we'll need to fix that.
     #[cfg(test)]
     fn set_time_history_len(&mut self, n: usize) {
         self.time_history.set_max_len(n);
@@ -136,7 +136,6 @@ impl History {
         I: Iterator<Item = (MsecDuration, u16)>,
     {
         use rand::seq::{IteratorRandom, SliceRandom};
-        use std::iter;
         let mut rng = rand::rng();
 
         // We want to build a vector with the elements of the old histogram in
@@ -144,9 +143,9 @@ impl History {
         // that would take too much RAM.
         let mut observations = iter
             .take(TIME_HISTORY_LEN) // limit number of bins
-            .flat_map(|(dur, n)| iter::repeat(dur).take(n as usize))
+            .flat_map(|(dur, n)| std::iter::repeat_n(dur, n as usize))
             .choose_multiple(&mut rng, TIME_HISTORY_LEN);
-        // choose_multiple doesn't guarantee anything about the order of its output.
+        // IteratorRand::choose_multiple doesn't guarantee anything about the order of its output.
         observations.shuffle(&mut rng);
 
         let mut result = History::new_empty();
@@ -571,6 +570,7 @@ impl super::TimeoutEstimator for ParetoTimeoutEstimator {
             self.timeouts.take();
         }
         if is_last {
+            tracing::trace!(%hop, ?delay, "Circuit creation success");
             self.history.add_success(true);
         }
     }
@@ -591,6 +591,7 @@ impl super::TimeoutEstimator for ParetoTimeoutEstimator {
         if hop > 0 && have_seen_recent_activity {
             self.history.add_success(false);
             if self.history.n_recent_timeouts() > self.p.reset_after_timeouts {
+                tracing::debug!("Multiple connections failed, resetting timeouts...");
                 let base_timeouts = self.base_timeouts();
                 self.history.clear();
                 self.timeouts.take();
@@ -638,7 +639,7 @@ impl super::TimeoutEstimator for ParetoTimeoutEstimator {
     }
 
     fn learning_timeouts(&self) -> bool {
-        self.p.use_estimates && self.history.n_times() < self.p.min_observations.into()
+        self.p.use_estimates && self.history.n_times() < usize::from(self.p.min_observations)
     }
 
     fn build_state(&mut self) -> Option<ParetoTimeoutState> {
@@ -649,6 +650,74 @@ impl super::TimeoutEstimator for ParetoTimeoutEstimator {
             current_timeout: Some(cur_timeout),
             unknown_fields: Default::default(),
         })
+    }
+}
+
+/// A wrapper around `VecDeque<T>` that prevents more a certain number of entries from being inserted.
+#[derive(Clone, Debug)]
+struct BoundedDeque<T> {
+    /// The underlying `VecDeque`.
+    ///
+    /// We could use a `SmallVec` or an array instead,
+    /// but that would require reimplementing more of `VecDeque`.
+    inner: VecDeque<T>,
+
+    /// The maximum number of elements to permit.
+    limit: usize,
+}
+impl<T> BoundedDeque<T> {
+    /// Construct a new empty `BoundedDeque`, limited to `limit` entries.
+    fn new(limit: usize) -> Self {
+        Self {
+            inner: VecDeque::with_capacity(limit),
+            limit,
+        }
+    }
+
+    /// Remove every entry from this `BoundedDeque`.
+    fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    /// Return the number of entries in this `BoundedDeque`.
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Add a new entry to the back of this `BoundedDeque`.
+    ///
+    /// If the deque was at its limit, pop and return the entry at the front.
+    fn push_back(&mut self, item: T) -> Option<T> {
+        if self.limit == 0 {
+            return None;
+        }
+        let removed = if self.len() == self.limit {
+            self.inner.pop_front()
+        } else {
+            None
+        };
+        self.inner.push_back(item);
+        removed
+    }
+
+    /// Return an iterator over the entries in this `BoundedDeque`, from front to back.
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.inner.iter()
+    }
+
+    /// Replace the maximum number of observations in this `BoundedDeque`.
+    ///
+    /// Unlike the equivalent method in the old BoundedVecDeque crate,
+    /// if the new limit is smaller than the previous limit,
+    /// this method will remove the _oldest_ items from the queue
+    /// - that is, the ones from the front.
+    fn set_max_len(&mut self, new_limit: usize) {
+        if new_limit < self.limit {
+            let n_to_drain = self.inner.len().saturating_sub(new_limit);
+            self.inner.drain(0..n_to_drain);
+            self.inner.shrink_to_fit();
+        }
+        self.limit = new_limit;
     }
 }
 
@@ -669,8 +738,8 @@ mod test {
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
     use crate::timeouts::TimeoutEstimator;
-    use tor_basic_utils::test_rng::testing_rng;
     use tor_basic_utils::RngExt as _;
+    use tor_basic_utils::test_rng::testing_rng;
 
     /// Return an action to build a 3-hop circuit.
     fn b3() -> Action {
@@ -954,6 +1023,20 @@ mod test {
         let ms1 = est.timeouts(&act).0.as_millis() as i32;
         let ms2 = est2.timeouts(&act).0.as_millis() as i32;
         assert!((ms1 - ms2).abs() < 50);
+    }
+
+    #[test]
+    fn validate_iterator_choose_multiple() {
+        // The documentation for IteratorRandom::choose_multiple says that it
+        // returns fewer than N elements if the iterators has fewer than N elements.
+        // But rand has changed behavior in the past, so let's make sure this doesn't
+        // change in the future.
+        use rand::seq::IteratorRandom as _;
+        let mut rng = testing_rng();
+        let mut ten_elements = (1..=10).choose_multiple(&mut rng, 100);
+        ten_elements.sort();
+        assert_eq!(ten_elements.len(), 10);
+        assert_eq!(ten_elements, (1..=10).collect::<Vec<_>>());
     }
 
     // TODO: add tests from Tor.

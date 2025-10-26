@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,7 +41,11 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
+
+// TODO #1645 (either remove this, or decide to have it everywhere)
+#![cfg_attr(not(all(feature = "full", feature = "experimental")), allow(unused))]
 
 // TODO: write more comprehensive documentation when the API is a bit more
 // stable
@@ -50,6 +54,7 @@ mod arti_path;
 pub mod config;
 mod err;
 mod key_specifier;
+pub(crate) mod raw;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 
@@ -64,6 +69,7 @@ mod dummy;
 pub use arti_path::{ArtiPath, DENOTATOR_SEP};
 pub use err::{
     ArtiPathSyntaxError, Error, KeystoreCorruptionError, KeystoreError, UnknownKeyTypeError,
+    UnrecognizedEntry, UnrecognizedEntryError,
 };
 pub use key_specifier::{
     ArtiPathRange, ArtiPathUnavailableError, CTorPath, CTorServicePath,
@@ -71,12 +77,15 @@ pub use key_specifier::{
     KeyPathInfoBuilder, KeyPathInfoExtractor, KeyPathPattern, KeySpecifier, KeySpecifierComponent,
     KeySpecifierComponentViaDisplayFromStr, KeySpecifierPattern,
 };
+#[cfg(feature = "onion-service-cli-extra")]
+#[cfg_attr(docsrs, doc(cfg(feature = "onion-service-cli-extra")))]
+pub use raw::{RawEntryId, RawKeystoreEntry};
 
 #[cfg(feature = "keymgr")]
 #[cfg_attr(docsrs, doc(cfg(feature = "keymgr")))]
 pub use {
     keystore::arti::ArtiNativeKeystore,
-    keystore::Keystore,
+    keystore::{Keystore, KeystoreEntryResult},
     mgr::{KeyMgr, KeyMgrBuilder, KeyMgrBuilderError, KeystoreEntry},
     ssh_key,
 };

@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 use derive_more::Display;
@@ -269,6 +270,15 @@ pub enum ErrorKind {
     /// dropped, and is preventing other operations from completing.
     #[display("Tor client is shutting down.")]
     ArtiShuttingDown,
+
+    /// This Tor client software is missing some feature that is recommended
+    /// (or required) for operation on the network.
+    ///
+    /// This occurs when the directory authorities tell us that we ought to have
+    /// a particular protocol feature that we do not support.
+    /// The correct solution is likely to upgrade to a more recent version of Arti.
+    #[display("Software version is deprecated")]
+    SoftwareDeprecated,
 
     /// An operation failed because we waited too long for an exit to do
     /// something.

@@ -20,7 +20,7 @@ use arti_client::TorClientConfig;
 #[cfg(feature = "onion-service-service")]
 use tor_config::define_list_builder_accessors;
 use tor_config::resolve_alternative_specs;
-pub(crate) use tor_config::{impl_standard_builder, ConfigBuildError, Listen};
+pub(crate) use tor_config::{ConfigBuildError, Listen, impl_standard_builder};
 
 use crate::{LoggingConfig, LoggingConfigBuilder};
 
@@ -28,7 +28,7 @@ use crate::{LoggingConfig, LoggingConfigBuilder};
 ///
 /// The options in this example file are all commented out;
 /// the actual defaults are done via builder attributes in all the Rust config structs.
-pub const ARTI_EXAMPLE_CONFIG: &str = concat!(include_str!("./arti-example-config.toml"),);
+pub const ARTI_EXAMPLE_CONFIG: &str = concat!(include_str!("./arti-example-config.toml"));
 
 /// Test case file for the oldest version of the config we still support.
 ///
@@ -224,11 +224,32 @@ pub struct ArtiConfig {
     #[builder_field_attr(serde(default))]
     logging: LoggingConfig,
 
+    /// Metrics configuration
+    #[builder(sub_builder(fn_name = "build"))]
+    #[builder_field_attr(serde(default))]
+    pub(crate) metrics: MetricsConfig,
+
     /// Configuration for RPC subsystem
     #[cfg(feature = "rpc")]
     #[builder(sub_builder(fn_name = "build"))]
     #[builder_field_attr(serde(default))]
     pub(crate) rpc: RpcConfig,
+
+    /// Configuration for the RPC subsystem (disabled)
+    //
+    // This set of options allows us to detect and warn
+    // when anything is set under "rpc" in the config.
+    //
+    // The incantations are a bit subtle: we use an Option<toml::Value> in the builder,
+    // to ensure that our configuration will continue to round-trip thorough serde.
+    // We use () in the configuration type, since toml::Value isn't Eq,
+    // and since we don't want to expose whatever spurious options were in the config.
+    // We use builder(private), since using builder(setter(skip))
+    // would (apparently) override the type of the field in builder and make it a PhantomData.
+    #[cfg(not(feature = "rpc"))]
+    #[builder_field_attr(serde(default))]
+    #[builder(field(type = "Option<toml::Value>", build = "()"), private)]
+    rpc: (),
 
     /// Information on system resources used by Arti.
     ///
@@ -267,6 +288,11 @@ impl ArtiConfigBuilder {
                 .watch_configuration_mut() = config.application.watch_configuration;
         }
 
+        #[cfg(not(feature = "rpc"))]
+        if self.rpc.is_some() {
+            tracing::warn!("rpc options were set, but Arti was built without support for rpc.");
+        }
+
         Ok(config)
     }
 }
@@ -287,6 +313,38 @@ define_list_builder_accessors! {
 ///
 /// Used primarily as a type parameter on calls to [`tor_config::resolve`]
 pub type ArtiCombinedConfig = (ArtiConfig, TorClientConfig);
+
+/// Configuration for exporting metrics (eg, perf data)
+#[derive(Debug, Clone, Builder, Eq, PartialEq)]
+#[builder(build_fn(error = "ConfigBuildError"))]
+#[builder(derive(Debug, Serialize, Deserialize))]
+pub struct MetricsConfig {
+    /// Where to listen for incoming HTTP connections.
+    #[builder(sub_builder(fn_name = "build"))]
+    #[builder_field_attr(serde(default))]
+    pub(crate) prometheus: PrometheusConfig,
+}
+impl_standard_builder! { MetricsConfig }
+
+/// Configuration for one or more proxy listeners.
+#[derive(Debug, Clone, Builder, Eq, PartialEq)]
+#[builder(build_fn(error = "ConfigBuildError"))]
+#[builder(derive(Debug, Serialize, Deserialize))]
+#[allow(clippy::option_option)] // Builder port fields: Some(None) = specified to disable
+pub struct PrometheusConfig {
+    /// Port on which to establish a Prometheus scrape endpoint
+    ///
+    /// We listen here for incoming HTTP connections.
+    ///
+    /// If just a port is provided, we don't support IPv6.
+    /// Alternatively, (only) a single address and port can be specified.
+    /// These restrictions are due to upstream limitations:
+    /// <https://github.com/metrics-rs/metrics/issues/567>.
+    #[builder(default)]
+    #[builder_field_attr(serde(default))]
+    pub(crate) listen: Listen,
+}
+impl_standard_builder! { PrometheusConfig }
 
 impl ArtiConfig {
     /// Return the [`ApplicationConfig`] for this configuration.
@@ -331,9 +389,9 @@ mod test {
     // Saves adding many individual #[cfg], or a sub-module
     #![cfg_attr(not(feature = "pt-client"), allow(dead_code))]
 
-    use arti_client::config::dir;
     use arti_client::config::TorClientConfigBuilder;
-    use itertools::{chain, EitherOrBoth, Itertools};
+    use arti_client::config::dir;
+    use itertools::{EitherOrBoth, Itertools, chain};
     use regex::Regex;
     use std::collections::HashSet;
     use std::fmt::Write as _;
@@ -508,6 +566,7 @@ mod test {
                 "path_rules.long_lived_ports",
                 "proxy.socks_listen",
                 "proxy.dns_listen",
+                "use_obsolete_software",
             ],
         );
 
@@ -519,6 +578,16 @@ mod test {
                 // Examples exist but are not auto-testable
                 "tor_network.authorities",
                 "tor_network.fallback_caches",
+            ],
+        );
+
+        declare_exceptions(
+            None,
+            None,
+            Recognized,
+            &[
+                // Examples exist but are not auto-testable
+                "logging.opentelemetry",
             ],
         );
 
@@ -566,6 +635,24 @@ mod test {
                 "system.memory",
                 "system.memory.max",
                 "system.memory.low_water",
+            ],
+        );
+
+        declare_exceptions(
+            None,
+            Some(InNew), // The top-level section is in the new file (only).
+            Recognized,
+            &["metrics"],
+        );
+
+        declare_exceptions(
+            None,
+            None, // The inner information is not formatted for auto-testing
+            Recognized,
+            &[
+                // Prometheus metrics exporter, tested by fn metrics (below)
+                "metrics.prometheus",
+                "metrics.prometheus.listen",
             ],
         );
 
@@ -827,9 +914,9 @@ example config file {which:?}, uncommented={uncommented:?}
     ///   3. Either add a trivial example for the affected key(s) (starting with just `#`)
     ///      or add the affected key(s) to `declared_config_exceptions`
     fn exhaustive_1(example_file: &str, which: WhichExample, deprecated: &[String]) {
+        use InExample::*;
         use serde_json::Value as JsValue;
         use std::collections::BTreeSet;
-        use InExample::*;
 
         let example = uncomment_example_settings(example_file);
         let example: toml::Value = toml::from_str(&example).unwrap();
@@ -983,9 +1070,12 @@ example config file {which:?}, uncommented={uncommented:?}
 
         // If this assert fails, it might be because in `fn exhaustive`, below,
         // a newly-defined config item has not been added to the list for OLDEST_SUPPORTED_CONFIG.
-        assert! { problems.is_empty(),
-        "example config exhaustiveness check failed: {}\n-----8<-----\n{}\n-----8<-----\n",
-                  problems.join("\n"), example_file}
+        assert!(
+            problems.is_empty(),
+            "example config {which:?} exhaustiveness check failed: {}\n-----8<-----\n{}\n-----8<-----\n",
+            problems.join("\n"),
+            example_file,
+        );
     }
 
     #[test]
@@ -1084,7 +1174,7 @@ example config file {which:?}, uncommented={uncommented:?}
         };
 
         // [1], [2], narrow to just the nontrivial, non-default, examples
-        let mut examples = ExampleSectionLines::new("bridges");
+        let mut examples = ExampleSectionLines::from_section("bridges");
         examples.narrow((r#"^# For example:"#, true), NARROW_NONE);
 
         let compare = {
@@ -1134,20 +1224,17 @@ example config file {which:?}, uncommented={uncommented:?}
         // (They're everything from  `# An example managed pluggable transport`
         // through the start of the next
         // section.  They start with "#    ".)
-        let mut file = ExampleSectionLines::from_string(ARTI_EXAMPLE_CONFIG);
-        file.narrow(
-            (r"^# An example managed pluggable transport", true),
-            (r"^\[", false),
-        );
+        let mut file =
+            ExampleSectionLines::from_markers("# An example managed pluggable transport", "[");
         file.lines.retain(|line| line.starts_with("#    "));
-        file.strip_prefix("#    ");
+        file.uncomment();
 
         let result = file.resolve::<(TorClientConfig, ArtiConfig)>();
         let cfg_got = result.unwrap();
 
         #[cfg(feature = "pt-client")]
         {
-            use arti_client::config::{pt::TransportConfig, BridgesConfig};
+            use arti_client::config::{BridgesConfig, pt::TransportConfig};
             use tor_config_path::CfgPath;
 
             let bridges_got: &BridgesConfig = cfg_got.0.as_ref();
@@ -1178,69 +1265,72 @@ example config file {which:?}, uncommented={uncommented:?}
     fn memquota() {
         // Test that uncommenting the example generates a config
         // with tracking enabled, iff support is compiled in.
-
-        let mut file = ExampleSectionLines::from_string(ARTI_EXAMPLE_CONFIG);
-        file.narrow((r"^\[system\]", true), (r"^\[", false));
-        file.lines.retain(|line| {
-            [
-                //
-                "[",
-                "#    memory.",
-            ]
-            .iter()
-            .any(|t| line.starts_with(t))
-        });
-
-        file.strip_prefix("#    ");
+        let mut file = ExampleSectionLines::from_section("system");
+        file.lines.retain(|line| line.starts_with("#    memory."));
+        file.uncomment();
 
         let result = file.resolve_return_results::<(TorClientConfig, ArtiConfig)>();
 
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "memquota")] {
-                let result = result.unwrap();
+        let result = result.unwrap();
 
-                // Test that the example config doesn't have any unrecognised keys
-                assert_eq!(result.unrecognized, []);
-                assert_eq!(result.deprecated, []);
+        // Test that the example config doesn't have any unrecognised keys
+        assert_eq!(result.unrecognized, []);
+        assert_eq!(result.deprecated, []);
 
-                let inner: &tor_memquota::testing::ConfigInner =
-                    result.value.0.system_memory().inner().unwrap();
+        let inner: &tor_memquota::testing::ConfigInner =
+            result.value.0.system_memory().inner().unwrap();
 
-                // Test that the example low_water is the default
-                // value for the example max.
-                let defaulted_low = tor_memquota::Config::builder()
-                    .max(*inner.max)
-                    .build()
-                    .unwrap();
-                let inner_defaulted_low = defaulted_low.inner().unwrap();
-                assert_eq!(inner, inner_defaulted_low);
-            } else if #[cfg(arti_features_precise)] {
-                // Test that requesting memory quota tracking generates a config error
-                // if support is compiled out.
-                let m = result.unwrap_err().report().to_string();
-                assert!(m.contains("cargo feature `memquota` disabled"), "{m:?}");
-            } else {
-                // The `tor-memquota/memquota` feature is enabled by default in tor-memquota,
-                // but the corresponding `memquota` feature is but not enabled here in `arti`.
-                // so cargo --workspace enables it in a way we can't tell.  See arti/build.rs.
-                println!("not testing memquota config, cannot figure out if it's enabled");
-            }
-        }
+        // Test that the example low_water is the default
+        // value for the example max.
+        let defaulted_low = tor_memquota::Config::builder()
+            .max(*inner.max)
+            .build()
+            .unwrap();
+        let inner_defaulted_low = defaulted_low.inner().unwrap();
+        assert_eq!(inner, inner_defaulted_low);
+    }
+
+    #[test]
+    fn metrics() {
+        // Test that uncommenting the example generates a config with prometheus enabled.
+        let mut file = ExampleSectionLines::from_section("metrics");
+        file.lines
+            .retain(|line| line.starts_with("#    prometheus."));
+        file.uncomment();
+
+        let result = file
+            .resolve_return_results::<(TorClientConfig, ArtiConfig)>()
+            .unwrap();
+
+        // Test that the example config doesn't have any unrecognised keys
+        assert_eq!(result.unrecognized, []);
+        assert_eq!(result.deprecated, []);
+
+        // Check that the example is as we expected
+        assert_eq!(
+            result
+                .value
+                .1
+                .metrics
+                .prometheus
+                .listen
+                .single_address_legacy()
+                .unwrap(),
+            Some("127.0.0.1:9035".parse().unwrap()),
+        );
+
+        // We don't test "compiled out but not used" here.
+        // That case is handled in proxy.rs at startup time.
     }
 
     #[test]
     fn onion_services() {
-        // Here we require that the onion services configuration is between a
-        // line labeled with `#     [onion_service."allium-cepa"]` and
-        // a line that contains the start of the [vanguards] section,
-        // and that each line of _real_ configuration in that section begins with "#    ".
-        let mut file = ExampleSectionLines::from_string(ARTI_EXAMPLE_CONFIG);
-        file.narrow(
-            (r#"^#    \[onion_services."allium\-cepa"\]"#, true),
-            (r#"^\[vanguards\]"#, true),
-        );
+        // Here we require that the onion services configuration is between a line labeled
+        // with `##### ONION SERVICES` and a line labeled with `##### RPC`, and that each
+        // line of _real_ configuration in that section begins with `#    `.
+        let mut file = ExampleSectionLines::from_markers("##### ONION SERVICES", "##### RPC");
         file.lines.retain(|line| line.starts_with("#    "));
-        file.strip_prefix("#    ");
+        file.uncomment();
 
         let result = file.resolve::<(TorClientConfig, ArtiConfig)>();
         #[cfg(feature = "onion-service-service")]
@@ -1335,6 +1425,63 @@ example config file {which:?}, uncommented={uncommented:?}
         }
     }
 
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn rpc_defaults() {
+        let mut file = ExampleSectionLines::from_markers("##### RPC", "[");
+        // This will get us all the RPC entries that correspond to our defaults.
+        //
+        // The examples that _aren't_ in our defaults have '#      ' at the start.
+        file.lines
+            .retain(|line| line.starts_with("#    ") && !line.starts_with("#      "));
+        file.uncomment();
+
+        let parsed = file
+            .resolve_return_results::<(TorClientConfig, ArtiConfig)>()
+            .unwrap();
+        assert!(parsed.unrecognized.is_empty());
+        assert!(parsed.deprecated.is_empty());
+        let rpc_parsed: &RpcConfig = parsed.value.1.rpc();
+        let rpc_default = RpcConfig::default();
+        assert_eq!(rpc_parsed, &rpc_default);
+    }
+
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn rpc_full() {
+        use crate::rpc::listener::{ConnectPointOptionsBuilder, RpcListenerSetConfigBuilder};
+
+        // This will get us all the RPC entries, including those that _don't_ correspond to our defaults.
+        let mut file = ExampleSectionLines::from_markers("##### RPC", "[");
+        // We skip the "file" item because it conflicts with "dir" and "file_options"
+        file.lines
+            .retain(|line| line.starts_with("#    ") && !line.contains("file ="));
+        file.uncomment();
+
+        let parsed = file
+            .resolve_return_results::<(TorClientConfig, ArtiConfig)>()
+            .unwrap();
+        let rpc_parsed: &RpcConfig = parsed.value.1.rpc();
+
+        let expected = {
+            let mut bld_opts = ConnectPointOptionsBuilder::default();
+            bld_opts.enable(false);
+
+            let mut bld_set = RpcListenerSetConfigBuilder::default();
+            bld_set.dir(CfgPath::new("${HOME}/.my_connect_files/".to_string()));
+            bld_set.listener_options().enable(true);
+            bld_set
+                .file_options()
+                .insert("bad_file.json".to_string(), bld_opts);
+
+            let mut bld = RpcConfigBuilder::default();
+            bld.listen().insert("label".to_string(), bld_set);
+            bld.build().unwrap()
+        };
+
+        assert_eq!(&expected, rpc_parsed);
+    }
+
     /// Helper for fishing out parts of the config file and uncommenting them.
     ///
     /// It represents a part of a configuration file.
@@ -1358,31 +1505,43 @@ example config file {which:?}, uncommented={uncommented:?}
     const NARROW_NONE: NarrowInstruction<'static> = ("?<none>", false);
 
     impl ExampleSectionLines {
-        /// Construct a new ExampleSectionLines from `ARTI_EXAMPLE_CONFIG`, containing
+        /// Construct a new `ExampleSectionLines` from `ARTI_EXAMPLE_CONFIG`, containing
         /// everything that starts with `[section]`, up to but not including the
         /// next line that begins with a `[`.
-        fn new(section: &str) -> Self {
-            let section = format!("[{}]", section);
-
-            let mut first = Some(());
-            let lines = ARTI_EXAMPLE_CONFIG
-                .lines()
-                .skip_while(|l| l != &section)
-                .take_while(|l| first.take().is_some() || !l.starts_with("["))
-                .map(|l| l.to_string())
-                .collect_vec();
-
-            ExampleSectionLines { section, lines }
+        fn from_section(section: &str) -> Self {
+            Self::from_markers(format!("[{section}]"), "[")
         }
 
-        /// Construct a new ExampleSectionsLine from a provided configuration file,
-        /// without cutting out any sections.
+        /// Construct a new `ExampleSectionLines` from `ARTI_EXAMPLE_CONFIG`,
+        /// containing everything that starts with `start`, up to but not
+        /// including the next line that begins with `end`.
         ///
-        /// The caller must do any needed section selection, later.
-        fn from_string(contents: &str) -> Self {
-            let section = "".into();
-            let lines = contents.lines().map(|s| s.to_string()).collect_vec();
-            ExampleSectionLines { section, lines }
+        /// If `start` is a configuration section header it will be put in the
+        /// `section` field of the returned `ExampleSectionLines`, otherwise
+        /// at the beginning of the `lines` field.
+        ///
+        /// `start` will be perceived as a configuration section header if it
+        /// starts with `[` and ends with `]`.
+        fn from_markers<S, E>(start: S, end: E) -> Self
+        where
+            S: AsRef<str>,
+            E: AsRef<str>,
+        {
+            let (start, end) = (start.as_ref(), end.as_ref());
+            let mut lines = ARTI_EXAMPLE_CONFIG
+                .lines()
+                .skip_while(|line| !line.starts_with(start))
+                .peekable();
+            let section = lines
+                .next_if(|l0| l0.starts_with('['))
+                .map(|section| section.to_owned())
+                .unwrap_or_default();
+            let lines = lines
+                .take_while(|line| !line.starts_with(end))
+                .map(|l| l.to_owned())
+                .collect_vec();
+
+            Self { section, lines }
         }
 
         /// Remove all lines from this section, except those between the (unique) line matching
@@ -1459,7 +1618,7 @@ example config file {which:?}, uncommented={uncommented:?}
             eprintln!("parsing\n  --\n{}\n  --", &s);
             let mut sources = tor_config::ConfigurationSources::new_empty();
             sources.push_source(
-                tor_config::ConfigurationSource::from_verbatim(s.to_string()),
+                tor_config::ConfigurationSource::from_verbatim(s.clone()),
                 tor_config::sources::MustRead::MustRead,
             );
             sources.load().expect(&s)
@@ -1468,6 +1627,7 @@ example config file {which:?}, uncommented={uncommented:?}
         fn resolve<R: tor_config::load::Resolvable>(&self) -> Result<R, ConfigResolveError> {
             tor_config::load::resolve(self.parse())
         }
+
         fn resolve_return_results<R: tor_config::load::Resolvable>(
             &self,
         ) -> Result<ResolutionResults<R>, ConfigResolveError> {
@@ -1482,10 +1642,9 @@ example config file {which:?}, uncommented={uncommented:?}
         use tor_config_path::CfgPath;
         let sec = std::time::Duration::from_secs(1);
 
-        let auth = dir::Authority::builder()
-            .name("Fred")
-            .v3ident([22; 20].into())
-            .clone();
+        let mut authorities = dir::AuthorityContacts::builder();
+        authorities.v3idents().push([22; 20].into());
+
         let mut fallback = dir::FallbackDir::builder();
         fallback
             .rsa_identity([23; 20].into())
@@ -1499,7 +1658,7 @@ example config file {which:?}, uncommented={uncommented:?}
         bld.proxy().socks_listen(Listen::new_localhost(9999));
         bld.logging().console("warn");
 
-        bld_tor.tor_network().set_authorities(vec![auth]);
+        *bld_tor.tor_network().authorities() = authorities;
         bld_tor.tor_network().set_fallback_caches(vec![fallback]);
         bld_tor
             .storage()

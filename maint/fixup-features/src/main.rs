@@ -51,7 +51,7 @@
 mod changes;
 mod graph;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table, Value};
@@ -216,7 +216,7 @@ impl Crate {
             };
 
             if !graph.contains_edge("full", wanted.as_str()) {
-                w(format!("full should contain {}. Fixing.", wanted));
+                w(format!("full should contain {wanted}. Fixing."));
                 changes.push(Change::AddExternalEdge("full".to_string(), wanted));
             }
         }
@@ -236,7 +236,9 @@ impl Crate {
             }
             // Every feature that depends on `__is_experimental` is reachable from `experimental`.
             for f in is_experimental.difference(&reachable_from_experimental) {
-                w(format!("{f} is marked as __is_experimental, but is not reachable from experimental. Fixing."));
+                w(format!(
+                    "{f} is marked as __is_experimental, but is not reachable from experimental. Fixing."
+                ));
                 changes.push(Change::AddEdge("experimental".into(), f.clone()))
             }
 
@@ -406,18 +408,17 @@ fn list_crate_paths(
 
 fn main() -> Result<()> {
     let mut pargs = pico_args::Arguments::from_env();
-    const HELP: &str =
-        "fixup-features [--no-annotate] [--exclude <PREFIX1> --exclude <PREFIX2> ...] <toplevel Cargo.toml>";
+    const HELP: &str = "fixup-features [--no-annotate] [--exclude <PREFIX1> --exclude <PREFIX2> ...] <toplevel Cargo.toml>";
 
     if pargs.contains(["-h", "--help"]) {
-        println!("{}", HELP);
+        println!("{HELP}");
         return Ok(());
     }
     let no_annotate = pargs.contains("--no-annotate");
     let exclusion_prefixes: Vec<String> = pargs.values_from_str("--exclude").unwrap();
     let toplevel_toml_file: PathBuf = pargs.free_from_str()?;
     if !pargs.finish().is_empty() {
-        println!("{}", HELP);
+        println!("{HELP}");
         return Ok(());
     }
 

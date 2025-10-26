@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 pub mod details;
@@ -60,26 +61,27 @@ pub mod testprovider;
 use async_trait::async_trait;
 #[cfg(feature = "hs-service")]
 use itertools::chain;
-use static_assertions::const_assert;
+use tor_error::warn_report;
 use tor_linkspec::{
     ChanTarget, DirectChanMethodsHelper, HasAddrs, HasRelayIds, RelayIdRef, RelayIdType,
 };
 use tor_llcrypto as ll;
 use tor_llcrypto::pk::{ed25519::Ed25519Identity, rsa::RsaIdentity};
 use tor_netdoc::doc::microdesc::{MdDigest, Microdesc};
-use tor_netdoc::doc::netstatus::{self, MdConsensus, MdConsensusRouterStatus, RouterStatus};
+use tor_netdoc::doc::netstatus::{self, MdConsensus, MdRouterStatus};
 #[cfg(feature = "hs-common")]
 use {hsdir_ring::HsDirRing, std::iter};
 
 use derive_more::{From, Into};
-use futures::{stream::BoxStream, StreamExt};
+use futures::{StreamExt, stream::BoxStream};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use rand::seq::{IndexedRandom as _, SliceRandom as _};
+use rand::seq::{IndexedRandom as _, SliceRandom as _, WeightError};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::time::SystemTime;
 use strum::{EnumCount, EnumIter};
 use tracing::warn;
 use typed_index_collections::{TiSlice, TiVec};
@@ -88,7 +90,7 @@ use typed_index_collections::{TiSlice, TiVec};
 use {
     itertools::Itertools,
     std::collections::HashSet,
-    tor_error::{internal, Bug},
+    tor_error::{Bug, internal},
     tor_hscrypto::{pk::HsBlindId, time::TimePeriod},
 };
 
@@ -129,15 +131,15 @@ pub(crate) struct RouterStatusIdx(usize);
 pub(crate) trait ConsensusRelays {
     /// Obtain the list of relays in the consensus
     //
-    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdConsensusRouterStatus>;
+    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdRouterStatus>;
 }
 impl ConsensusRelays for MdConsensus {
-    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdConsensusRouterStatus> {
+    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdRouterStatus> {
         TiSlice::from_ref(MdConsensus::relays(self))
     }
 }
 impl ConsensusRelays for NetDir {
-    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdConsensusRouterStatus> {
+    fn c_relays(&self) -> &TiSlice<RouterStatusIdx, MdRouterStatus> {
         self.consensus.c_relays()
     }
 }
@@ -145,7 +147,7 @@ impl ConsensusRelays for NetDir {
 /// Configuration for determining when two relays have addresses "too close" in
 /// the network.
 ///
-/// Used by [`Relay::low_level_details().in_same_subnet()`].
+/// Used by `Relay::low_level_details().in_same_subnet()`.
 #[derive(Deserialize, Debug, Clone, Copy, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SubnetConfig {
@@ -223,9 +225,8 @@ impl SubnetConfig {
         T: tor_linkspec::HasAddrs,
         U: tor_linkspec::HasAddrs,
     {
-        a.addrs().iter().any(|aa| {
+        a.addrs().any(|aa| {
             b.addrs()
-                .iter()
                 .any(|bb| self.addrs_in_same_subnet(&aa.ip(), &bb.ip()))
         })
     }
@@ -487,7 +488,7 @@ pub(crate) struct HsDirs<D> {
     /// secondary rings will be active at a time.  We have two here in order
     /// to conform with a more flexible regime in proposal 342.
     //
-    // TODO: hs clients never need this; so I've made it not-present for thm.
+    // TODO: hs clients never need this; so I've made it not-present for them.
     // But does that risk too much with respect to side channels?
     //
     // TODO: Perhaps we should refactor this so that it is clear that these
@@ -564,6 +565,10 @@ pub enum DirEvent {
     /// (This event is _not_ broadcast when receiving new descriptors for a
     /// consensus which is not yet ready to replace the current consensus.)
     NewDescriptors,
+
+    /// We have received updated recommendations and requirements
+    /// for which subprotocols we should have to use the network.
+    NewProtocolRecommendation,
 }
 
 /// The network directory provider is shutting down without giving us the
@@ -708,6 +713,11 @@ pub trait NetDirProvider: UpcastArcNetDirProvider + Send + Sync {
             }
         }
     }
+
+    /// Return the latest set of recommended and required protocols, if there is one.
+    ///
+    /// This may be more recent (or more available) than this provider's associated NetDir.
+    fn protocol_statuses(&self) -> Option<(SystemTime, Arc<netstatus::ProtoStatuses>)>;
 }
 
 impl<T> NetDirProvider for Arc<T>
@@ -728,6 +738,10 @@ where
 
     fn params(&self) -> Arc<dyn AsRef<NetParameters>> {
         self.deref().params()
+    }
+
+    fn protocol_statuses(&self) -> Option<(SystemTime, Arc<netstatus::ProtoStatuses>)> {
+        self.deref().protocol_statuses()
     }
 }
 
@@ -783,7 +797,7 @@ pub struct PartialNetDir {
 #[derive(Clone)]
 pub struct Relay<'a> {
     /// A router descriptor for this relay.
-    rs: &'a netstatus::MdConsensusRouterStatus,
+    rs: &'a netstatus::MdRouterStatus,
     /// A microdescriptor for this relay.
     md: &'a Microdesc,
     /// The country code this relay is in, if we know one.
@@ -796,7 +810,7 @@ pub struct Relay<'a> {
 #[derive(Debug)]
 pub struct UncheckedRelay<'a> {
     /// A router descriptor for this relay.
-    rs: &'a netstatus::MdConsensusRouterStatus,
+    rs: &'a netstatus::MdRouterStatus,
     /// A microdescriptor for this relay, if there is one.
     md: Option<&'a Microdesc>,
     /// The country code this relay is in, if we know one.
@@ -895,10 +909,8 @@ impl PartialNetDir {
                 .c_relays()
                 .iter()
                 .map(|rs| {
-                    let ret = db
-                        .lookup_country_code_multi(rs.addrs().iter().map(|x| x.ip()))
-                        .cloned();
-                    ret
+                    db.lookup_country_code_multi(rs.addrs().map(|x| x.ip()))
+                        .cloned()
                 })
                 .collect()
         } else {
@@ -1043,7 +1055,7 @@ impl NetDir {
     /// index within the consensus.
     fn relay_from_rs_and_rsidx<'a>(
         &'a self,
-        rs: &'a netstatus::MdConsensusRouterStatus,
+        rs: &'a netstatus::MdRouterStatus,
         rsidx: RouterStatusIdx,
     ) -> UncheckedRelay<'a> {
         debug_assert_eq!(self.c_relays()[rsidx].rsa_identity(), rs.rsa_identity());
@@ -1112,18 +1124,15 @@ impl NetDir {
                 move |replica: u8| {
                     let hsdir_idx = hsdir_ring::service_hsdir_index(&hsid, replica, ring.params());
 
-                    let items = ring
-                        .ring_items_at(hsdir_idx, spread, |(hsdir_idx, _)| {
-                            // According to rend-spec 2.2.3:
-                            //                                                  ... If any of those
-                            // nodes have already been selected for a lower-numbered replica of the
-                            // service, any nodes already chosen are disregarded (i.e. skipped over)
-                            // when choosing a replica's hsdir_spread_store nodes.
-                            selected_nodes.insert(*hsdir_idx)
-                        })
-                        .collect::<Vec<_>>();
-
-                    items
+                    ring.ring_items_at(hsdir_idx, spread, |(hsdir_idx, _)| {
+                        // According to rend-spec 2.2.3:
+                        //                                                  ... If any of those
+                        // nodes have already been selected for a lower-numbered replica of the
+                        // service, any nodes already chosen are disregarded (i.e. skipped over)
+                        // when choosing a replica's hsdir_spread_store nodes.
+                        selected_nodes.insert(*hsdir_idx)
+                    })
+                    .collect::<Vec<_>>()
                 }
             })
             .filter_map(move |(_hsdir_idx, rs_idx)| {
@@ -1162,7 +1171,7 @@ impl NetDir {
         self.all_relays().filter_map(UncheckedRelay::into_relay)
     }
 
-    /// Look up a relay's `MicroDesc` by its `RouterStatusIdx`
+    /// Look up a relay's [`Microdesc`] by its [`RouterStatusIdx`]
     #[cfg_attr(not(feature = "hs-common"), allow(dead_code))]
     pub(crate) fn md_by_rsidx(&self, rsidx: RouterStatusIdx) -> Option<&Microdesc> {
         self.mds.get(rsidx)?.as_deref()
@@ -1201,7 +1210,7 @@ impl NetDir {
     /// Obtain a `Relay` given a `RouterStatusIdx`
     ///
     /// Differs from `relay_from_rs_and_rsi` as follows:
-    ///  * That function expects the caller to already have an `MdConsensusRouterStatus`;
+    ///  * That function expects the caller to already have an `MdRouterStatus`;
     ///    it checks with `debug_assert` that the relay in the netdir matches.
     ///  * That function panics if the `RouterStatusIdx` is invalid; this one returns `None`.
     ///  * That function returns an `UncheckedRelay`; this one a `Relay`.
@@ -1363,7 +1372,7 @@ impl NetDir {
 
         // TODO: If we later support more identity key types, this will
         // become incorrect.  This assertion might help us recognize that case.
-        const_assert!(RelayIdType::COUNT == 2);
+        const _: () = assert!(RelayIdType::COUNT == 2);
 
         match (rsa_id, ed25519_id) {
             (Some(r), Some(e)) => self.id_pair_listed(e, r),
@@ -1446,6 +1455,16 @@ impl NetDir {
     #[cfg(feature = "hs-common")]
     pub fn relay_protocol_status(&self) -> &netstatus::ProtoStatus {
         self.consensus.relay_protocol_status()
+    }
+
+    /// Return a [`ProtoStatus`](netstatus::ProtoStatus) that lists the
+    /// network's current requirements and recommendations for the list of
+    /// protocols that every relay must implement.
+    //
+    // TODO HS: See notes on relay_protocol_status above.
+    #[cfg(feature = "hs-common")]
+    pub fn client_protocol_status(&self) -> &netstatus::ProtoStatus {
+        self.consensus.client_protocol_status()
     }
 
     /// Return weighted the fraction of relays we can use.  We only
@@ -1576,10 +1595,23 @@ impl NetDir {
         // This code will give the wrong result if the total of all weights
         // can exceed u64::MAX.  We make sure that can't happen when we
         // set up `self.weights`.
-        relays[..]
-            .choose_weighted(rng, |r| self.weights.weight_rs_for_role(r.rs, role))
-            .ok()
-            .cloned()
+        match relays[..].choose_weighted(rng, |r| self.weights.weight_rs_for_role(r.rs, role)) {
+            Ok(relay) => Some(relay.clone()),
+            Err(WeightError::InsufficientNonZero) => {
+                if relays.is_empty() {
+                    None
+                } else {
+                    warn!(?self.weights, ?role,
+                          "After filtering, all {} relays had zero weight. Choosing one at random. See bug #1907.",
+                          relays.len());
+                    relays.choose(rng).cloned()
+                }
+            }
+            Err(e) => {
+                warn_report!(e, "Unexpected error while sampling a relay");
+                None
+            }
+        }
     }
 
     /// Choose `n` relay at random.
@@ -1595,6 +1627,7 @@ impl NetDir {
     /// This function returns an empty vector if (and only if) there
     /// are no relays with nonzero weight where `usable` returned
     /// true.
+    #[allow(clippy::cognitive_complexity)] // all due to tracing crate.
     pub fn pick_n_relays<'a, R, P>(
         &'a self,
         rng: &mut R,
@@ -1611,16 +1644,45 @@ impl NetDir {
         let mut relays = match relays[..].choose_multiple_weighted(rng, n, |r| {
             self.weights.weight_rs_for_role(r.rs, role) as f64
         }) {
-            Err(rand::seq::WeightError::InsufficientNonZero) => {
+            Err(WeightError::InsufficientNonZero) => {
                 // Too few relays had nonzero weights: return all of those that are okay.
-                relays
+                // (This is behavior used to come up with rand 0.9; it no longer does.
+                // We still detect it.)
+                let remaining: Vec<_> = relays
                     .iter()
                     .filter(|r| self.weights.weight_rs_for_role(r.rs, role) > 0)
                     .cloned()
-                    .collect()
+                    .collect();
+                if remaining.is_empty() {
+                    warn!(?self.weights, ?role,
+                          "After filtering, all {} relays had zero weight! Picking some at random. See bug #1907.",
+                          relays.len());
+                    if relays.len() >= n {
+                        relays.choose_multiple(rng, n).cloned().collect()
+                    } else {
+                        relays
+                    }
+                } else {
+                    warn!(?self.weights, ?role,
+                          "After filtering, only had {}/{} relays with nonzero weight. Returning them all. See bug #1907.",
+                           remaining.len(), relays.len());
+                    remaining
+                }
             }
-            Err(_) => Vec::new(),
-            Ok(iter) => iter.map(Relay::clone).collect(),
+            Err(e) => {
+                warn_report!(e, "Unexpected error while sampling a set of relays");
+                Vec::new()
+            }
+            Ok(iter) => {
+                let selection: Vec<_> = iter.map(Relay::clone).collect();
+                if selection.len() < n && selection.len() < relays.len() {
+                    warn!(?self.weights, ?role,
+                          "choose_multiple_weighted returned only {returned}, despite requesting {n}, \
+                          and having {filtered_len} available after filtering. See bug #1907.",
+                          returned=selection.len(), filtered_len=relays.len());
+                }
+                selection
+            }
         };
         relays.shuffle(rng);
         relays
@@ -1637,7 +1699,7 @@ impl NetDir {
     ///
     /// Note: because this function is used to assess the total
     /// properties of the consensus, the `usable` predicate takes a
-    /// [`RouterStatus`] rather than a [`Relay`].
+    /// [`MdRouterStatus`] rather than a [`Relay`].
     pub fn total_weight<P>(&self, role: WeightRole, usable: P) -> RelayWeight
     where
         P: Fn(&UncheckedRelay<'_>) -> bool,
@@ -1890,18 +1952,15 @@ impl NetDir {
                 move |(ring, replica): (&HsDirRing, u8)| {
                     let hsdir_idx = hsdir_ring::service_hsdir_index(hsid, replica, ring.params());
 
-                    let items = ring
-                        .ring_items_at(hsdir_idx, spread, |(hsdir_idx, _)| {
-                            // According to rend-spec 2.2.3:
-                            //                                                  ... If any of those
-                            // nodes have already been selected for a lower-numbered replica of the
-                            // service, any nodes already chosen are disregarded (i.e. skipped over)
-                            // when choosing a replica's hsdir_spread_store nodes.
-                            selected_nodes.insert(*hsdir_idx)
-                        })
-                        .collect::<Vec<_>>();
-
-                    items
+                    ring.ring_items_at(hsdir_idx, spread, |(hsdir_idx, _)| {
+                        // According to rend-spec 2.2.3:
+                        //                                                  ... If any of those
+                        // nodes have already been selected for a lower-numbered replica of the
+                        // service, any nodes already chosen are disregarded (i.e. skipped over)
+                        // when choosing a replica's hsdir_spread_store nodes.
+                        selected_nodes.insert(*hsdir_idx)
+                    })
+                    .collect::<Vec<_>>()
                 }
             })
             .filter_map(|(_hsdir_idx, rs_idx)| {
@@ -2012,7 +2071,7 @@ impl<'a> Relay<'a> {
     /// This function is only available if the crate was built with
     /// its `experimental-api` feature.
     #[cfg(feature = "experimental-api")]
-    pub fn rs(&self) -> &netstatus::MdConsensusRouterStatus {
+    pub fn rs(&self) -> &netstatus::MdRouterStatus {
         self.rs
     }
     /// Return a reference to this relay's "microdescriptor" entry in
@@ -2042,7 +2101,7 @@ pub enum RelayLookupError {
 }
 
 impl<'a> HasAddrs for Relay<'a> {
-    fn addrs(&self) -> &[std::net::SocketAddr] {
+    fn addrs(&self) -> impl Iterator<Item = std::net::SocketAddr> {
         self.rs.addrs()
     }
 }
@@ -2113,7 +2172,7 @@ mod test {
     use float_eq::assert_float_eq;
     use std::collections::HashSet;
     use std::time::Duration;
-    use tor_basic_utils::test_rng;
+    use tor_basic_utils::test_rng::{self, testing_rng};
     use tor_linkspec::{RelayIdType, RelayIds};
 
     #[cfg(feature = "hs-common")]
@@ -2551,14 +2610,16 @@ mod test {
         assert!(e32.low_level_details().ipv4_policy().allows_some_port());
         assert!(e32.low_level_details().ipv6_policy().allows_some_port());
 
-        assert!(e12
-            .low_level_details()
-            .ipv4_declared_policy()
-            .allows_some_port());
-        assert!(e12
-            .low_level_details()
-            .ipv6_declared_policy()
-            .allows_some_port());
+        assert!(
+            e12.low_level_details()
+                .ipv4_declared_policy()
+                .allows_some_port()
+        );
+        assert!(
+            e12.low_level_details()
+                .ipv6_declared_policy()
+                .allows_some_port()
+        );
     }
 
     #[cfg(feature = "experimental-api")]
@@ -2740,9 +2801,11 @@ mod test {
             .unwrap();
         assert_eq!(w, RelayWeight(4_000));
 
-        assert!(netdir
-            .weight_by_rsa_id(&[99; 20].into(), WeightRole::Guard)
-            .is_none());
+        assert!(
+            netdir
+                .weight_by_rsa_id(&[99; 20].into(), WeightRole::Guard)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2889,5 +2952,62 @@ mod test {
         //
         // If we use relays [A, B, C] for replica 1, and hs_index(2) = E, then replica 2 _must_ get
         // relays [E, F, D]. We should have a test that checks this.
+    }
+
+    #[test]
+    fn zero_weights() {
+        // Here we check the behavior of IndexedRandom::{choose_weighted, choose_multiple_weighted}
+        // in the presence of items whose weight is 0.
+        //
+        // We think that the behavior is:
+        //   - An item with weight 0 is never returned.
+        //   - If all items have weight 0, choose_weighted returns an error.
+        //   - If all items have weight 0, choose_multiple_weighted returns an empty list.
+        //   - If we request n items from choose_multiple_weighted,
+        //     but only m<n items have nonzero weight, we return all m of those items.
+        //   - if the request for n items can't be completely satisfied with n items of weight >= 0,
+        //     we get InsufficientNonZero.
+        let items = vec![1, 2, 3];
+        let mut rng = testing_rng();
+
+        let a = items.choose_weighted(&mut rng, |_| 0);
+        assert!(matches!(a, Err(WeightError::InsufficientNonZero)));
+
+        let x = items.choose_multiple_weighted(&mut rng, 2, |_| 0);
+        let xs: Vec<_> = x.unwrap().collect();
+        assert!(xs.is_empty());
+
+        let only_one = |n: &i32| if *n == 1 { 1 } else { 0 };
+        let x = items.choose_multiple_weighted(&mut rng, 2, only_one);
+        let xs: Vec<_> = x.unwrap().collect();
+        assert_eq!(&xs[..], &[&1]);
+
+        for _ in 0..100 {
+            let a = items.choose_weighted(&mut rng, only_one);
+            assert_eq!(a.unwrap(), &1);
+
+            let x = items
+                .choose_multiple_weighted(&mut rng, 1, only_one)
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(x, vec![&1]);
+        }
+    }
+
+    #[test]
+    fn insufficient_but_nonzero() {
+        // Here we check IndexedRandom::choose_multiple_weighted when there no zero values,
+        // but there are insufficient values.
+        // (If this behavior changes, we need to change our usage.)
+
+        let items = vec![1, 2, 3];
+        let mut rng = testing_rng();
+        let mut a = items
+            .choose_multiple_weighted(&mut rng, 10, |_| 1)
+            .unwrap()
+            .copied()
+            .collect::<Vec<_>>();
+        a.sort();
+        assert_eq!(a, items);
     }
 }

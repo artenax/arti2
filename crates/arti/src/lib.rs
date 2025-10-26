@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 // TODO #1645 (either remove this, or decide to have it everywhere)
@@ -99,24 +100,29 @@ use std::ffi::OsString;
 use std::fmt::Write;
 
 pub use cfg::{
-    ApplicationConfig, ApplicationConfigBuilder, ArtiCombinedConfig, ArtiConfig, ArtiConfigBuilder,
-    ProxyConfig, ProxyConfigBuilder, SystemConfig, SystemConfigBuilder, ARTI_EXAMPLE_CONFIG,
+    ARTI_EXAMPLE_CONFIG, ApplicationConfig, ApplicationConfigBuilder, ArtiCombinedConfig,
+    ArtiConfig, ArtiConfigBuilder, ProxyConfig, ProxyConfigBuilder, SystemConfig,
+    SystemConfigBuilder,
 };
 pub use logging::{LoggingConfig, LoggingConfigBuilder};
 
-use arti_client::config::default_config_files;
 use arti_client::TorClient;
+use arti_client::config::default_config_files;
 use safelog::with_safe_logging_suppressed;
-use tor_config::mistrust::BuilderExt as _;
 use tor_config::ConfigurationSources;
+use tor_config::mistrust::BuilderExt as _;
 use tor_rtcompat::ToplevelRuntime;
 
 use anyhow::{Context, Error, Result};
-use clap::{value_parser, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, value_parser};
 #[allow(unused_imports)]
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
-#[cfg(any(feature = "hsc", feature = "onion-service-service"))]
+#[cfg(any(
+    feature = "hsc",
+    feature = "onion-service-service",
+    feature = "onion-service-cli-extra",
+))]
 use clap::Subcommand as _;
 
 #[cfg(feature = "experimental-api")]
@@ -130,6 +136,8 @@ fn create_runtime() -> std::io::Result<impl ToplevelRuntime> {
             use tor_rtcompat::tokio::TokioNativeTlsRuntime as ChosenRuntime;
         } else if #[cfg(all(feature="tokio", feature="rustls"))] {
             use tor_rtcompat::tokio::TokioRustlsRuntime as ChosenRuntime;
+            // Note: See comments in tor_rtcompate::impls::rustls::RustlsProvider
+            // about choice of default crypto provider.
             let _idempotent_ignore = rustls_crate::crypto::CryptoProvider::install_default(
                 rustls_crate::crypto::ring::default_provider(),
 
@@ -138,6 +146,8 @@ fn create_runtime() -> std::io::Result<impl ToplevelRuntime> {
             use tor_rtcompat::async_std::AsyncStdNativeTlsRuntime as ChosenRuntime;
         } else if #[cfg(all(feature="async-std", feature="rustls"))] {
             use tor_rtcompat::async_std::AsyncStdRustlsRuntime as ChosenRuntime;
+            // Note: See comments in tor_rtcompate::impls::rustls::RustlsProvider
+            // about choice of default crypto provider.
             let _idempotent_ignore = rustls_crate::crypto::CryptoProvider::install_default(
                 rustls_crate::crypto::ring::default_provider(),
             );
@@ -177,6 +187,7 @@ fn list_enabled_features() -> &'static [&'static str] {
 /// Currently, might panic if wrong arguments are specified.
 #[cfg_attr(feature = "experimental-api", visibility::make(pub))]
 #[allow(clippy::cognitive_complexity)]
+#[instrument(skip_all, level = "trace")]
 fn main_main<I, T>(cli_args: I) -> Result<()>
 where
     I: IntoIterator<Item = T>,
@@ -190,7 +201,7 @@ where
         // If we couldn't resolve the default config file, then too bad.  If something
         // actually tries to use it, it will produce an error, but don't fail here
         // just for that reason.
-        write!(config_file_help, " Defaults to {:?}", default).unwrap();
+        write!(config_file_help, " Defaults to {:?}", default).expect("Can't write to string");
     }
 
     // We create the runtime now so that we can use its `Debug` impl to describe it for
@@ -294,6 +305,13 @@ where
         }
     }
 
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "onion-service-cli-extra")] {
+            let clap_app = subcommands::keys::KeysSubcommands::augment_subcommands(clap_app);
+            let clap_app = subcommands::raw::RawSubcommands::augment_subcommands(clap_app);
+        }
+    }
+
     // Tracing doesn't log anything when there is no subscriber set.  But we want to see
     // logging messages from config parsing etc.  We can't set the global default subscriber
     // because we can only set it once.  The other ways involve a closure.  So we have a
@@ -374,7 +392,9 @@ where
     #[cfg(feature = "harden")]
     if !config.application().permit_debugging {
         if let Err(e) = process::enable_process_hardening() {
-            error!("Encountered a problem while enabling hardening. To disable this feature, set application.permit_debugging to true.");
+            error!(
+                "Encountered a problem while enabling hardening. To disable this feature, set application.permit_debugging to true."
+            );
             return Err(e);
         }
     }
@@ -384,11 +404,22 @@ where
         return subcommands::proxy::run(runtime, proxy_matches, cfg_sources, config, client_config);
     }
 
+    // Check for the optional "keys" and "keys-raw" subcommand.
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "onion-service-cli-extra")] {
+            if let Some(keys_matches) = matches.subcommand_matches("keys") {
+                return subcommands::keys::run(runtime, keys_matches, &config, &client_config);
+            } else if let Some(raw_matches) = matches.subcommand_matches("keys-raw") {
+                return subcommands::raw::run(runtime, raw_matches, &client_config);
+            }
+        }
+    }
+
     // Check for the optional "hss" subcommand.
     cfg_if::cfg_if! {
         if #[cfg(feature = "onion-service-service")] {
             if let Some(hss_matches) = matches.subcommand_matches("hss") {
-                return subcommands::hss::run(hss_matches, &config, &client_config);
+                return subcommands::hss::run(runtime, hss_matches, &config, &client_config);
             }
         }
     }

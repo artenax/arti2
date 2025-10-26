@@ -9,9 +9,9 @@ use tracing::warn;
 use weak_table::WeakValueHashMap;
 
 use crate::{
+    RpcAuthentication,
     connection::{Connection, ConnectionId},
     globalid::{GlobalId, MacKey},
-    RpcAuthentication,
 };
 
 /// A function we use to construct Session objects in response to authentication.
@@ -190,7 +190,7 @@ impl RpcMgr {
         connection
     }
 
-    /// Look up an object in  the context of this `RpcMgr`.
+    /// Look up an object in the context of this `RpcMgr`.
     ///
     /// Some object identifiers exist in a manager-global context, so that they
     /// can be used outside of a single RPC session.  This function looks up an
@@ -200,8 +200,8 @@ impl RpcMgr {
     /// Along with the object, this additionally returns the [`rpc::Context`] associated with the
     /// object.  That context can be used to invoke any special methods on the object.
     pub fn lookup_object(&self, id: &rpc::ObjectId) -> Result<ObjectWithContext, rpc::LookupError> {
-        let global_id = GlobalId::try_decode(&self.global_id_mac_key, id)?;
-        self.lookup_by_global_id(&global_id)
+        GlobalId::try_decode(&self.global_id_mac_key, id)?
+            .and_then(|global_id| self.lookup_by_global_id(&global_id))
             .ok_or_else(|| rpc::LookupError::NoObject(id.clone()))
     }
 

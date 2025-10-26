@@ -27,15 +27,15 @@ mod rtt;
 pub(crate) mod sendme;
 mod vegas;
 
-use std::time::Instant;
-
 use crate::{Error, Result};
 
 use self::{
     params::{Algorithm, CongestionControlParams, CongestionWindowParams},
     rtt::RoundtripTimeEstimator,
-    sendme::{CircTag, SendmeValidator},
+    sendme::SendmeValidator,
 };
+use tor_cell::relaycell::msg::SendmeTag;
+use tor_rtcompat::{DynTimeProvider, SleepProvider};
 
 /// This trait defines what a congestion control algorithm must implement in order to interface
 /// with the circuit reactor.
@@ -43,7 +43,11 @@ use self::{
 /// Note that all functions informing the algorithm, as in not getters, return a Result meaning
 /// that on error, it means we can't recover or that there is a protocol violation. In both
 /// cases, the circuit MUST be closed.
-pub(crate) trait CongestionControlAlgorithm: Send {
+pub(crate) trait CongestionControlAlgorithm: Send + std::fmt::Debug {
+    /// Return true iff this algorithm uses stream level SENDMEs.
+    fn uses_stream_sendme(&self) -> bool;
+    /// Return true iff this algorithm uses stream level XON/XOFFs.
+    fn uses_xon_xoff(&self) -> bool;
     /// Return true iff the next cell is expected to be a SENDME.
     fn is_next_cell_sendme(&self) -> bool;
     /// Return true iff a cell can be sent on the wire according to the congestion control
@@ -72,9 +76,18 @@ pub(crate) trait CongestionControlAlgorithm: Send {
     /// Inform the algorithm that we just sent a SENDME.
     fn sendme_sent(&mut self) -> Result<()>;
 
+    /// Return the number of in-flight cells (sent but awaiting SENDME ack).
+    ///
+    /// Optional, because not all algorithms track this.
+    #[cfg(feature = "conflux")]
+    fn inflight(&self) -> Option<u32>;
+
     /// Test Only: Return the congestion window.
     #[cfg(test)]
     fn send_window(&self) -> u32;
+
+    /// Return the congestion control [`Algorithm`] implemented by this type.
+    fn algorithm(&self) -> Algorithm;
 }
 
 /// These are congestion signals used by a congestion control algorithm to make decisions. These
@@ -129,10 +142,10 @@ pub(crate) struct CongestionWindow {
 
 impl CongestionWindow {
     /// Constructor taking consensus parameters.
-    fn new(params: &CongestionWindowParams) -> Self {
+    fn new(params: CongestionWindowParams) -> Self {
         Self {
             value: params.cwnd_init(),
-            params: params.clone(),
+            params,
             is_full: false,
         }
     }
@@ -237,7 +250,8 @@ impl CongestionWindow {
         self.params.sendme_inc()
     }
 
-    #[cfg(test)]
+    /// Return the congestion window params.
+    #[cfg(any(test, feature = "conflux"))]
     pub(crate) fn params(&self) -> &CongestionWindowParams {
         &self.params
     }
@@ -252,7 +266,7 @@ pub(crate) struct CongestionControl {
     /// This is the SENDME validator as in it keeps track of the circuit tag found within an
     /// authenticated SENDME cell. It can store the tags and validate a tag against our queue of
     /// expected values.
-    sendme_validator: SendmeValidator<CircTag>,
+    sendme_validator: SendmeValidator<SendmeTag>,
     /// The RTT estimator for the circuit we are attached on.
     rtt: RoundtripTimeEstimator,
     /// The congestion control algorithm.
@@ -265,10 +279,10 @@ impl CongestionControl {
         let state = State::default();
         // Use what the consensus tells us to use.
         let algorithm: Box<dyn CongestionControlAlgorithm> = match params.alg() {
-            Algorithm::FixedWindow(p) => Box::new(fixed::FixedWindow::new(p.circ_window_start())),
-            Algorithm::Vegas(ref p) => {
+            Algorithm::FixedWindow(p) => Box::new(fixed::FixedWindow::new(*p)),
+            Algorithm::Vegas(p) => {
                 let cwnd = CongestionWindow::new(params.cwnd_params());
-                Box::new(vegas::Vegas::new(p, &state, cwnd))
+                Box::new(vegas::Vegas::new(*p, &state, cwnd))
             }
         };
         Self {
@@ -277,6 +291,18 @@ impl CongestionControl {
             sendme_validator: SendmeValidator::new(),
             state,
         }
+    }
+
+    /// Return true iff the underlying algorithm uses stream level SENDMEs.
+    /// At the moment, only FixedWindow uses it. It has been eliminated with Vegas.
+    pub(crate) fn uses_stream_sendme(&self) -> bool {
+        self.algorithm.uses_stream_sendme()
+    }
+
+    /// Return true iff the underlying algorithm uses stream level XON/XOFFs.
+    /// At the moment, only Vegas uses it.
+    pub(crate) fn uses_xon_xoff(&self) -> bool {
+        self.algorithm.uses_xon_xoff()
     }
 
     /// Return true iff a DATA cell is allowed to be sent based on the congestion control state.
@@ -289,19 +315,21 @@ impl CongestionControl {
     /// An error is returned if there is a protocol violation with regards to congestion control.
     pub(crate) fn note_sendme_received(
         &mut self,
-        tag: CircTag,
+        runtime: &DynTimeProvider,
+        tag: SendmeTag,
         signals: CongestionSignals,
     ) -> Result<()> {
         // This MUST be the first thing that we do that is validate the SENDME. Any error leads to
         // closing the circuit.
         self.sendme_validator.validate(Some(tag))?;
 
+        let now = runtime.now();
         // Update our RTT estimate if the algorithm yields back a congestion window. RTT
         // measurements only make sense for a congestion window. For example, FixedWindow here
         // doesn't use it and so no need for the RTT.
         if let Some(cwnd) = self.algorithm.cwnd() {
             self.rtt
-                .update(Instant::now(), &self.state, cwnd)
+                .update(now, &self.state, cwnd)
                 .map_err(|e| Error::CircProto(e.to_string()))?;
         }
 
@@ -327,9 +355,9 @@ impl CongestionControl {
     ///
     /// An error is returned if there is a protocol violation with regards to flow or congestion
     /// control.
-    pub(crate) fn note_data_sent<U>(&mut self, tag: &U) -> Result<()>
+    pub(crate) fn note_data_sent<U>(&mut self, runtime: &DynTimeProvider, tag: &U) -> Result<()>
     where
-        U: Clone + Into<CircTag>,
+        U: Clone + Into<SendmeTag>,
     {
         // Inform the algorithm that the data was just sent. This is important to be the very first
         // thing so the congestion window can be updated accordingly making the following calls
@@ -342,11 +370,38 @@ impl CongestionControl {
             self.sendme_validator.record(tag);
             // Only keep the SENDME timestamp if the algorithm has a congestion window.
             if self.algorithm.cwnd().is_some() {
-                self.rtt.expect_sendme(Instant::now());
+                self.rtt.expect_sendme(runtime.now());
             }
         }
 
         Ok(())
+    }
+
+    /// Return the number of in-flight cells (sent but awaiting SENDME ack).
+    ///
+    /// Optional, because not all algorithms track this.
+    #[cfg(feature = "conflux")]
+    pub(crate) fn inflight(&self) -> Option<u32> {
+        self.algorithm.inflight()
+    }
+
+    /// Return the congestion window object.
+    ///
+    /// Optional, because not all algorithms track this.
+    #[cfg(feature = "conflux")]
+    pub(crate) fn cwnd(&self) -> Option<&CongestionWindow> {
+        self.algorithm.cwnd()
+    }
+
+    /// Return a reference to the RTT estimator.
+    pub(crate) fn rtt(&self) -> &RoundtripTimeEstimator {
+        &self.rtt
+    }
+
+    /// Return the congestion control algorithm.
+    #[cfg(feature = "conflux")]
+    pub(crate) fn algorithm(&self) -> Algorithm {
+        self.algorithm.algorithm()
     }
 }
 
@@ -368,13 +423,13 @@ mod test {
 
     use crate::congestion::test_utils::new_cwnd;
 
-    use super::sendme::CircTag;
     use super::CongestionControl;
+    use tor_cell::relaycell::msg::SendmeTag;
 
     impl CongestionControl {
         /// For testing: get a copy of the current send window, and the
         /// expected incoming tags.
-        pub(crate) fn send_window_and_expected_tags(&self) -> (u32, Vec<CircTag>) {
+        pub(crate) fn send_window_and_expected_tags(&self) -> (u32, Vec<SendmeTag>) {
             (
                 self.algorithm.send_window(),
                 self.sendme_validator.expected_tags(),

@@ -9,8 +9,8 @@ use std::{
 use std::os::unix::prelude::MetadataExt;
 
 use crate::{
-    walk::{PathType, ResolvePath},
     Error, Result, Type,
+    walk::{PathType, ResolvePath},
 };
 
 /// Definition for the "sticky bit", which on Unix means that the contents of
@@ -41,7 +41,7 @@ impl<'a> super::Verifier<'a> {
     // to fix in the future if we can do so without adding much complexity
     // to the code.  It's not urgent, since the allocations won't cost much
     // compared to the filesystem access.
-    pub(crate) fn check_errors(&self, path: &Path) -> impl Iterator<Item = Error> + '_ {
+    pub(crate) fn check_errors(&self, path: &Path) -> impl Iterator<Item = Error> + '_ + use<'_> {
         if self.mistrust.is_disabled() {
             // We don't want to walk the path in this case at all: we'll just
             // look at the last element.
@@ -85,7 +85,10 @@ impl<'a> super::Verifier<'a> {
     /// If check_contents is set, return an iterator over all the errors in
     /// elements _contained in this directory_.
     #[cfg(feature = "walkdir")]
-    pub(crate) fn check_content_errors(&self, path: &Path) -> impl Iterator<Item = Error> + '_ {
+    pub(crate) fn check_content_errors(
+        &self,
+        path: &Path,
+    ) -> impl Iterator<Item = Error> + '_ + use<'_> {
         use std::sync::Arc;
 
         if !self.check_contents || self.mistrust.is_disabled() {
@@ -181,7 +184,11 @@ impl<'a> super::Verifier<'a> {
         // about a directory, the owner cah change the permissions and owner
         // of anything in the directory.)
 
-        #[cfg(all(not(target_os = "ios"), not(target_os = "android")))]
+        #[cfg(all(
+            not(target_os = "ios"),
+            not(target_os = "tvos"),
+            not(target_os = "android")
+        ))]
         {
             let uid = meta.uid();
             if uid != 0 && Some(uid) != self.mistrust.trust_user {
@@ -225,7 +232,11 @@ impl<'a> super::Verifier<'a> {
             }
         };
         // If we trust the GID, then we allow even more bits to be set.
-        #[cfg(all(not(target_os = "ios"), not(target_os = "android")))]
+        #[cfg(all(
+            not(target_os = "ios"),
+            not(target_os = "tvos"),
+            not(target_os = "android")
+        ))]
         if self.mistrust.trust_group == Some(meta.gid()) {
             forbidden_bits &= !0o070;
         }
@@ -241,7 +252,7 @@ impl<'a> super::Verifier<'a> {
         // Android: https://developer.android.com/training/data-storage
         // > App-specific storage: [...] Use the directories within internal storage to save
         // sensitive information that other apps shouldn't access.
-        #[cfg(any(target_os = "ios", target_os = "android"))]
+        #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "android"))]
         {
             forbidden_bits &= !0o070;
         }

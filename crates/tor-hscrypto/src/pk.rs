@@ -7,15 +7,21 @@
 use std::fmt::{self, Debug, Display};
 use std::str::FromStr;
 
+use derive_deftly::Deftly;
 use digest::Digest;
-use itertools::{chain, Itertools};
+use itertools::{Itertools, chain};
+use safelog::DisplayRedacted;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tor_basic_utils::{impl_debug_hex, StrExt as _};
+use tor_basic_utils::{StrExt as _, impl_debug_hex};
 use tor_key_forge::ToEncodableKey;
 use tor_llcrypto::d::Sha3_256;
 use tor_llcrypto::pk::ed25519::{Ed25519PublicKey, Ed25519SigningKey};
 use tor_llcrypto::pk::{curve25519, ed25519, keymanip};
 use tor_llcrypto::util::ct::CtByteArray;
+use tor_llcrypto::{
+    derive_deftly_template_ConstantTimeEq, derive_deftly_template_PartialEqFromCtEq,
+};
 
 use crate::macros::{define_bytes, define_pk_keypair};
 use crate::time::TimePeriod;
@@ -24,7 +30,7 @@ use crate::time::TimePeriod;
 pub use hs_client_intro_auth::{HsClientIntroAuthKey, HsClientIntroAuthKeypair};
 
 define_bytes! {
-/// The identity of a v3 onion service. (KP_hs_id)
+/// The identity of a v3 onion service. (`KP_hs_id`)
 ///
 /// This is the decoded and validated ed25519 public key that is encoded as a
 /// `${base32}.onion` address.  When expanded, it is a public key whose
@@ -39,25 +45,8 @@ define_bytes! {
 pub struct HsId([u8; 32]);
 }
 
-impl fmt::LowerHex for HsId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "HsId(0x")?;
-        for v in self.0.as_ref() {
-            write!(f, "{:02x}", v)?;
-        }
-        write!(f, ")")?;
-        Ok(())
-    }
-}
-
-impl Debug for HsId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "HsId({})", self)
-    }
-}
-
 define_pk_keypair! {
-/// The identity of a v3 onion service, expanded into a public key. (KP_hs_id)
+/// The identity of a v3 onion service, expanded into a public key. (`KP_hs_id`)
 ///
 /// This is the decoded and validated ed25519 public key that is encoded as
 /// a `${base32}.onion` address.
@@ -70,6 +59,8 @@ define_pk_keypair! {
 //
 // NOTE: This is called the "master" key in rend-spec-v3, but we're deprecating
 // that vocabulary generally.
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
 pub struct HsIdKey(ed25519::PublicKey) /
     ///
     /// This is stored as an expanded secret key, for compatibility with the C
@@ -84,6 +75,8 @@ pub struct HsIdKey(ed25519::PublicKey) /
     /// major drawback is that once you have found a good `a`, you can't get an
     /// `s` for it, since you presumably can't find SHA512 preimages.  And that
     /// is why we store the private key in (a,r) form.)
+    #[derive(Deftly)]
+    #[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
     HsIdKeypair(ed25519::ExpandedKeypair);
 }
 
@@ -126,8 +119,8 @@ const HSID_ONION_VERSION: u8 = 0x03;
 /// The fixed string `.onion`
 pub const HSID_ONION_SUFFIX: &str = ".onion";
 
-impl Display for HsId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl safelog::DisplayRedacted for HsId {
+    fn fmt_unredacted(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
         // rend-spec-v3 s.6 [ONIONADDRESS]
         let checksum = self.onion_checksum();
         let binary = chain!(self.0.as_ref(), &checksum, &[HSID_ONION_VERSION],)
@@ -137,14 +130,12 @@ impl Display for HsId {
         b32.make_ascii_lowercase();
         write!(f, "{}{}", b32, HSID_ONION_SUFFIX)
     }
-}
 
-impl safelog::Redactable for HsId {
     // We here display some of the end.  We don't want to display the
     // *start* because vanity domains, which would perhaps suffer from
     // reduced deniability.
-    fn display_redacted(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let unredacted = self.to_string();
+    fn fmt_redacted(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let unredacted = self.display_unredacted().to_string();
         /// Length of the base32 data part of the address
         const DATA: usize = 56;
         assert_eq!(unredacted.len(), DATA + HSID_ONION_SUFFIX.len());
@@ -157,9 +148,21 @@ impl safelog::Redactable for HsId {
         // 8 of those bits are the version, which is currently always 0x03.
         // So we are showing 7 bits derived from the site key.
 
-        write!(f, "???{}", &unredacted[DATA - 3..])
+        write!(f, "[…]{}", &unredacted[DATA - 3..])
     }
 }
+
+impl safelog::DebugRedacted for HsId {
+    fn fmt_redacted(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HsId({})", self.display_redacted())
+    }
+
+    fn fmt_unredacted(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HsId({})", self.display_unredacted())
+    }
+}
+
+safelog::derive_redacted_debug!(HsId);
 
 impl FromStr for HsId {
     type Err = HsIdParseError;
@@ -178,7 +181,7 @@ impl FromStr for HsId {
         // ecosystem libraries for base32 expect.  All this allocation and copying is
         // still probably less work than the SHA3 for the checksum.
         // However, we are going to use this function to *detect* and filter .onion
-        // addresses, so it should have a fast path to reject thm.
+        // addresses, so it should have a fast path to reject them.
         let mut s = s.to_owned();
         s.make_ascii_uppercase();
 
@@ -374,7 +377,13 @@ define_pk_keypair! {
 ///
 /// Note: This is a separate type from [`HsBlindId`] because it is about 6x
 /// larger.  It is an expanded form, used for doing actual cryptography.
-pub struct HsBlindIdKey(ed25519::PublicKey) / HsBlindIdKeypair(ed25519::ExpandedKeypair);
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+pub struct HsBlindIdKey(ed25519::PublicKey) /
+
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+HsBlindIdKeypair(ed25519::ExpandedKeypair);
 }
 
 impl From<HsBlindIdKeypair> for HsBlindIdKey {
@@ -452,7 +461,13 @@ define_pk_keypair! {
 /// Note: we use a separate signing key here, rather than using the
 /// `HsBlindIdKey` directly, so that the [`HsBlindIdKeypair`]
 /// can be kept offline.
-pub struct HsDescSigningKey(ed25519::PublicKey) / HsDescSigningKeypair(ed25519::Keypair);
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+pub struct HsDescSigningKey(ed25519::PublicKey) /
+
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+HsDescSigningKeypair(ed25519::Keypair);
 }
 
 define_pk_keypair! {
@@ -463,7 +478,13 @@ define_pk_keypair! {
 /// used at each introduction point.  Introduction points don't know the
 /// relation of this key to the onion service: they only recognize the same key
 /// when they see it again.
-pub struct HsIntroPtSessionIdKey(ed25519::PublicKey) / HsIntroPtSessionIdKeypair(ed25519::Keypair);
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+pub struct HsIntroPtSessionIdKey(ed25519::PublicKey) /
+
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+HsIntroPtSessionIdKeypair(ed25519::Keypair);
 }
 
 define_pk_keypair! {
@@ -473,7 +494,16 @@ define_pk_keypair! {
 /// The onion service chooses a different one of these to use with each
 /// introduction point, though it does not need to tell the introduction points
 /// about these keys.
-pub struct HsSvcNtorKey(curve25519::PublicKey) / HsSvcNtorSecretKey(curve25519::StaticSecret);
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+pub struct HsSvcNtorKey(curve25519::PublicKey) /
+
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+HsSvcNtorSecretKey(curve25519::StaticSecret);
+
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
 curve25519_pair as HsSvcNtorKeypair;
 }
 
@@ -481,7 +511,12 @@ mod hs_client_intro_auth {
     #![allow(deprecated)]
     //! Key type wrappers for the deprecated `HsClientIntroKey`/`HsClientIntroKeypair` types.
 
+    use subtle::ConstantTimeEq;
     use tor_llcrypto::pk::ed25519;
+    use tor_llcrypto::{
+        derive_deftly::Deftly, derive_deftly_template_ConstantTimeEq,
+        derive_deftly_template_PartialEqFromCtEq,
+    };
 
     use crate::macros::define_pk_keypair;
 
@@ -492,8 +527,13 @@ mod hs_client_intro_auth {
     /// This is used to sign a nonce included in an extension in the encrypted
     /// portion of an introduce cell.
     #[deprecated(note = "This key type is not used in the protocol implemented today.")]
+    #[derive(Deftly)]
+    #[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
     pub struct HsClientIntroAuthKey(ed25519::PublicKey) /
+
     #[deprecated(note = "This key type is not used in the protocol implemented today.")]
+    #[derive(Deftly)]
+    #[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
     HsClientIntroAuthKeypair(ed25519::Keypair);
     }
 }
@@ -529,14 +569,17 @@ define_pk_keypair! {
 /// // The keys are identical
 /// assert_eq!(key1, key2);
 /// ```
-pub struct HsClientDescEncKey(curve25519::PublicKey) / HsClientDescEncSecretKey(curve25519::StaticSecret);
-curve25519_pair as HsClientDescEncKeypair;
-}
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+pub struct HsClientDescEncKey(curve25519::PublicKey) /
 
-impl PartialEq for HsClientDescEncKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+HsClientDescEncSecretKey(curve25519::StaticSecret);
+
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+curve25519_pair as HsClientDescEncKeypair;
 }
 
 impl Eq for HsClientDescEncKey {}
@@ -614,7 +657,13 @@ define_pk_keypair! {
 /// (`KP_hss_desc_enc`)
 ///
 /// This key is created for a single descriptor, and then thrown away.
-pub struct HsSvcDescEncKey(curve25519::PublicKey) / HsSvcDescEncSecretKey(curve25519::StaticSecret);
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+pub struct HsSvcDescEncKey(curve25519::PublicKey) /
+
+#[derive(Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
+HsSvcDescEncSecretKey(curve25519::StaticSecret);
 }
 
 impl From<&HsClientDescEncSecretKey> for HsClientDescEncKey {
@@ -632,7 +681,8 @@ impl From<&HsClientDescEncKeypair> for HsClientDescEncKey {
 /// An ephemeral x25519 keypair, generated by an onion service
 /// and used to for onion service encryption.
 #[allow(clippy::exhaustive_structs)]
-#[derive(Debug)]
+#[derive(Debug, Deftly)]
+#[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
 pub struct HsSvcDescEncKeypair {
     /// The public part of the key.
     pub public: HsSvcDescEncKey,
@@ -768,7 +818,6 @@ mod test {
 
     use hex_literal::hex;
     use itertools::izip;
-    use safelog::Redactable;
     use std::time::{Duration, SystemTime};
     use tor_basic_utils::test_rng::testing_rng;
 
@@ -787,7 +836,7 @@ mod test {
         let onion = format!("{}.onion", b32);
 
         assert_eq!(onion.parse::<HsId>().unwrap(), hsid);
-        assert_eq!(hsid.to_string(), onion);
+        assert_eq!(hsid.display_unredacted().to_string(), onion);
 
         let weird_case: String = izip!(onion.chars(), [false, true].iter().cloned().cycle(),)
             .map(|(c, swap)| if swap { c.to_ascii_uppercase() } else { c })
@@ -812,10 +861,11 @@ mod test {
         chk_err!(edited(53, b'X'), PE::WrongChecksum);
         chk_err!(&format!("www.{}", &onion), PE::HsIdContainsSubdomain);
 
-        assert_eq!(format!("{:x}", &hsid), format!("HsId(0x{})", hex));
-        assert_eq!(format!("{:?}", &hsid), format!("HsId({})", onion));
+        safelog::with_safe_logging_suppressed(|| {
+            assert_eq!(format!("{:?}", &hsid), format!("HsId({})", onion));
+        });
 
-        assert_eq!(format!("{}", hsid.redacted()), "???sid.onion");
+        assert_eq!(format!("{}", hsid.display_redacted()), "[…]sid.onion");
     }
 
     #[test]

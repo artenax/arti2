@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 mod connect;
@@ -55,19 +56,19 @@ mod state;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use futures::task::SpawnExt as _;
-use futures::StreamExt as _;
 
 use educe::Educe;
-use tracing::debug;
+use tracing::{debug, instrument};
 
+use tor_circmgr::ClientOnionServiceDataTunnel;
 use tor_circmgr::hspool::HsCircPool;
 use tor_circmgr::isolation::StreamIsolation;
-use tor_error::{internal, Bug};
+use tor_error::{Bug, internal};
 use tor_hscrypto::pk::HsId;
 use tor_netdir::NetDir;
-use tor_proto::circuit::ClientCirc;
 use tor_rtcompat::Runtime;
 
 pub use err::FailedAttemptError;
@@ -76,7 +77,7 @@ pub use keys::{HsClientDescEncKeypairSpecifier, HsClientSecretKeys, HsClientSecr
 pub use relay_info::InvalidTarget;
 pub use state::HsClientConnectorConfig;
 
-use err::{rend_pt_identity_for_error, IntroPtIndex, RendPtIdentityForError};
+use err::{IntroPtIndex, RendPtIdentityForError, rend_pt_identity_for_error};
 use state::{Config, MockableConnectorData, Services};
 
 /// An object that negotiates connections with onion services
@@ -86,7 +87,7 @@ use state::{Config, MockableConnectorData, Services};
 /// and potentially different circuit isolation.
 ///
 /// The principal entrypoint is
-/// [`get_or_launch_connection()`](HsClientConnector::get_or_launch_connection).
+/// [`get_or_launch_tunnel()`](HsClientConnector::get_or_launch_tunnel).
 ///
 /// This object is handle-like: it is fairly cheap to clone,
 ///  and contains `Arc`s internally.
@@ -145,7 +146,7 @@ impl<R: Runtime> HsClientConnector<R, connect::Data> {
     /// a new circuit will be created.
     ///
     /// Once a circuit is returned, the caller can use it to open new streams to the
-    /// onion service. To do so, call [`ClientCirc::begin_stream`] on it.
+    /// onion service. To do so, call [`ClientOnionServiceDataTunnel::begin_stream`] on it.
     ///
     /// Each HS connection request must provide the appropriate
     /// service discovery keys to use -
@@ -156,34 +157,21 @@ impl<R: Runtime> HsClientConnector<R, connect::Data> {
     // Without this, it is possible for `Services::get_or_launch_connection`
     // to not return a `Send` future.
     // https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/1034#note_2881718
-    pub fn get_or_launch_circuit<'r>(
+    #[instrument(skip_all, level = "trace")]
+    pub fn get_or_launch_tunnel<'r>(
         &'r self,
         netdir: &'r Arc<NetDir>,
         hs_id: HsId,
         secret_keys: HsClientSecretKeys,
         isolation: StreamIsolation,
-    ) -> impl Future<Output = Result<Arc<ClientCirc>, ConnError>> + Send + Sync + 'r {
+    ) -> impl Future<Output = Result<Arc<ClientOnionServiceDataTunnel>, ConnError>> + Send + Sync + 'r
+    {
         // As in tor-circmgr,  we take `StreamIsolation`, to ensure that callers in
         // arti-client pass us the final overall isolation,
         // including the per-TorClient isolation.
         // But internally we need a Box<dyn Isolation> since we need .join().
         let isolation = Box::new(isolation);
         Services::get_or_launch_connection(self, netdir, hs_id, isolation, secret_keys)
-    }
-
-    /// A deprecated alias for `get_or_launch_circuit`.
-    ///
-    /// We renamed it to be
-    /// more clear about what exactly it is launching.
-    #[deprecated(since = "0.5.1", note = "Use get_or_launch_circuit instead.")]
-    pub fn get_or_launch_connection<'r>(
-        &'r self,
-        netdir: &'r Arc<NetDir>,
-        hs_id: HsId,
-        secret_keys: HsClientSecretKeys,
-        isolation: StreamIsolation,
-    ) -> impl Future<Output = Result<Arc<ClientCirc>, ConnError>> + Send + Sync + 'r {
-        self.get_or_launch_circuit(netdir, hs_id, secret_keys, isolation)
     }
 }
 
@@ -222,5 +210,49 @@ impl<R: Runtime, D: MockableConnectorData> HsClientConnector<R, D> {
                 spawning: "housekeeping task",
                 cause: cause.into(),
             })
+    }
+}
+
+/// Return a list of the protocols [supported](tor_protover::doc_supported) by this crate,
+/// running as a hidden service client.
+pub fn supported_hsclient_protocols() -> tor_protover::Protocols {
+    use tor_protover::named::*;
+    // WARNING: REMOVING ELEMENTS FROM THIS LIST CAN BE DANGEROUS!
+    // SEE [`tor_protover::doc_changing`]
+    [
+        HSINTRO_V3,
+        // Technically, there is nothing for a client to do to support HSINTRO_RATELIM.
+        // See torspec#319
+        HSINTRO_RATELIM,
+        HSREND_V3,
+        HSDIR_V3,
+    ]
+    .into_iter()
+    .collect()
+}
+
+#[cfg(test)]
+mod test {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_duration_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+
+    use super::*;
+
+    #[test]
+    fn protocols() {
+        let pr = supported_hsclient_protocols();
+        let expected = "HSIntro=4-5 HSRend=2 HSDir=2".parse().unwrap();
+        assert_eq!(pr, expected);
     }
 }

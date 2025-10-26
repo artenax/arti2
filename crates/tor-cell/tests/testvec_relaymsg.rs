@@ -8,7 +8,7 @@ use tor_cell::chancell::msg::HandshakeType;
 /// Except where noted, these were taken by instrumenting Tor
 /// 0.4.5.0-alpha-dev to dump all of its cells to the logs, and
 /// running in a chutney network with "test-network-all".
-use tor_cell::relaycell::{msg, RelayCmd, RelayMsg};
+use tor_cell::relaycell::{RelayCmd, RelayMsg, msg};
 use tor_linkspec::LinkSpec;
 use tor_llcrypto::pk::rsa::RsaIdentity;
 
@@ -484,7 +484,8 @@ fn test_data() {
     let d = msg::Data::new(&b[..]);
     assert!(d.is_err());
 
-    let (d, rest) = msg::Data::try_split_from(&b[..]).expect("Empty input?");
+    let (d, rest) = msg::Data::try_split_from(tor_cell::relaycell::RelayCellFormat::V0, &b[..])
+        .expect("Empty input?");
     assert_eq!(d.as_ref(), &b[0..498]);
     assert_eq!(rest, &b[498..]);
 }
@@ -667,7 +668,7 @@ fn test_establish_rendezvous() {
 #[cfg(feature = "hs")]
 #[test]
 fn test_establish_intro() {
-    use tor_cell::relaycell::hs::{est_intro::*, UnrecognizedExt};
+    use tor_cell::relaycell::hs::{UnrecognizedExt, est_intro::*};
 
     let cmd = RelayCmd::ESTABLISH_INTRO;
     let auth_key = [0x33; 32].into();

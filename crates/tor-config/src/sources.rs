@@ -182,8 +182,6 @@ impl ConfigurationSources {
     // The other inputs are always used and therefore
     // don't need to be lifted into FnOnce() -> Result.
     ///
-    /// `mistrust` is used to check whether the configuration files have appropriate permissions.
-    ///
     /// `ConfigurationSource::Dir`s
     /// will be scanned for files whose name ends in `.toml`.
     /// All those files (if any) will be read (in lexical order by filename).
@@ -238,6 +236,13 @@ impl ConfigurationSources {
         self.options.push(option.into());
     }
 
+    /// All given override options.
+    ///
+    /// See [`push_option`](Self::push_option).
+    pub fn options(&self) -> impl Iterator<Item = &String> + Clone {
+        self.options.iter()
+    }
+
     /// Sets the filesystem permission mistrust
     ///
     /// This value only indicates whether and how to check permissions
@@ -263,7 +268,7 @@ impl ConfigurationSources {
     /// Scan for files and load the configuration into a new [`ConfigurationTree`].
     ///
     /// This is a convenience method for [`scan()`](Self::scan)
-    /// followed by [`files.load`].
+    /// followed by `files.load`.
     pub fn load(&self) -> Result<ConfigurationTree, ConfigError> {
         let files = self.scan()?;
         files.load()

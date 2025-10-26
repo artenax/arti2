@@ -1,7 +1,7 @@
 //! An error type for [C Tor](crate::keystore::ctor) keystores.
 
-use crate::keystore::fs_utils;
 use crate::KeystoreError;
+use crate::keystore::fs_utils;
 use tor_error::{ErrorKind, HasKind};
 use tor_hscrypto::pk::HsIdParseError;
 use tor_key_forge::KeystoreItemType;
@@ -80,6 +80,12 @@ pub(crate) enum MalformedServiceKeyError {
         /// The expected value of the tag.
         expected_tag: Vec<u8>,
     },
+
+    /// Found an entry that cannot be recognized as a key
+    /// (i.e.: a key that doesn't provide a valid
+    /// [`CTorPath`](crate::CTorPath))
+    #[error("unrecognized key")]
+    NotAKey,
 
     /// Found an invalid ed25519 public key
     #[error("invalid ed25519 public key")]

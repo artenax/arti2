@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 pub mod config;
@@ -127,7 +128,9 @@ impl<R: Runtime> PtMgr<R> {
         for opt in ret.values() {
             if let TransportOptions::Unmanaged(u) = opt {
                 if !u.is_localhost() {
-                    warn!("Configured to connect to a PT on a non-local addresses. This is usually insecure! We recommend running PTs on localhost only.");
+                    warn!(
+                        "Configured to connect to a PT on a non-local addresses. This is usually insecure! We recommend running PTs on localhost only."
+                    );
                 }
             }
         }
@@ -235,7 +238,9 @@ impl<R: Runtime> PtMgr<R> {
                 match managed_cmethod {
                     // A configured-and-running cmethod.
                     Some(cmethod) => {
-                        trace!("Found configured managed transport {transport} accessible via {cmethod:?}");
+                        trace!(
+                            "Found configured managed transport {transport} accessible via {cmethod:?}"
+                        );
                         Ok(Some(cmethod))
                     }
                     // A configured-but-not-running cmethod.
@@ -281,7 +286,9 @@ impl<R: Runtime> PtMgr<R> {
     ) -> Result<PtClientMethod, PtError> {
         // Tell the reactor to spawn the PT, and wait for it.
         // (The reactor will handle coalescing multiple requests.)
-        info!("Got a request for transport {transport}, which is not currently running. Launching it.");
+        info!(
+            "Got a request for transport {transport}, which is not currently running. Launching it."
+        );
 
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -346,7 +353,7 @@ impl<R: Runtime> tor_chanmgr::factory::AbstractPtMgr for PtMgr<R> {
         };
 
         let proxy = ExternalProxyPlugin::new(self.runtime.clone(), cmethod.endpoint, cmethod.kind);
-        let factory = ChanBuilder::new(self.runtime.clone(), proxy);
+        let factory = ChanBuilder::new(self.runtime.clone(), proxy, None);
         // FIXME(eta): Should we cache constructed factories? If no: should this still be an Arc?
         // FIXME(eta): Should we track what transports are live somehow, so we can shut them down?
         Ok(Some(Arc::new(factory)))

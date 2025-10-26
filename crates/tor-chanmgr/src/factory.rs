@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::event::ChanMgrEventSender;
 use async_trait::async_trait;
-use tor_error::{internal, HasKind, HasRetryTime};
+use tor_error::{HasKind, HasRetryTime, internal};
 use tor_linkspec::{HasChanMethod, OwnedChanTarget, PtTransportName};
 use tor_proto::channel::Channel;
 use tor_proto::memquota::ChannelAccount;
-use tracing::debug;
+use tracing::{debug, instrument};
 
 /// An opaque type that lets a `ChannelFactory` update the `ChanMgr` about bootstrap progress.
 ///
@@ -90,6 +90,7 @@ where
     type BuildSpec = OwnedChanTarget;
     type Stream = CF::Stream;
 
+    #[instrument(skip_all, level = "trace")]
     async fn build_channel(
         &self,
         target: &Self::BuildSpec,
@@ -101,6 +102,7 @@ where
     }
 
     #[cfg(feature = "relay")]
+    #[instrument(skip_all, level = "trace")]
     async fn build_channel_using_incoming(
         &self,
         peer: std::net::SocketAddr,
@@ -169,6 +171,7 @@ impl<CF> Clone for CompoundFactory<CF> {
 
 #[async_trait]
 impl<CF: ChannelFactory> ChannelFactory for CompoundFactory<CF> {
+    #[instrument(skip_all, level = "trace")]
     async fn connect_via_transport(
         &self,
         target: &OwnedChanTarget,
@@ -191,7 +194,7 @@ impl<CF: ChannelFactory> ChannelFactory for CompoundFactory<CF> {
             _ => {
                 return Err(crate::Error::Internal(internal!(
                     "No support for channel method"
-                )))
+                )));
             }
         };
 

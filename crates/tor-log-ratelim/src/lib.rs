@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 /// Implementation notes
@@ -76,17 +77,17 @@ mod ratelim;
 
 use std::time::Duration;
 
-pub use ratelim::rt::{install_runtime, InstallRuntimeError};
+pub use ratelim::rt::{InstallRuntimeError, install_runtime};
 
 /// Re-exports for macros.
 #[doc(hidden)]
 pub mod macro_prelude {
     pub use crate::{
-        logstate::LogState,
-        ratelim::{rt::rt_support, RateLim},
         Activity, Loggable,
+        logstate::LogState,
+        ratelim::{RateLim, rt::rt_support},
     };
-    pub use once_cell::sync::Lazy;
+    pub use std::sync::LazyLock;
     pub use std::sync::{Arc, Mutex, Weak};
     pub use tor_error::ErrorReport;
     pub use tracing;

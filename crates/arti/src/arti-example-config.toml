@@ -48,7 +48,7 @@
 [logging]
 
 # Specify filtering directives for sending trace messages to the console
-# (via standard output).
+# (via stderr).
 #
 # It can be as simple as a single loglevel, or as complicated as a
 # list with per-module settings.
@@ -95,6 +95,43 @@
 # outside of arti, including journald.
 #
 #time_granularity = "1s"
+
+# If the experimental `opentelemetry` feature is enabled, spans can be exported
+# to a HTTP(S) URL or to a JSON file in the https://opentelemetry.io format.
+#
+# Note that this information may be extremely sensitive. It is not recommended
+# to use this outside of development and debugging usecases.
+#
+# Only one of `file` or `http` may be specified, due to limitations in the
+# underlying tracing system.
+#
+# For example (not the default):
+#     opentelemetry.file = { path = "~/logs/otel.json" }
+#
+# You can also specify a `batch` option on both `file` and `http` exporters, to
+# configure how the writes are batched. The `http` exporter also supports
+# setting a timeout. If not set, these will all be left at the OpenTelemetry
+# defaults. For example (not the defaults):
+#
+#     opentelemetry.http = {endpoint = "http://localhost:4318/v1/traces", timeout = "15s", batch = { max_queue_size = 1024, max_export_batch_size = 256, scheduled_delay = "5s" } }
+
+[metrics]
+
+# Arti can export metrics, offering a Prometheus scraper endpoint.
+# Usually only used when providing Tor Hidden Services (Onion Services).
+#
+# WARNING: exposing these metrics publicly is dangerous, and must be avoided.
+# Currently only plaintext HTTP is supported, either on a localhost IPv4 port,
+# or on a single other IPv4 or IPv6 address and port.
+# There is no access control beyond that implied by listening only on localhost.
+#
+# The set of metrics currently available is quite limited, and not stable.
+# We expect to extend it; MRs welcome.
+
+# This suggested port is the same as the example in the C Tor tor(1) manpage.
+# But note that the set of available metrics is quite different.
+#
+#    prometheus.listen = 9035
 
 # Locations to use for storing things on disk.
 #
@@ -373,9 +410,12 @@
 [tor_network]
 # List of locations to look in when downloading directory information
 # we don't actually have a directory yet.
+#
 #   fallback_caches = [ <default list is compiled-in > ]
 
-# List of directory authorities which we expect to sign consensus documents.
+# List of directory authorities which we expect to sign consensus documents and
+# to download directory information from, if we are a directory mirror.
+#
 #   authorities = [ <default list is compiled-in > ]
 
 # Channels and their behaviour
@@ -454,16 +494,31 @@
 # to Arti when we launch?
 #max_files = 16384
 
-# Are we limiting memory use and if so to how much?
-# The default is unlimited.
+## Are we limiting memory use, and if so to how much?
+
+# Maximum tracked memory use, after which reclamation starts.
 #
-# Maximum memory use, after which reclamation starts:
+# The default is "auto", which uses a value derived from the total system
+# memory. It should not be assumed that the value used for "auto" will remain
+# stable across different versions of arti. The value used for "auto" may also
+# take into account other OS-specific features, such as cgroups on Linux.
+#
+# Note that not all memory usage is tracked: Arti can actually
+# use more memory than is listed here for various kinds of overhead.
+#
+# If `system.memory.low_water` is given as an explicit value,
+# `system.memory.max` must also be given as an explicit value.
+#
 #    memory.max = "8 GiB"
-# (If anything is specified in `[system.memory]`, this value is mandatory.)
+
+# Low-water mark for tracked memory:
+# When reclaiming memory, we stop when we reach this amount.
 #
-# When reclaiming memory, we stop when we reach this amount:
+# The default is "auto", which uses 3/4 of `system.memory.max`. It should not be
+# assumed that the value used for "auto" will remain stable across different
+# versions of arti.
+#
 #    memory.low_water = "6 GiB"
-# (The default is 3/4 of `system.memory.max`.)
 
 ##### ONION SERVICES
 #
@@ -514,6 +569,15 @@
 #
 #    enable_pow = false
 
+# The maximum number of entries allowed in the rendezvous request queue when PoW is enabled.
+#
+# If you are seeing dropped requests, have a bursty traffic pattern, and have some memory to
+# spare, you may want to increase this. Each entry will take a few KB. If this is reduced at
+# runtime, it may prevent new requests from coming in until the queue is smaller than the new
+# size, but it will not drop existing requests that are in the queue.
+#
+#    pow_rend_queue_depth = 8192
+
 #    [onion_services."allium-cepa".restricted_discovery]
 # Whether to enable restricted discovery mode.
 #
@@ -547,6 +611,65 @@
 #    alice = "descriptor:x25519:PU63REQUH4PP464E2Y7AVQ35HBB5DXDH5XEUVUNP3KCPNOXZGIBA"
 #    bob = "descriptor:x25519:B5ZQGTPERMMUDA6VC63LHJUF5IHPOKJMUK26LY2XKSF7VG52AESQ"
 
+##### RPC
+# Configuration options for the RPC subsystem.
+# The RPC subsystem allows other applications to access Arti, and control its behavior.
+# It is only available if Arti was built with RPC support.
+#
+#    [rpc]
+#
+# A boolean to determine whether Arti should accept RPC connections.
+#
+#    enable = false
+#
+# A set of default locations where Arti should listen for RPC connections,
+# if none were configured. You should typically not override this.
+# Use specific rpc.listen options instead.
+#
+#    # listen_default = [ <A list of platform-dependent default connect points, as strings> ]
+#
+# Instead, if you want to override the ways in which Arti listens for RPC connections,
+# you should declare one or more of these [rpc.listen] sections.
+# Each of them specifies a place where Arti will look for "connect files".
+# (These are JSON files that tell Arti where to listen for connections,
+# and tell applications how to connect to Arti.
+# For more information on their format, see the RPC documentation at
+# https://gitlab.torproject.org/tpo/core/arti/-/tree/main/doc/dev/rpc-book)
+#
+# The defaults are:
+#
+#    [rpc.listen."user-default"]
+#    enable = true
+#    dir = "${ARTI_LOCAL_DATA}/rpc/connect.d"
+#
+#    [rpc.listen."system-default"]
+#    enable = false
+#    dir = "/etc/arti-rpc/connect.d"
+#
+# Available options for configuring connect points are as follows.
+# Each listener section is introduced with a label. This can be an arbitrary identifier.
+#
+#       [rpc.listen."label"]
+#
+# A boolean to enable or disable the entire listener section. (Default is 'true')
+#
+#       enable = true
+#
+# A single connect file.
+#
+#       file = "${HOME}/.arti_connect.json"
+#
+# A directory to search for connect files.  Only filenames ending with ".json" are considered.
+# This option is mutually exclusive with "file".
+# Exactly one of "file" and "dir" must be set.
+#
+#       dir = "${HOME}/.my_connect_files/"
+#
+# A map from filenames within "dir" to options to set on those files.
+# Currently only "enable" is supported.
+#
+#       file_options = { "bad_file.json" = { enable = false }}
+
 [vanguards]
 # The kind of vanguard to use when building onion service circuits.
 #
@@ -562,3 +685,17 @@
 # Setting this option to anything other than "auto" or "disabled" when
 # the `vanguards` feature is disabled is a configuration error.
 #mode = "auto"
+
+# Support for overriding Arti's behavior when a required or recommended protocol is missing.
+#
+# Ordinarily, Arti will exit when the consensus says that some protocol is required,
+# and Arti does not support that protocol.  You can override this behavior
+# by listing that protocol here.
+#
+# It is almost always better to upgrade Arti than to use this feature.
+#
+#[use_obsolete_software]
+#
+# A space-separated list of protocols. Protocols have names like "Cons=4" or "Relay=3".
+#
+#ignore_missing_required_protocols = ""

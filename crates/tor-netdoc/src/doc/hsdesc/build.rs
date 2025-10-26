@@ -4,8 +4,8 @@ mod inner;
 mod middle;
 mod outer;
 
-use crate::doc::hsdesc::{IntroAuthType, IntroPointDesc};
 use crate::NetdocBuilder;
+use crate::doc::hsdesc::{IntroAuthType, IntroPointDesc};
 use rand::{CryptoRng, RngCore};
 use tor_bytes::EncodeError;
 use tor_cell::chancell::msg::HandshakeType;
@@ -27,7 +27,7 @@ use self::inner::HsDescInner;
 use self::middle::HsDescMiddle;
 use self::outer::HsDescOuter;
 
-use super::desc_enc::{HsDescEncNonce, HsDescEncryption, HS_DESC_ENC_NONCE_LEN};
+use super::desc_enc::{HS_DESC_ENC_NONCE_LEN, HsDescEncNonce, HsDescEncryption};
 use super::pow::PowParams;
 
 /// An intermediary type for encoding hidden service descriptors.
@@ -65,6 +65,7 @@ struct HsDesc<'a> {
     #[builder(default)]
     #[cfg(feature = "hs-pow-full")]
     pow_params: Option<&'a PowParams>,
+
     /// The list of clients authorized to discover the hidden service.
     ///
     /// If `None`, restricted discovery is disabled.
@@ -88,6 +89,13 @@ struct HsDesc<'a> {
     revision_counter: RevisionCounter,
     /// The "subcredential" of the onion service.
     subcredential: Subcredential,
+
+    /// Maximum length of generated HsDesc.
+    ///
+    /// If the generated descriptor is larger than this, `build_sign` will return an error.
+    #[builder(field(type = "Option<usize>", build = "()"), setter(strip_option))]
+    #[allow(dead_code)]
+    max_generated_len: (),
 }
 
 /// Restricted discovery parameters.
@@ -144,6 +152,8 @@ impl<'a> NetdocBuilder for HsDescBuilder<'a> {
         ///
         /// rend-spec-v3 2.5.1.1
         const SUPERENCRYPTED_ALIGN: usize = 10 * (1 << 10);
+
+        let max_generated_len = self.max_generated_len.unwrap_or(usize::MAX);
 
         let hs_desc = self
             .build()
@@ -204,14 +214,19 @@ impl<'a> NetdocBuilder for HsDescBuilder<'a> {
         );
 
         // Finally, build the hidden service descriptor.
-        HsDescOuter {
+        let hsdesc = HsDescOuter {
             hs_desc_sign: hs_desc.hs_desc_sign,
             hs_desc_sign_cert: hs_desc.hs_desc_sign_cert,
             lifetime: hs_desc.lifetime,
             revision_counter: hs_desc.revision_counter,
             superencrypted: middle_encrypted,
         }
-        .build_sign(rng)
+        .build_sign(rng)?;
+
+        if hsdesc.len() > max_generated_len {
+            return Err(EncodeError::BadLengthValue);
+        }
+        Ok(hsdesc)
     }
 }
 
@@ -268,7 +283,7 @@ fn pad_with_zero_to_align(v: &[u8], alignment: usize) -> Cow<[u8]> {
         let padded = v
             .iter()
             .copied()
-            .chain(std::iter::repeat(0).take(padding))
+            .chain(std::iter::repeat_n(0, padding))
             .collect::<Vec<_>>();
 
         Cow::Owned(padded)
@@ -398,9 +413,11 @@ mod test {
         let expiry = SystemTime::now() + Duration::from_secs(CERT_EXPIRY_SECS);
         let mut rng = Config::Deterministic.into_rng();
         let intro_points = vec![IntroPointDesc {
-            link_specifiers: vec![LinkSpec::OrPort(Ipv4Addr::LOCALHOST.into(), 9999)
-                .encode()
-                .unwrap()],
+            link_specifiers: vec![
+                LinkSpec::OrPort(Ipv4Addr::LOCALHOST.into(), 9999)
+                    .encode()
+                    .unwrap(),
+            ],
             ipt_ntor_key: create_curve25519_pk(&mut rng),
             ipt_sid_key: ed25519::Keypair::generate(&mut rng).verifying_key().into(),
             svc_ntor_key: create_curve25519_pk(&mut rng).into(),

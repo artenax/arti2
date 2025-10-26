@@ -2,10 +2,11 @@
 //!
 //! See the [`KeyMgr`] docs for more details.
 
+use crate::raw::{RawEntryId, RawKeystoreEntry};
 use crate::{
-    ArtiPath, BoxedKeystore, KeyCertificateSpecifier, KeyPath, KeyPathError, KeyPathInfo,
-    KeyPathInfoExtractor, KeyPathPattern, KeySpecifier, KeystoreCorruptionError, KeystoreId,
-    KeystoreSelector, Result,
+    ArtiPath, BoxedKeystore, Error, KeyCertificateSpecifier, KeyPath, KeyPathError, KeyPathInfo,
+    KeyPathInfoExtractor, KeyPathPattern, KeySpecifier, KeystoreCorruptionError,
+    KeystoreEntryResult, KeystoreId, KeystoreSelector, Result,
 };
 
 use itertools::Itertools;
@@ -68,9 +69,47 @@ pub struct KeystoreEntry<'a> {
     key_path: KeyPath,
     /// The [`KeystoreItemType`] of the key.
     key_type: KeystoreItemType,
-    /// The [`KeystoreId`] that of the keystore where the key was found.
+    /// The [`KeystoreId`] of the keystore where the key was found.
     #[getter(as_copy)]
     keystore_id: &'a KeystoreId,
+    /// The [`RawEntryId`] of the key, an identifier used in
+    /// `arti raw` operations.
+    #[getter(skip)]
+    raw_id: RawEntryId,
+}
+
+impl<'a> KeystoreEntry<'a> {
+    /// Create a new `KeystoreEntry`
+    pub(crate) fn new(
+        key_path: KeyPath,
+        key_type: KeystoreItemType,
+        keystore_id: &'a KeystoreId,
+        raw_id: RawEntryId,
+    ) -> Self {
+        Self {
+            key_path,
+            key_type,
+            keystore_id,
+            raw_id,
+        }
+    }
+
+    /// Return an instance of [`RawKeystoreEntry`]
+    #[cfg(feature = "onion-service-cli-extra")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "onion-service-cli-extra")))]
+    pub fn raw_entry(&self) -> RawKeystoreEntry {
+        RawKeystoreEntry::new(self.raw_id.clone(), self.keystore_id.clone())
+    }
+}
+
+// NOTE: Some methods require a `KeystoreEntryResult<KeystoreEntry>` as an
+// argument (e.g.: `KeyMgr::raw_keystore_entry`). For this reason  implementing
+// `From<KeystoreEntry<'a>> for KeystoreEntryResult<KeystoreEntry<'a>>` makes
+// `KeystoreEntry` more ergonomic.
+impl<'a> From<KeystoreEntry<'a>> for KeystoreEntryResult<KeystoreEntry<'a>> {
+    fn from(val: KeystoreEntry<'a>) -> Self {
+        Ok(val)
+    }
 }
 
 impl KeyMgrBuilder {
@@ -191,6 +230,53 @@ impl KeyMgr {
         }
     }
 
+    /// Read a key from one of the key stores specified, and try to deserialize it as `K::Key`.
+    ///
+    /// Returns `Ok(None)` if none of the key stores have the requested key.
+    ///
+    /// Returns an error if the specified keystore does not exist.
+    #[cfg(feature = "onion-service-cli-extra")]
+    pub fn get_from<K: ToEncodableKey>(
+        &self,
+        key_spec: &dyn KeySpecifier,
+        keystore_id: &KeystoreId,
+    ) -> Result<Option<K>> {
+        let store = std::iter::once(self.find_keystore(keystore_id)?);
+        self.get_from_store(key_spec, &K::Key::item_type(), store)
+    }
+
+    /// Validates the integrity of a [`KeystoreEntry`].
+    ///
+    /// This retrieves the key corresponding to the provided [`KeystoreEntry`],
+    /// and checks if its contents are valid (i.e. that the key can be parsed).
+    /// The [`KeyPath`] of the entry is further validated using [`describe`](KeyMgr::describe).
+    ///
+    /// NOTE: Currently, ctor entries cannot be validated using [`describe`](KeyMgr::describe), so they
+    /// are considered valid if the manager successfully retrieves the corresponding keys,
+    /// but are otherwise not validated by this procedure.
+    ///
+    /// Returns `Ok(())` if the specified keystore entry is valid, and `Err` otherwise.
+    ///
+    /// NOTE: If the specified entry does not exist, this will only validate its [`KeyPath`].
+    #[cfg(feature = "onion-service-cli-extra")]
+    pub fn validate_entry_integrity(&self, entry: &KeystoreEntry) -> Result<()> {
+        let selector = entry.keystore_id().into();
+        let store = self.select_keystore(&selector)?;
+        // Ignore the parsed key, only checking if it parses correctly
+        let _ = store.get(entry.key_path(), entry.key_type())?;
+
+        // TODO: Implement `describe()` support for CTor keystore entries
+        if !matches!(entry.key_path(), KeyPath::CTor(_)) {
+            // Ignore the result, just checking if the path is recognized
+            let _ = self
+                .describe(entry.key_path())
+                // TODO: `Error::Corruption` might not be the best fit for this situation.
+                .map_err(|e| Error::Corruption(e.into()))?;
+        }
+
+        Ok(())
+    }
+
     /// Generate a new key of type `K`, and insert it into the key store specified by `selector`.
     ///
     /// If the key already exists in the specified key store, the `overwrite` flag is used to
@@ -198,8 +284,8 @@ impl KeyMgr {
     ///
     /// On success, this function returns the newly generated key.
     ///
-    /// Returns [`Error::KeyAlreadyExists`](crate::Error::KeyAlreadyExists)
-    /// if the key already exists in the specified key store and `overwrite` is `false`.
+    /// Returns [`Error::KeyAlreadyExists`] if the key already exists in the specified
+    /// key store and `overwrite` is `false`.
     ///
     /// **IMPORTANT**: using this function concurrently with any other `KeyMgr` operation that
     /// mutates the key store state is **not** recommended, as it can yield surprising results! The
@@ -223,11 +309,10 @@ impl KeyMgr {
         K::Key: Keygen,
     {
         let store = self.select_keystore(&selector)?;
-        let key_type = K::Key::item_type();
 
-        if overwrite || !store.contains(key_spec, &key_type)? {
+        if overwrite || !store.contains(key_spec, &K::Key::item_type())? {
             let key = K::Key::generate(rng)?;
-            store.insert(&key, key_spec, &key_type)?;
+            store.insert(&key, key_spec)?;
 
             Ok(K::from_encodable_key(key))
         } else {
@@ -262,7 +347,7 @@ impl KeyMgr {
         if old_key.is_some() && !overwrite {
             Err(crate::Error::KeyAlreadyExists)
         } else {
-            let () = store.insert(&key, key_spec, &key_type)?;
+            let () = store.insert(&key, key_spec)?;
             Ok(old_key)
         }
     }
@@ -309,25 +394,64 @@ impl KeyMgr {
         store.remove(entry.key_path(), entry.key_type())
     }
 
+    /// Remove the specified keystore entry.
+    ///
+    /// Similar to [`KeyMgr::remove_entry`], except this method accepts both recognized and
+    /// unrecognized entries, identified by a raw id (in the form of a `&str`) and a
+    /// [`KeystoreId`].
+    ///
+    /// Returns an error if the entry could not be removed, or if the entry doesn't exist.
+    #[cfg(feature = "onion-service-cli-extra")]
+    pub fn remove_unchecked(&self, raw_id: &str, keystore_id: &KeystoreId) -> Result<()> {
+        let selector = KeystoreSelector::from(keystore_id);
+        let store = self.select_keystore(&selector)?;
+        let raw_id = store.raw_entry_id(raw_id)?;
+        let store = self.select_keystore(&selector)?;
+        store.remove_unchecked(&raw_id)
+    }
+
     /// Return the keystore entry descriptors of the keys matching the specified [`KeyPathPattern`].
     ///
     /// NOTE: This searches for matching keys in _all_ keystores.
+    ///
+    /// NOTE: This function only returns the *recognized* entries that match the provided pattern.
+    /// The unrecognized entries (i.e. those that do not have a valid [`KeyPath`]) will be filtered out,
+    /// even if they match the specified pattern.
     pub fn list_matching(&self, pat: &KeyPathPattern) -> Result<Vec<KeystoreEntry>> {
         self.all_stores()
             .map(|store| -> Result<Vec<_>> {
                 Ok(store
                     .list()?
                     .into_iter()
-                    .filter(|(key_path, _): &(KeyPath, KeystoreItemType)| key_path.matches(pat))
-                    .map(|(path, key_type)| KeystoreEntry {
-                        key_path: path.clone(),
-                        key_type,
-                        keystore_id: store.id(),
-                    })
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.key_path().matches(pat))
                     .collect::<Vec<_>>())
             })
             .flatten_ok()
             .collect::<Result<Vec<_>>>()
+    }
+
+    /// List keys and certificates of the specified keystore.
+    #[cfg(feature = "onion-service-cli-extra")]
+    pub fn list_by_id(&self, id: &KeystoreId) -> Result<Vec<KeystoreEntryResult<KeystoreEntry>>> {
+        self.find_keystore(id)?.list()
+    }
+
+    /// List keys and certificates of all the keystores.
+    #[cfg(feature = "onion-service-cli-extra")]
+    pub fn list(&self) -> Result<Vec<KeystoreEntryResult<KeystoreEntry>>> {
+        self.all_stores()
+            .map(|store| -> Result<Vec<_>> { store.list() })
+            .flatten_ok()
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// List all the configured keystore.
+    #[cfg(feature = "onion-service-cli-extra")]
+    pub fn list_keystores(&self) -> Vec<KeystoreId> {
+        self.all_stores()
+            .map(|store| store.id().to_owned())
+            .collect()
     }
 
     /// Describe the specified key.
@@ -581,7 +705,7 @@ impl KeyMgr {
     fn find_keystore(&self, id: &KeystoreId) -> Result<&BoxedKeystore> {
         self.all_stores()
             .find(|keystore| keystore.id() == id)
-            .ok_or_else(|| bad_api_usage!("could not find keystore with ID {id}").into())
+            .ok_or_else(|| crate::Error::KeystoreNotFound(id.clone()))
     }
 
     /// Get the signing key of the certificate described by `spec`.
@@ -635,9 +759,8 @@ impl KeyMgr {
     {
         let cert = cert.to_encodable_cert();
         let store = self.select_keystore(&selector)?;
-        let cert_type = <C::EncodableCert as ItemType>::item_type();
 
-        let () = store.insert(&cert, cert_spec, &cert_type)?;
+        let () = store.insert(&cert, cert_spec)?;
         Ok(())
     }
 }
@@ -658,27 +781,125 @@ mod tests {
     #![allow(clippy::needless_pass_by_value)]
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
-    use crate::{ArtiPath, ArtiPathUnavailableError, KeyPath};
-    use std::collections::HashMap;
+    use crate::keystore::arti::err::{ArtiNativeKeystoreError, MalformedPathError};
+    use crate::raw::{RawEntryId, RawKeystoreEntry};
+    use crate::{
+        ArtiPath, ArtiPathUnavailableError, Error, KeyPath, KeystoreEntryResult, KeystoreError,
+        UnrecognizedEntryError,
+    };
+    use std::path::PathBuf;
     use std::result::Result as StdResult;
     use std::str::FromStr;
-    use std::sync::RwLock;
+    use std::sync::{Arc, RwLock};
     use std::time::{Duration, SystemTime};
     use tor_basic_utils::test_rng::testing_rng;
     use tor_cert::CertifiedKey;
     use tor_cert::Ed25519Cert;
+    use tor_error::{ErrorKind, HasKind};
     use tor_key_forge::{
         CertData, EncodableItem, ErasedKey, InvalidCertError, KeyType, KeystoreItem,
     };
     use tor_llcrypto::pk::ed25519::{self, Ed25519PublicKey as _};
+    use tor_llcrypto::rng::FakeEntropicRng;
+
+    /// Metadata structure for tracking key operations in tests.
+    #[derive(Clone, Debug, PartialEq)]
+    struct KeyMetadata {
+        /// The identifier for the item (e.g., "coot", "moorhen").
+        item_id: String,
+        /// The keystore from which the item was retrieved.
+        ///
+        /// Set by `Keystore::get`.
+        retrieved_from: Option<KeystoreId>,
+        /// Whether the item was generated via `Keygen::generate`.
+        is_generated: bool,
+    }
+
+    /// Metadata structure for tracking certificate operations in tests.
+    #[derive(Clone, Debug, PartialEq)]
+    struct CertMetadata {
+        /// The identifier for the subject key (e.g., "coot").
+        subject_key_id: String,
+        /// The identifier for the signing key (e.g., "moorhen").
+        signing_key_id: String,
+        /// The keystore from which the certificate was retrieved.
+        ///
+        /// Set by `Keystore::get`.
+        retrieved_from: Option<KeystoreId>,
+        /// Whether the certificate was freshly generated (i.e. returned from the "or generate"
+        /// branch of `get_or_generate()`) or retrieved from a keystore.
+        is_generated: bool,
+    }
+
+    /// Metadata structure for tracking item operations in tests.
+    #[derive(Clone, Debug, PartialEq, derive_more::From)]
+    enum ItemMetadata {
+        /// Metadata about a key.
+        Key(KeyMetadata),
+        /// Metadata about a certificate.
+        Cert(CertMetadata),
+    }
+
+    impl ItemMetadata {
+        /// Get the item ID.
+        ///
+        /// For keys, this returns the key's ID.
+        /// For certificates, this returns a formatted string identifying the subject key.
+        fn item_id(&self) -> &str {
+            match self {
+                ItemMetadata::Key(k) => &k.item_id,
+                ItemMetadata::Cert(c) => &c.subject_key_id,
+            }
+        }
+
+        /// Get retrieved_from.
+        fn retrieved_from(&self) -> Option<&KeystoreId> {
+            match self {
+                ItemMetadata::Key(k) => k.retrieved_from.as_ref(),
+                ItemMetadata::Cert(c) => c.retrieved_from.as_ref(),
+            }
+        }
+
+        /// Get is_generated.
+        fn is_generated(&self) -> bool {
+            match self {
+                ItemMetadata::Key(k) => k.is_generated,
+                ItemMetadata::Cert(c) => c.is_generated,
+            }
+        }
+
+        /// Set the retrieved_from field to the specified keystore ID.
+        fn set_retrieved_from(&mut self, id: KeystoreId) {
+            match self {
+                ItemMetadata::Key(meta) => meta.retrieved_from = Some(id),
+                ItemMetadata::Cert(meta) => meta.retrieved_from = Some(id),
+            }
+        }
+
+        /// Returns a reference to key metadata if this is a Key variant.
+        fn as_key(&self) -> Option<&KeyMetadata> {
+            match self {
+                ItemMetadata::Key(meta) => Some(meta),
+                _ => None,
+            }
+        }
+
+        /// Returns a reference to certificate metadata if this is a Cert variant.
+        fn as_cert(&self) -> Option<&CertMetadata> {
+            match self {
+                ItemMetadata::Cert(meta) => Some(meta),
+                _ => None,
+            }
+        }
+    }
 
     /// The type of "key" stored in the test key stores.
     #[derive(Clone, Debug)]
     struct TestItem {
         /// The underlying key.
         item: KeystoreItem,
-        /// Some metadata about the key
-        meta: String,
+        /// Metadata about the key.
+        meta: ItemMetadata,
     }
 
     /// A "certificate" used for testing purposes.
@@ -700,13 +921,17 @@ mod tests {
 
     impl TestItem {
         /// Create a new test key with the specified metadata.
-        fn new(meta: &str) -> Self {
+        fn new(item_id: &str) -> Self {
             let mut rng = testing_rng();
             TestItem {
                 item: ed25519::Keypair::generate(&mut rng)
                     .as_keystore_item()
                     .unwrap(),
-                meta: meta.into(),
+                meta: ItemMetadata::Key(KeyMetadata {
+                    item_id: item_id.to_string(),
+                    retrieved_from: None,
+                    is_generated: false,
+                }),
             }
         }
     }
@@ -718,7 +943,11 @@ mod tests {
         {
             Ok(TestItem {
                 item: ed25519::Keypair::generate(&mut rng).as_keystore_item()?,
-                meta: "generated_test_key".into(),
+                meta: ItemMetadata::Key(KeyMetadata {
+                    item_id: "generated_test_key".to_string(),
+                    retrieved_from: None,
+                    is_generated: true,
+                }),
             })
         }
     }
@@ -800,18 +1029,68 @@ mod tests {
         }
     }
 
+    #[derive(thiserror::Error, Debug, Clone, derive_more::Display)]
+    enum MockKeystoreError {
+        NotFound,
+    }
+
+    impl KeystoreError for MockKeystoreError {}
+
+    impl HasKind for MockKeystoreError {
+        fn kind(&self) -> ErrorKind {
+            // Return a dummy ErrorKind for the purposes of this test
+            tor_error::ErrorKind::Other
+        }
+    }
+
+    fn build_raw_id_path<T: ToString>(key_path: &T, key_type: &KeystoreItemType) -> RawEntryId {
+        let mut path = key_path.to_string();
+        path.push('.');
+        path.push_str(&key_type.arti_extension());
+        RawEntryId::Path(PathBuf::from(&path))
+    }
+
     macro_rules! impl_keystore {
-        ($name:tt, $id:expr) => {
+        ($name:tt, $id:expr $(,$unrec:expr)?) => {
             struct $name {
-                inner: RwLock<HashMap<(ArtiPath, KeystoreItemType), TestItem>>,
+                inner: RwLock<
+                    Vec<StdResult<(ArtiPath, KeystoreItemType, TestItem), UnrecognizedEntryError>>,
+                >,
                 id: KeystoreId,
             }
 
             impl Default for $name {
                 fn default() -> Self {
+                    let id = KeystoreId::from_str($id).unwrap();
+                    let inner: RwLock<
+                        Vec<
+                            StdResult<
+                                (ArtiPath, KeystoreItemType, TestItem),
+                                UnrecognizedEntryError,
+                            >,
+                        >,
+                    > = Default::default();
+                    // Populate the Keystore with the specified number
+                    // of unrecognized entries.
+                    $(
+                        for i in 0..$unrec {
+                            let invalid_key_path =
+                                PathBuf::from(&format!("unrecognized_entry{}", i));
+                            let raw_id = RawEntryId::Path(invalid_key_path.clone());
+                            let entry = RawKeystoreEntry::new(raw_id, id.clone()).into();
+                            let entry = UnrecognizedEntryError::new(
+                                entry,
+                                Arc::new(ArtiNativeKeystoreError::MalformedPath {
+                                    path: invalid_key_path,
+                                    err: MalformedPathError::NoExtension,
+                                }),
+                            );
+                            inner.write().unwrap().push(Err(entry));
+                        }
+                    )?
                     Self {
-                        inner: Default::default(),
-                        id: KeystoreId::from_str($id).unwrap(),
+                        inner,
+                        id,
                     }
                 }
             }
@@ -829,11 +1108,17 @@ mod tests {
                     key_spec: &dyn KeySpecifier,
                     item_type: &KeystoreItemType,
                 ) -> Result<bool> {
+                    let wanted_arti_path = key_spec.arti_path().unwrap();
                     Ok(self
                         .inner
                         .read()
                         .unwrap()
-                        .contains_key(&(key_spec.arti_path().unwrap(), item_type.clone())))
+                        .iter()
+                        .find(|res| match res {
+                            Ok((spec, ty, _)) => spec == &wanted_arti_path && ty == item_type,
+                            Err(_) => false,
+                        })
+                        .is_some())
                 }
 
                 fn id(&self) -> &KeystoreId {
@@ -845,31 +1130,51 @@ mod tests {
                     key_spec: &dyn KeySpecifier,
                     item_type: &KeystoreItemType,
                 ) -> Result<Option<ErasedKey>> {
-                    Ok(self
-                        .inner
-                        .read()
-                        .unwrap()
-                        .get(&(key_spec.arti_path().unwrap(), item_type.clone()))
-                        .map(|k| Box::new(k.clone()) as Box<dyn ItemType>))
+                    let key_spec = key_spec.arti_path().unwrap();
+
+                    Ok(self.inner.read().unwrap().iter().find_map(|res| {
+                        match res {
+                            Ok((arti_path, ty, k)) => {
+                                if arti_path == &key_spec && ty == item_type {
+                                    let mut k = k.clone();
+                                    k.meta.set_retrieved_from(self.id().clone());
+                                    return Some(Box::new(k) as Box<dyn ItemType>);
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                        None
+                    }))
+                }
+
+                #[cfg(feature = "onion-service-cli-extra")]
+                fn raw_entry_id(&self, raw_id: &str) -> Result<RawEntryId> {
+                    Ok(RawEntryId::Path(
+                        PathBuf::from(raw_id.to_string()),
+                    ))
                 }
 
                 fn insert(
                     &self,
                     key: &dyn EncodableItem,
                     key_spec: &dyn KeySpecifier,
-                    item_type: &KeystoreItemType,
                 ) -> Result<()> {
                     let key = key.downcast_ref::<TestItem>().unwrap();
-                    let value = &key.meta;
-                    let key = TestItem {
-                        item: key.as_keystore_item()?,
-                        meta: format!("{}_{value}", self.id()),
-                    };
+
+                    let item = key.as_keystore_item()?;
+                    let meta = key.meta.clone();
+
+                    let item_type = item.item_type()?;
+                    let key = TestItem { item, meta };
 
                     self.inner
                         .write()
                         .unwrap()
-                        .insert((key_spec.arti_path().unwrap(), item_type.clone()), key);
+                        // TODO: `insert` is used instead of `push`, because some of the
+                        // tests (mainly `insert_and_get` and `keygen`) fail otherwise.
+                        // It could be a good idea to use `push` and adapt the tests,
+                        // in order to reduce cognitive complexity.
+                        .insert(0, (Ok((key_spec.arti_path().unwrap(), item_type, key))));
 
                     Ok(())
                 }
@@ -879,22 +1184,57 @@ mod tests {
                     key_spec: &dyn KeySpecifier,
                     item_type: &KeystoreItemType,
                 ) -> Result<Option<()>> {
-                    Ok(self
-                        .inner
-                        .write()
-                        .unwrap()
-                        .remove(&(key_spec.arti_path().unwrap(), item_type.clone()))
-                        .map(|_| ()))
+                    let wanted_arti_path = key_spec.arti_path().unwrap();
+                    let index = self.inner.read().unwrap().iter().position(|res| {
+                        if let Ok((arti_path, ty, _)) = res {
+                            arti_path == &wanted_arti_path && ty == item_type
+                        } else {
+                            false
+                        }
+                    });
+                    let Some(index) = index else {
+                        return Ok(None);
+                    };
+                    let _ = self.inner.write().unwrap().remove(index);
+
+                    Ok(Some(()))
                 }
 
-                fn list(&self) -> Result<Vec<(KeyPath, KeystoreItemType)>> {
+                #[cfg(feature = "onion-service-cli-extra")]
+                fn remove_unchecked(&self, entry_id: &RawEntryId) -> Result<()> {
+                    let index = self.inner.read().unwrap().iter().position(|res| match res {
+                        Ok((spec, ty, _)) => {
+                            let id = build_raw_id_path(spec, ty);
+                            entry_id == &id
+                        }
+                        Err(e) => {
+                            e.entry().raw_id() == entry_id
+                        }
+                    });
+                    let Some(index) = index else {
+                        return Err(Error::Keystore(Arc::new(MockKeystoreError::NotFound)));
+                    };
+                    let _ = self.inner.write().unwrap().remove(index);
+                    Ok(())
+                }
+
+                fn list(&self) -> Result<Vec<KeystoreEntryResult<KeystoreEntry>>> {
                     Ok(self
                         .inner
                         .read()
                         .unwrap()
                         .iter()
-                        .map(|((arti_path, item_type), _)| {
-                            (KeyPath::Arti(arti_path.clone()), item_type.clone())
+                        .map(|res| match res {
+                            Ok((arti_path, ty, _)) => {
+                                let raw_id = RawEntryId::Path(
+                                    PathBuf::from(
+                                        &arti_path.to_string(),
+                                    )
+                                );
+
+                                Ok(KeystoreEntry::new(KeyPath::Arti(arti_path.clone()), ty.clone(), self.id(), raw_id))
+                            }
+                            Err(e) => Err(e.clone()),
                         })
                         .collect())
                 }
@@ -925,6 +1265,7 @@ mod tests {
     impl_keystore!(Keystore1, "keystore1");
     impl_keystore!(Keystore2, "keystore2");
     impl_keystore!(Keystore3, "keystore3");
+    impl_keystore!(KeystoreUnrec1, "keystore_unrec1", 1);
 
     impl_specifier!(TestKeySpecifier1, "spec1");
     impl_specifier!(TestKeySpecifier2, "spec2");
@@ -935,14 +1276,18 @@ mod tests {
 
     /// Create a test `KeystoreEntry`.
     fn entry_descriptor(specifier: impl KeySpecifier, keystore_id: &KeystoreId) -> KeystoreEntry {
+        let arti_path = specifier.arti_path().unwrap();
+        let raw_id = RawEntryId::Path(PathBuf::from(arti_path.as_ref()));
         KeystoreEntry {
-            key_path: specifier.arti_path().unwrap().into(),
+            key_path: arti_path.into(),
             key_type: TestItem::item_type(),
             keystore_id,
+            raw_id,
         }
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn insert_and_get() {
         let mut builder = KeyMgrBuilder::default().primary_store(Box::<Keystore1>::default());
 
@@ -963,12 +1308,13 @@ mod tests {
             .unwrap();
 
         assert!(old_key.is_none());
+        let key = mgr.get::<TestItem>(&TestKeySpecifier1).unwrap().unwrap();
+        assert_eq!(key.meta.item_id(), "coot");
         assert_eq!(
-            mgr.get::<TestItem>(&TestKeySpecifier1)
-                .unwrap()
-                .map(|k| k.meta),
-            Some("keystore2_coot".to_string()),
+            key.meta.retrieved_from(),
+            Some(&KeystoreId::from_str("keystore2").unwrap())
         );
+        assert_eq!(key.meta.is_generated(), false);
 
         // Insert a different key using the _same_ key specifier.
         let old_key = mgr
@@ -979,16 +1325,21 @@ mod tests {
                 true,
             )
             .unwrap()
-            .unwrap()
-            .meta;
-        assert_eq!(old_key, "keystore2_coot");
-        // Check that the original value was overwritten:
+            .unwrap();
+        assert_eq!(old_key.meta.item_id(), "coot");
         assert_eq!(
-            mgr.get::<TestItem>(&TestKeySpecifier1)
-                .unwrap()
-                .map(|k| k.meta),
-            Some("keystore2_gull".to_string()),
+            old_key.meta.retrieved_from(),
+            Some(&KeystoreId::from_str("keystore2").unwrap())
         );
+        assert_eq!(old_key.meta.is_generated(), false);
+        // Check that the original value was overwritten:
+        let key = mgr.get::<TestItem>(&TestKeySpecifier1).unwrap().unwrap();
+        assert_eq!(key.meta.item_id(), "gull");
+        assert_eq!(
+            key.meta.retrieved_from(),
+            Some(&KeystoreId::from_str("keystore2").unwrap())
+        );
+        assert_eq!(key.meta.is_generated(), false);
 
         // Insert a different key using the _same_ key specifier (overwrite = false)
         let err = mgr
@@ -1022,12 +1373,13 @@ mod tests {
             )
             .unwrap();
         assert!(old_key.is_none());
+        let key = mgr.get::<TestItem>(&TestKeySpecifier3).unwrap().unwrap();
+        assert_eq!(key.meta.item_id(), "moorhen");
         assert_eq!(
-            mgr.get::<TestItem>(&TestKeySpecifier3)
-                .unwrap()
-                .map(|k| k.meta),
-            Some("keystore1_moorhen".to_string())
+            key.meta.retrieved_from(),
+            Some(&KeystoreId::from_str("keystore1").unwrap())
         );
+        assert_eq!(key.meta.is_generated(), false);
 
         // The key doesn't exist in any of the stores yet.
         assert!(mgr.get::<TestItem>(&TestKeySpecifier4).unwrap().is_none());
@@ -1047,22 +1399,70 @@ mod tests {
             assert!(old_key.is_none());
 
             // Ensure the key now exists in `store`.
+            let key = mgr.get::<TestItem>(&TestKeySpecifier4).unwrap().unwrap();
+            assert_eq!(key.meta.item_id(), "cormorant");
             assert_eq!(
-                mgr.get::<TestItem>(&TestKeySpecifier4)
-                    .unwrap()
-                    .map(|k| k.meta),
-                Some(format!("{store}_cormorant"))
+                key.meta.retrieved_from(),
+                Some(&KeystoreId::from_str(store).unwrap())
             );
+            assert_eq!(key.meta.is_generated(), false);
         }
 
         // The key exists in all key stores, but if no keystore_id is specified, we return the
         // value from the first key store it is found in (in this case, Keystore1)
+        let key = mgr.get::<TestItem>(&TestKeySpecifier4).unwrap().unwrap();
+        assert_eq!(key.meta.item_id(), "cormorant");
         assert_eq!(
-            mgr.get::<TestItem>(&TestKeySpecifier4)
-                .unwrap()
-                .map(|k| k.meta),
-            Some("keystore1_cormorant".to_string())
+            key.meta.retrieved_from(),
+            Some(&KeystoreId::from_str("keystore1").unwrap())
         );
+        assert_eq!(key.meta.is_generated(), false);
+    }
+
+    #[test]
+    #[cfg(feature = "onion-service-cli-extra")]
+    fn get_from() {
+        let mut builder = KeyMgrBuilder::default().primary_store(Box::<Keystore1>::default());
+
+        builder
+            .secondary_stores()
+            .extend([Keystore2::new_boxed(), Keystore3::new_boxed()]);
+
+        let mgr = builder.build().unwrap();
+
+        let keystore1_id = KeystoreId::from_str("keystore1").unwrap();
+        let keystore2_id = KeystoreId::from_str("keystore2").unwrap();
+        let key_id_1 = "mantis shrimp";
+        let key_id_2 = "tardigrade";
+
+        // Insert a key into Keystore1
+        let _ = mgr
+            .insert(
+                TestItem::new(key_id_1),
+                &TestKeySpecifier1,
+                KeystoreSelector::Id(&keystore1_id),
+                true,
+            )
+            .unwrap();
+
+        // Insert a key into Keystore2
+        let _ = mgr
+            .insert(
+                TestItem::new(key_id_2),
+                &TestKeySpecifier1,
+                KeystoreSelector::Id(&keystore2_id),
+                true,
+            )
+            .unwrap();
+
+        // Retrieve key
+        let key = mgr
+            .get_from::<TestItem>(&TestKeySpecifier1, &keystore2_id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(key.meta.item_id(), key_id_2);
+        assert_eq!(key.meta.retrieved_from(), Some(&keystore2_id));
     }
 
     #[test]
@@ -1075,9 +1475,11 @@ mod tests {
 
         let mgr = builder.build().unwrap();
 
-        assert!(!mgr.secondary_stores[0]
-            .contains(&TestKeySpecifier1, &TestItem::item_type())
-            .unwrap());
+        assert!(
+            !mgr.secondary_stores[0]
+                .contains(&TestKeySpecifier1, &TestItem::item_type())
+                .unwrap()
+        );
 
         // Insert a key into Keystore2
         mgr.insert(
@@ -1087,55 +1489,69 @@ mod tests {
             true,
         )
         .unwrap();
+        let key = mgr.get::<TestItem>(&TestKeySpecifier1).unwrap().unwrap();
+        assert_eq!(key.meta.item_id(), "coot");
         assert_eq!(
-            mgr.get::<TestItem>(&TestKeySpecifier1)
-                .unwrap()
-                .map(|k| k.meta),
-            Some("keystore2_coot".to_string())
+            key.meta.retrieved_from(),
+            Some(&KeystoreId::from_str("keystore2").unwrap())
         );
+        assert_eq!(key.meta.is_generated(), false);
 
         // Try to remove the key from a non-existent key store
-        assert!(mgr
-            .remove::<TestItem>(
+        assert!(
+            mgr.remove::<TestItem>(
                 &TestKeySpecifier1,
                 KeystoreSelector::Id(&KeystoreId::from_str("not_an_id_we_know_of").unwrap())
             )
-            .is_err());
+            .is_err()
+        );
         // The key still exists in Keystore2
-        assert!(mgr.secondary_stores[0]
-            .contains(&TestKeySpecifier1, &TestItem::item_type())
-            .unwrap());
-
-        // Try to remove the key from the primary key store
-        assert!(mgr
-            .remove::<TestItem>(&TestKeySpecifier1, KeystoreSelector::Primary)
-            .unwrap()
-            .is_none(),);
-
-        // The key still exists in Keystore2
-        assert!(mgr.secondary_stores[0]
-            .contains(&TestKeySpecifier1, &TestItem::item_type())
-            .unwrap());
-
-        // Removing from Keystore2 should succeed.
-        assert_eq!(
-            mgr.remove::<TestItem>(
-                &TestKeySpecifier1,
-                KeystoreSelector::Id(&KeystoreId::from_str("keystore2").unwrap())
-            )
-            .unwrap()
-            .map(|k| k.meta),
-            Some("keystore2_coot".to_string())
+        assert!(
+            mgr.secondary_stores[0]
+                .contains(&TestKeySpecifier1, &TestItem::item_type())
+                .unwrap()
         );
 
+        // Try to remove the key from the primary key store
+        assert!(
+            mgr.remove::<TestItem>(&TestKeySpecifier1, KeystoreSelector::Primary)
+                .unwrap()
+                .is_none()
+        );
+
+        // The key still exists in Keystore2
+        assert!(
+            mgr.secondary_stores[0]
+                .contains(&TestKeySpecifier1, &TestItem::item_type())
+                .unwrap()
+        );
+
+        // Removing from Keystore2 should succeed.
+        let removed_key = mgr
+            .remove::<TestItem>(
+                &TestKeySpecifier1,
+                KeystoreSelector::Id(&KeystoreId::from_str("keystore2").unwrap()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed_key.meta.item_id(), "coot");
+        assert_eq!(
+            removed_key.meta.retrieved_from(),
+            Some(&KeystoreId::from_str("keystore2").unwrap())
+        );
+        assert_eq!(removed_key.meta.is_generated(), false);
+
         // The key doesn't exist in Keystore2 anymore
-        assert!(!mgr.secondary_stores[0]
-            .contains(&TestKeySpecifier1, &TestItem::item_type())
-            .unwrap());
+        assert!(
+            !mgr.secondary_stores[0]
+                .contains(&TestKeySpecifier1, &TestItem::item_type())
+                .unwrap()
+        );
     }
 
     #[test]
     fn keygen() {
+        let mut rng = FakeEntropicRng(testing_rng());
         let mgr = KeyMgrBuilder::default()
             .primary_store(Box::<Keystore1>::default())
             .build()
@@ -1150,17 +1566,18 @@ mod tests {
         .unwrap();
 
         // There is no corresponding public key entry.
-        assert!(mgr
-            .get::<TestPublicKey>(&TestPublicKeySpecifier1)
-            .unwrap()
-            .is_none(),);
+        assert!(
+            mgr.get::<TestPublicKey>(&TestPublicKeySpecifier1)
+                .unwrap()
+                .is_none()
+        );
 
         // Try to generate a new key (overwrite = false)
         let err = mgr
             .generate::<TestItem>(
                 &TestKeySpecifier1,
                 KeystoreSelector::Primary,
-                &mut testing_rng(),
+                &mut rng,
                 false,
             )
             .unwrap_err();
@@ -1168,47 +1585,57 @@ mod tests {
         assert!(matches!(err, crate::Error::KeyAlreadyExists));
 
         // The previous entry was not overwritten because overwrite = false
+        let key = mgr.get::<TestItem>(&TestKeySpecifier1).unwrap().unwrap();
+        assert_eq!(key.meta.item_id(), "coot");
         assert_eq!(
-            mgr.get::<TestItem>(&TestKeySpecifier1)
-                .unwrap()
-                .map(|k| k.meta),
-            Some("keystore1_coot".to_string())
+            key.meta.retrieved_from(),
+            Some(&KeystoreId::from_str("keystore1").unwrap())
         );
+        assert_eq!(key.meta.is_generated(), false);
 
         // We don't store public keys in the keystore
-        assert!(mgr
-            .get::<TestPublicKey>(&TestPublicKeySpecifier1)
-            .unwrap()
-            .is_none(),);
+        assert!(
+            mgr.get::<TestPublicKey>(&TestPublicKeySpecifier1)
+                .unwrap()
+                .is_none()
+        );
 
         // Try to generate a new key (overwrite = true)
-        let key = mgr
+        let generated_key = mgr
             .generate::<TestItem>(
                 &TestKeySpecifier1,
                 KeystoreSelector::Primary,
-                &mut testing_rng(),
+                &mut rng,
                 true,
             )
             .unwrap();
 
-        assert_eq!(key.meta, "generated_test_key".to_string());
+        assert_eq!(generated_key.meta.item_id(), "generated_test_key");
+        // Not set in a freshly generated key, because KeyMgr::generate()
+        // returns it straight away, without going through Keystore::get()
+        assert_eq!(generated_key.meta.retrieved_from(), None);
+        assert_eq!(generated_key.meta.is_generated(), true);
 
+        // Retrieve the inserted key
+        let retrieved_key = mgr.get::<TestItem>(&TestKeySpecifier1).unwrap().unwrap();
+        assert_eq!(retrieved_key.meta.item_id(), "generated_test_key");
         assert_eq!(
-            mgr.get::<TestItem>(&TestKeySpecifier1)
-                .unwrap()
-                .map(|k| k.meta),
-            Some("keystore1_generated_test_key".to_string())
+            retrieved_key.meta.retrieved_from(),
+            Some(&KeystoreId::from_str("keystore1").unwrap())
         );
+        assert_eq!(retrieved_key.meta.is_generated(), true);
 
         // We don't store public keys in the keystore
-        assert!(mgr
-            .get::<TestPublicKey>(&TestPublicKeySpecifier1)
-            .unwrap()
-            .is_none(),);
+        assert!(
+            mgr.get::<TestPublicKey>(&TestPublicKeySpecifier1)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn get_or_generate() {
+        let mut rng = FakeEntropicRng(testing_rng());
         let mut builder = KeyMgrBuilder::default().primary_store(Box::<Keystore1>::default());
 
         builder
@@ -1230,51 +1657,62 @@ mod tests {
         .unwrap();
 
         // The key already exists in keystore 2 so it won't be auto-generated.
+        let key = mgr
+            .get_or_generate::<TestItem>(&TestKeySpecifier1, KeystoreSelector::Primary, &mut rng)
+            .unwrap();
+        assert_eq!(key.meta.item_id(), "coot");
         assert_eq!(
-            mgr.get_or_generate::<TestItem>(
-                &TestKeySpecifier1,
-                KeystoreSelector::Primary,
-                &mut testing_rng()
-            )
-            .unwrap()
-            .meta,
-            "keystore2_coot".to_string(),
+            key.meta.retrieved_from(),
+            Some(&KeystoreId::from_str("keystore2").unwrap())
         );
+        assert_eq!(key.meta.is_generated(), false);
 
         assert_eq!(
             mgr.get_entry::<TestItem>(&entry_desc1)
                 .unwrap()
                 .map(|k| k.meta),
-            Some("keystore2_coot".to_string())
+            Some(ItemMetadata::Key(KeyMetadata {
+                item_id: "coot".to_string(),
+                retrieved_from: Some(keystore2.clone()),
+                is_generated: false,
+            }))
         );
 
         // This key doesn't exist in any of the keystores, so it will be auto-generated and
         // inserted into keystore 3.
         let keystore3 = KeystoreId::from_str("keystore3").unwrap();
-        assert_eq!(
-            mgr.get_or_generate::<TestItem>(
+        let generated_key = mgr
+            .get_or_generate::<TestItem>(
                 &TestKeySpecifier2,
                 KeystoreSelector::Id(&keystore3),
-                &mut testing_rng()
+                &mut rng,
             )
-            .unwrap()
-            .meta,
-            "generated_test_key".to_string(),
-        );
+            .unwrap();
+        assert_eq!(generated_key.meta.item_id(), "generated_test_key");
+        // Not set in a freshly generated key, because KeyMgr::get_or_generate()
+        // returns it straight away, without going through Keystore::get()
+        assert_eq!(generated_key.meta.retrieved_from(), None);
+        assert_eq!(generated_key.meta.is_generated(), true);
 
+        // Retrieve the inserted key
+        let retrieved_key = mgr.get::<TestItem>(&TestKeySpecifier2).unwrap().unwrap();
+        assert_eq!(retrieved_key.meta.item_id(), "generated_test_key");
         assert_eq!(
-            mgr.get::<TestItem>(&TestKeySpecifier2)
-                .unwrap()
-                .map(|k| k.meta),
-            Some("keystore3_generated_test_key".to_string())
+            retrieved_key.meta.retrieved_from(),
+            Some(&KeystoreId::from_str("keystore3").unwrap())
         );
+        assert_eq!(retrieved_key.meta.is_generated(), true);
 
         let entry_desc2 = entry_descriptor(TestKeySpecifier2, &keystore3);
         assert_eq!(
             mgr.get_entry::<TestItem>(&entry_desc2)
                 .unwrap()
                 .map(|k| k.meta),
-            Some("keystore3_generated_test_key".to_string()),
+            Some(ItemMetadata::Key(KeyMetadata {
+                item_id: "generated_test_key".to_string(),
+                retrieved_from: Some(keystore3.clone()),
+                is_generated: true,
+            }))
         );
 
         let arti_pat = KeyPathPattern::Arti("*".to_string());
@@ -1287,6 +1725,167 @@ mod tests {
         assert_eq!(mgr.remove_entry(&entry_desc2).unwrap(), Some(()));
         assert!(mgr.get_entry::<TestItem>(&entry_desc2).unwrap().is_none());
         assert!(mgr.remove_entry(&entry_desc2).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_matching_ignores_unrecognized_keys() {
+        let builder = KeyMgrBuilder::default().primary_store(Box::new(KeystoreUnrec1::default()));
+
+        let mgr = builder.build().unwrap();
+
+        let unrec_1 = KeystoreId::from_str("keystore_unrec1").unwrap();
+        mgr.insert(
+            TestItem::new("whale shark"),
+            &TestKeySpecifier1,
+            KeystoreSelector::Id(&unrec_1),
+            true,
+        )
+        .unwrap();
+
+        let arti_pat = KeyPathPattern::Arti("*".to_string());
+        let valid_key_path = KeyPath::Arti(TestKeySpecifier1.arti_path().unwrap());
+        let matching = mgr.list_matching(&arti_pat).unwrap();
+        // assert the unrecognized key has been filtered out
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching.first().unwrap().key_path(), &valid_key_path);
+    }
+
+    #[cfg(feature = "onion-service-cli-extra")]
+    #[test]
+    /// Test all `arti keys` subcommands
+    // TODO: split this in different tests
+    fn keys_subcommands() {
+        let mut builder =
+            KeyMgrBuilder::default().primary_store(Box::new(KeystoreUnrec1::default()));
+        builder
+            .secondary_stores()
+            .extend([Keystore2::new_boxed(), Keystore3::new_boxed()]);
+
+        let mgr = builder.build().unwrap();
+        let ks_unrec1id = KeystoreId::from_str("keystore_unrec1").unwrap();
+        let keystore2id = KeystoreId::from_str("keystore2").unwrap();
+        let keystore3id = KeystoreId::from_str("keystore3").unwrap();
+
+        // Insert a key into KeystoreUnrec1
+        let _ = mgr
+            .insert(
+                TestItem::new("pangolin"),
+                &TestKeySpecifier1,
+                KeystoreSelector::Id(&ks_unrec1id),
+                true,
+            )
+            .unwrap();
+
+        // Insert a key into Keystore2
+        let _ = mgr
+            .insert(
+                TestItem::new("coot"),
+                &TestKeySpecifier2,
+                KeystoreSelector::Id(&keystore2id),
+                true,
+            )
+            .unwrap();
+
+        // Insert a key into Keystore3
+        let _ = mgr
+            .insert(
+                TestItem::new("penguin"),
+                &TestKeySpecifier3,
+                KeystoreSelector::Id(&keystore3id),
+                true,
+            )
+            .unwrap();
+
+        let assert_key = |path, ty, expected_path: &ArtiPath, expected_type| {
+            assert_eq!(ty, expected_type);
+            assert_eq!(path, &KeyPath::Arti(expected_path.clone()));
+        };
+        let item_type = TestItem::new("axolotl").item.item_type().unwrap();
+        let unrecognized_entry_id = RawEntryId::Path(PathBuf::from("unrecognized_entry0"));
+
+        // Test `list`
+        let entries = mgr.list().unwrap();
+
+        let expected_items = [
+            (ks_unrec1id, TestKeySpecifier1.arti_path().unwrap()),
+            (keystore2id, TestKeySpecifier2.arti_path().unwrap()),
+            (keystore3id, TestKeySpecifier3.arti_path().unwrap()),
+        ];
+
+        // Secondary keystores contain 1 valid key each
+        let mut recognized_entries = 0;
+        let mut unrecognized_entries = 0;
+        for entry in entries.iter() {
+            match entry {
+                Ok(e) => {
+                    if let Some((_, expected_arti_path)) = expected_items
+                        .iter()
+                        .find(|(keystore_id, _)| keystore_id == e.keystore_id())
+                    {
+                        assert_key(e.key_path(), e.key_type(), expected_arti_path, &item_type);
+                        recognized_entries += 1;
+                        continue;
+                    }
+
+                    panic!("Unexpected key encountered {:?}", e);
+                }
+                Err(u) => {
+                    assert_eq!(u.entry().raw_id(), &unrecognized_entry_id);
+                    unrecognized_entries += 1;
+                }
+            }
+        }
+        assert_eq!(recognized_entries, 3);
+        assert_eq!(unrecognized_entries, 1);
+
+        // Test `list_keystores`
+        let keystores = mgr.list_keystores().iter().len();
+
+        assert_eq!(keystores, 3);
+
+        // Test `list_by_id`
+        let primary_keystore_id = KeystoreId::from_str("keystore_unrec1").unwrap();
+        let entries = mgr.list_by_id(&primary_keystore_id).unwrap();
+
+        // Primary keystore contains a valid key and an unrecognized key
+        let mut recognized_entries = 0;
+        let mut unrecognized_entries = 0;
+        // A list of entries, in a form that can be consumed by remove_unchecked
+        let mut all_entries = vec![];
+        for entry in entries.iter() {
+            match entry {
+                Ok(entry) => {
+                    assert_key(
+                        entry.key_path(),
+                        entry.key_type(),
+                        &TestKeySpecifier1.arti_path().unwrap(),
+                        &item_type,
+                    );
+                    recognized_entries += 1;
+                    all_entries.push(RawKeystoreEntry::new(
+                        build_raw_id_path(entry.key_path(), entry.key_type()),
+                        primary_keystore_id.clone(),
+                    ));
+                }
+                Err(u) => {
+                    assert_eq!(u.entry().raw_id(), &unrecognized_entry_id);
+                    unrecognized_entries += 1;
+                    all_entries.push(u.entry().into());
+                }
+            }
+        }
+        assert_eq!(recognized_entries, 1);
+        assert_eq!(unrecognized_entries, 1);
+
+        // Remove a recognized entry and an recognized one
+        for entry in all_entries {
+            mgr.remove_unchecked(&entry.raw_id().to_string(), entry.keystore_id())
+                .unwrap();
+        }
+
+        // Check the keys have been removed
+        let entries = mgr.list_by_id(&primary_keystore_id).unwrap();
+        assert_eq!(entries.len(), 0);
     }
 
     /// Whether to generate a given item before running the `run_certificate_test`.
@@ -1306,6 +1905,7 @@ mod tests {
         ) => {{
             use GenerateItem::*;
 
+            let mut rng = FakeEntropicRng(testing_rng());
             let mut builder = KeyMgrBuilder::default().primary_store(Box::<Keystore1>::default());
 
             builder
@@ -1325,7 +1925,7 @@ mod tests {
                     .generate::<TestItem>(
                         &TestKeySpecifier1,
                         KeystoreSelector::Primary,
-                        &mut testing_rng(),
+                        &mut rng,
                         false,
                     )
                     .unwrap();
@@ -1336,24 +1936,29 @@ mod tests {
                     .generate::<TestItem>(
                         &TestKeySpecifier2,
                         KeystoreSelector::Id(&KeystoreId::from_str("keystore2").unwrap()),
-                        &mut testing_rng(),
+                        &mut rng,
                         false,
                     )
                     .unwrap();
             }
 
             let make_certificate = move |subject_key: &TestItem, signed_with: &TestItem| {
-                let meta = format!(
-                    "a test cert for {} signed with {}",
-                    subject_key.meta, signed_with.meta
-                );
+                let subject_id = subject_key.meta.as_key().unwrap().item_id.clone();
+                let signing_id = signed_with.meta.as_key().unwrap().item_id.clone();
+
+                let meta = ItemMetadata::Cert(CertMetadata {
+                    subject_key_id: subject_id,
+                    signing_key_id: signing_id,
+                    retrieved_from: None,
+                    is_generated: true,
+                });
 
                 // Note: this is not really a cert for `subject_key` signed with the `signed_with`
                 // key!. The two are `TestItem`s and not keys, so we can't really generate a real
                 // cert from them. We can, however, pretend we did, for testing purposes.
                 // Eventually we might want to rewrite these tests to use real items
                 // (like the `ArtiNativeKeystore` tests)
-                let mut rng = rand::rng();
+                let mut rng = FakeEntropicRng(testing_rng());
                 let keypair = ed25519::Keypair::generate(&mut rng);
                 let encoded_cert = Ed25519Cert::constructor()
                     .cert_type(tor_cert::CertType::IDENTITY_V_SIGNING)
@@ -1374,7 +1979,7 @@ mod tests {
                     &spec,
                     &make_certificate,
                     KeystoreSelector::Primary,
-                    &mut testing_rng(),
+                    &mut rng,
                 );
 
             #[allow(unused_assignments)]
@@ -1395,18 +2000,22 @@ mod tests {
             if !has_error {
                 let (key, cert) = res.unwrap();
 
-
-                let expected_subj_key_meta = if $generate_subject_key == Yes {
-                    "keystore1_generated_test_key"
+                let expected_subj_key_id = if $generate_subject_key == Yes {
+                    "generated_test_key"
                 } else {
                     "generated_test_key"
                 };
 
-                assert_eq!(key.meta, expected_subj_key_meta);
+                assert_eq!(key.meta.item_id(), expected_subj_key_id);
                 assert_eq!(
-                    cert.0.meta,
-                    format!("a test cert for {expected_subj_key_meta} signed with keystore2_generated_test_key")
+                    cert.0.meta.as_cert().unwrap().subject_key_id,
+                    expected_subj_key_id
                 );
+                assert_eq!(
+                    cert.0.meta.as_cert().unwrap().signing_key_id,
+                    "generated_test_key"
+                );
+                assert_eq!(cert.0.meta.is_generated(), true);
             }
         }}
     }

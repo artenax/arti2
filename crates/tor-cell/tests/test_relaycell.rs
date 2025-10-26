@@ -3,8 +3,8 @@
 
 use tor_bytes::Error;
 use tor_cell::relaycell::{
-    msg::{self, AnyRelayMsg},
     AnyRelayMsgOuter, RelayCellFormat, RelayCmd, RelayMsg, StreamId, UnparsedRelayMsg,
+    msg::{self, AnyRelayMsg},
 };
 
 #[cfg(feature = "experimental-udp")]
@@ -44,18 +44,32 @@ fn decode(body: &str) -> Box<[u8; CELL_BODY_LEN]> {
     Box::new(result)
 }
 
-fn cell(body: &str, id: Option<StreamId>, msg: AnyRelayMsg) {
+// Run several tests, requiring that that `body`, is the default encdoding of `msg` with `version`.
+fn cell(version: RelayCellFormat, body: &str, id: Option<StreamId>, msg: AnyRelayMsg) {
     let body = decode(body);
     let mut bad_rng = BadRng;
 
+    // encode the cell msg so that we can get its length
+    let mut encoded_msg = Vec::new();
+    msg.clone().encode_onto(&mut encoded_msg).unwrap();
+
     let expected = AnyRelayMsgOuter::new(id, msg);
 
-    let decoded = AnyRelayMsgOuter::decode_singleton(RelayCellFormat::V0, body.clone()).unwrap();
+    let decoded = AnyRelayMsgOuter::decode_singleton(version, body.clone()).unwrap();
 
-    let decoded_from_partial = UnparsedRelayMsg::from_singleton_body(RelayCellFormat::V0, body)
-        .unwrap()
-        .decode::<AnyRelayMsg>()
-        .unwrap();
+    let unparsed = UnparsedRelayMsg::from_singleton_body(version, body).unwrap();
+
+    // check the accessors for `UnparsedRelayMsg`
+    assert_eq!(unparsed.cmd(), decoded.cmd());
+    assert_eq!(unparsed.stream_id(), decoded.stream_id());
+    if unparsed.cmd() == RelayCmd::DATA {
+        assert_eq!(unparsed.data_len().map(usize::from), Ok(encoded_msg.len()));
+    } else {
+        // if not a DATA cell, then there are no data bytes
+        assert_eq!(unparsed.data_len(), Ok(0));
+    }
+
+    let decoded_from_partial = unparsed.decode::<AnyRelayMsg>().unwrap();
     assert_eq!(decoded_from_partial.stream_id(), decoded.stream_id());
     assert_eq!(decoded_from_partial.cmd(), decoded.cmd());
 
@@ -65,8 +79,8 @@ fn cell(body: &str, id: Option<StreamId>, msg: AnyRelayMsg) {
         format!("{:?}", decoded_from_partial)
     );
 
-    let encoded1 = decoded.encode(&mut bad_rng).unwrap();
-    let encoded2 = expected.encode(&mut bad_rng).unwrap();
+    let encoded1 = decoded.encode(version, &mut bad_rng).unwrap();
+    let encoded2 = expected.encode(version, &mut bad_rng).unwrap();
 
     assert_eq!(&encoded1[..], &encoded2[..]);
 }
@@ -90,8 +104,9 @@ fn bad_rng() {
 }
 
 #[test]
-fn test_cells() {
+fn test_cells_v0() {
     cell(
+        RelayCellFormat::V0,
         "02 0000 9999 12345678 000c 6e6565642d746f2d6b6e6f77 00000000",
         StreamId::new(0x9999),
         msg::Data::new(&b"need-to-know"[..]).unwrap().into(),
@@ -113,6 +128,101 @@ fn test_cells() {
     assert_eq!(c.msg().cmd(), RelayCmd::from(2));
     let (s, _) = c.into_streamid_and_msg();
     assert_eq!(s, StreamId::new(0x9999));
+
+    // check accessors on `UnparsedRelayMsg`.
+    let m = decode("02 0000 9999 12345678 01f2 6e6565642d746f2d6b6e6f77 00000000");
+    let c = UnparsedRelayMsg::from_singleton_body(RelayCellFormat::V0, m).unwrap();
+    assert_eq!(c.cmd(), RelayCmd::from(2));
+    assert_eq!(c.stream_id(), StreamId::new(0x9999));
+    assert_eq!(c.data_len(), Ok(0x01f2));
+
+    // check `data_len()` with a cell that has an invalid length.
+    let m = decode("02 0000 9999 12345678 04f2 6e6565642d746f2d6b6e6f77 00000000");
+    let c = UnparsedRelayMsg::from_singleton_body(RelayCellFormat::V0, m).unwrap();
+    assert!(c.data_len().is_err());
+}
+
+#[test]
+fn test_valid_cells_v1() {
+    // Correct DATA message, with stream ID.
+    cell(
+        RelayCellFormat::V1,
+        "00000000000000000000000000000000 02 000c 3230 6e6565642d746f2d6b6e6f77 00000000",
+        StreamId::new(0x3230),
+        msg::Data::new(b"need-to-know").unwrap().into(),
+    );
+    // Correct Extended2 message, without stream ID.
+    cell(
+        RelayCellFormat::V1,
+        "00000000000000000000000000000000 0f 001f 001d
+              686f7720646f20796f7520646f20616e64207368616b652068616e6473 00000000",
+        None,
+        msg::Extended2::new(b"how do you do and shake hands".to_vec()).into(),
+    );
+    // Correct SENDME message, without stream ID.
+    //
+    // (Note that a 20-byte tag won't actually be used with the V1 format,
+    // but the encoding still allows it.
+    cell(
+        RelayCellFormat::V1,
+        "00000000000000000000000000000000 05 0017 01 0014
+              326e64206c656e20697320726564756e64616e74 00000000",
+        None,
+        msg::Sendme::new_tag(*b"2nd len is redundant").into(),
+    );
+
+    // Check accessors on `UnparsedRelayMsg`.
+    let m =
+        decode("00000000000000000000000000000000 02 000c 3230 6e6565642d746f2d6b6e6f77 00000000");
+    let c = UnparsedRelayMsg::from_singleton_body(RelayCellFormat::V1, m).unwrap();
+    assert_eq!(c.cmd(), RelayCmd::from(2));
+    assert_eq!(c.stream_id(), StreamId::new(0x3230));
+    assert_eq!(c.data_len(), Ok(0x000c));
+
+    // Check `data_len()` with a cell that has an invalid length.
+    let m =
+        decode("00000000000000000000000000000000 02 050c 3230 6e6565642d746f2d6b6e6f77 00000000");
+    let c = UnparsedRelayMsg::from_singleton_body(RelayCellFormat::V1, m).unwrap();
+    assert!(c.data_len().is_err());
+}
+
+#[test]
+fn test_invalid_cells_v1() {
+    // zero-valued stream ID on data message (which needs a stream.)
+    {
+        let body = decode("00000000000000000000000000000000 02 0001 0000 ff");
+        let err = AnyRelayMsgOuter::decode_singleton(RelayCellFormat::V1, body).unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidMessage("Zero-valued stream ID with relay command DATA".into(),),
+        );
+    }
+
+    // Message too long to fit in cell
+    {
+        // 489 bytes (0x1e9) is one over the limit.
+        let body = decode("00000000000000000000000000000000 02 01e9 3231 00");
+        let err = AnyRelayMsgOuter::decode_singleton(RelayCellFormat::V1, body).unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidMessage("Insufficient data in relay cell".into())
+        );
+
+        // Note that 0x01e8 succeeds.
+        let body = decode("00000000000000000000000000000000 02 01e8 3231 00");
+        let m = AnyRelayMsgOuter::decode_singleton(RelayCellFormat::V1, body).unwrap();
+        assert_eq!(m.cmd(), RelayCmd::DATA)
+    }
+
+    // Unrecognized command (not allowed in V1)
+    {
+        let body = decode("00000000000000000000000000000000 f0 0000 00000000");
+        let err = AnyRelayMsgOuter::decode_singleton(RelayCellFormat::V1, body).unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidMessage("Unrecognized relay command 240".into())
+        );
+    }
 }
 
 #[test]

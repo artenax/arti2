@@ -4,14 +4,14 @@
 #![allow(unreachable_pub)]
 
 use std::{
-    collections::{hash_map, BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map},
     future::Future,
     hash::Hash,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
-use futures::{task::noop_waker_ref, FutureExt, StreamExt as _};
+use futures::{FutureExt, StreamExt as _};
 use tor_async_utils::peekable_stream::PeekableStream;
 
 use crate::util::keyed_futures_unordered::KeyedFuturesUnordered;
@@ -153,9 +153,11 @@ where
         if let Some((key, fut)) = self.pending_streams.remove(key) {
             // Validate `priorities` invariant that keys are also present in exactly one of
             // `pending_streams` and `ready_values`.
-            debug_assert!(!self
-                .ready_streams
-                .contains_key(&(priority.clone(), key.clone())));
+            debug_assert!(
+                !self
+                    .ready_streams
+                    .contains_key(&(priority.clone(), key.clone()))
+            );
             let stream = fut
                 .into_inner()
                 // We know the future hasn't completed, so the stream should be present.
@@ -253,7 +255,7 @@ where
     pub fn poll_ready_iter_mut<'a>(
         &'a mut self,
         cx: &mut Context,
-    ) -> impl Iterator<Item = (&'a K, &'a P, &'a mut S)> + 'a {
+    ) -> impl Iterator<Item = (&'a K, &'a P, &'a mut S)> + 'a + use<'a, K, P, S> {
         // First poll for ready streams
         while let Poll::Ready(Some((key, stream))) = self.pending_streams.poll_next_unpin(cx) {
             let priority = self
@@ -297,9 +299,7 @@ where
             // This stream isn't in the ready list.
             return None;
         };
-        match Pin::new(&mut stream)
-            .poll_peek(&mut Context::from_waker(&futures::task::noop_waker()))
-        {
+        match Pin::new(&mut stream).poll_peek(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(Some(_val)) => (), // Stream is ready, and has an item. Proceed.
             Poll::Ready(None) => {
                 // Stream is ready, but is terminated.
@@ -311,7 +311,7 @@ where
                 // list. This should be impossible by the stability guarantees
                 // of `PeekableStream` and our own internal logic, but we can
                 // recover.
-                tracing::error!("Stream unexpectedly unready");
+                tracing::error!("Bug: Stream unexpectedly unready");
                 self.pending_streams
                     .try_insert(key.clone(), PeekableReady::new(stream))
                     // By invariant on `priorities` that keys are in exactly one of the ready or pending lists.
@@ -347,7 +347,7 @@ where
         };
         // We don't have a waker registered here, so we can just use the noop waker.
         // TODO: Create a mut future for `PeekableStream`.
-        Some(Pin::new(peekable).poll_peek_mut(&mut Context::from_waker(noop_waker_ref())))
+        Some(Pin::new(peekable).poll_peek_mut(&mut Context::from_waker(Waker::noop())))
     }
 
     /// Get a reference to the stream for `key`.
@@ -438,7 +438,7 @@ mod test {
         task::Poll,
     };
 
-    use futures::{stream::Peekable, SinkExt as _};
+    use futures::{SinkExt as _, stream::Peekable};
     use pin_project::pin_project;
     use tor_rtmock::MockRuntime;
 

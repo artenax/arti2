@@ -2,14 +2,14 @@
 name = "equix-bench"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 [[bench]]
 name = "equix_bench"
 harness = false
 
 [dev-dependencies]
-criterion = "0.5.1"
+criterion = "0.7.0"
 equix = { path = "../" }
 rand = "0.9"
 tor-c-equix = { git = "https://gitlab.torproject.org/tpo/core/tor.git" }

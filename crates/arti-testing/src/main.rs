@@ -89,6 +89,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 #![allow(clippy::print_stderr)] // Allowed in this crate only.
@@ -107,7 +108,7 @@ use tor_config::ConfigurationSources;
 use tor_dirmgr::filter::DirFilter;
 use tor_rtcompat::{PreferredRuntime, Runtime, RuntimeSubstExt as _, SleepProviderExt};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use tracing_subscriber::prelude::*;
 //use std::path::PathBuf;
 use std::str::FromStr;

@@ -1,10 +1,12 @@
 //! The `hsc` subcommand.
 
+use crate::subcommands::prompt;
 use crate::{Result, TorClient};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use arti_client::{HsClientDescEncKey, HsId, InertTorClient, KeystoreSelector, TorClientConfig};
 use clap::{ArgMatches, Args, FromArgMatches, Parser, Subcommand, ValueEnum};
+use safelog::DisplayRedacted;
 use tor_rtcompat::Runtime;
 
 use std::fs::OpenOptions;
@@ -101,9 +103,10 @@ pub(crate) struct CommonArgs {
     )]
     key_type: KeyType,
 
-    /// Whether to write the prompt or not
+    /// With this flag active no prompt will be shown
+    /// and no confirmation will be asked
     #[arg(long, short, default_value_t = false)]
-    quiet: bool,
+    batch: bool,
 }
 
 /// The common arguments of the key subcommands.
@@ -128,10 +131,6 @@ pub(crate) struct RotateKeyArgs {
     /// Arguments for configuring keygen.
     #[command(flatten)]
     keygen: KeygenArgs,
-
-    /// Do not prompt before overwriting the key.
-    #[arg(long, short)]
-    force: bool,
 }
 
 /// The arguments of the [`Remove`](KeySubcommand::Remove) subcommand.
@@ -140,10 +139,6 @@ pub(crate) struct RemoveKeyArgs {
     /// Arguments shared by all hsc subcommands.
     #[command(flatten)]
     common: CommonArgs,
-
-    /// Do not prompt before removing the key.
-    #[arg(long, short)]
-    force: bool,
 }
 
 /// Run the `hsc` subcommand.
@@ -184,7 +179,7 @@ fn run_key(subcommand: KeySubcommand, client: &InertTorClient) -> Result<()> {
 
 /// Run the `hsc prepare-stealth-mode-key` subcommand.
 fn prepare_service_discovery_key(args: &GetKeyArgs, client: &InertTorClient) -> Result<()> {
-    let addr = get_onion_address(args.common.quiet)?;
+    let addr = get_onion_address(&args.common)?;
     let key = match args.generate {
         GenerateKey::IfNeeded => {
             // TODO: consider using get_or_generate in generate_service_discovery_key
@@ -199,8 +194,8 @@ fn prepare_service_discovery_key(args: &GetKeyArgs, client: &InertTorClient) -> 
             Some(key) => key,
             None => {
                 return Err(anyhow!(
-                        "Service discovery key not found. Rerun with --generate=if-needed to generate a new service discovery keypair"
-                    ));
+                    "Service discovery key not found. Rerun with --generate=if-needed to generate a new service discovery keypair"
+                ));
             }
         },
     };
@@ -229,7 +224,9 @@ fn display_service_discovery_key(args: &KeygenArgs, key: &HsClientDescEncKey) ->
             if let Err(e) = res {
                 match e.kind() {
                     io::ErrorKind::AlreadyExists => {
-                        return Err(anyhow!("{filename} already exists. Move it, or rerun with --overwrite to overwrite it"));
+                        return Err(anyhow!(
+                            "{filename} already exists. Move it, or rerun with --overwrite to overwrite it"
+                        ));
                     }
                     _ => {
                         return Err(e)
@@ -251,12 +248,13 @@ fn write_public_key(mut f: impl io::Write, key: &HsClientDescEncKey) -> io::Resu
 
 /// Run the `hsc rotate-key` subcommand.
 fn rotate_service_discovery_key(args: &RotateKeyArgs, client: &InertTorClient) -> Result<()> {
-    let addr = get_onion_address(args.common.quiet)?;
-    if !args.force {
-        let msg = format!("rotate client restricted discovery key for {}?", addr);
-        if !prompt(&msg)? {
-            return Ok(());
-        }
+    let addr = get_onion_address(&args.common)?;
+    let msg = format!(
+        "rotate client restricted discovery key for {}?",
+        addr.display_unredacted()
+    );
+    if !args.common.batch && !prompt(&msg)? {
+        return Ok(());
     }
 
     let key = client.rotate_service_discovery_key(KeystoreSelector::default(), addr)?;
@@ -266,12 +264,13 @@ fn rotate_service_discovery_key(args: &RotateKeyArgs, client: &InertTorClient) -
 
 /// Run the `hsc remove-key` subcommand.
 fn remove_service_discovery_key(args: &RemoveKeyArgs, client: &InertTorClient) -> Result<()> {
-    let addr = get_onion_address(args.common.quiet)?;
-    if !args.force {
-        let msg = format!("remove client restricted discovery key for {}?", addr);
-        if !prompt(&msg)? {
-            return Ok(());
-        }
+    let addr = get_onion_address(&args.common)?;
+    let msg = format!(
+        "remove client restricted discovery key for {}?",
+        addr.display_unredacted()
+    );
+    if !args.common.batch && !prompt(&msg)? {
+        return Ok(());
     }
 
     let _key = client.remove_service_discovery_key(KeystoreSelector::default(), addr)?;
@@ -279,40 +278,10 @@ fn remove_service_discovery_key(args: &RemoveKeyArgs, client: &InertTorClient) -
     Ok(())
 }
 
-/// Prompt the user to confirm by typing yes or no.
-///
-/// Loops until the user confirms or declines,
-/// returning true if they confirmed.
-fn prompt(msg: &str) -> Result<bool> {
-    /// The accept message.
-    const YES: &str = "YES";
-    /// The decline message.
-    const NO: &str = "no";
-
-    let msg = format!("{msg} (type {YES} or {NO})");
-    loop {
-        let proceed = dialoguer::Input::<String>::new()
-            .with_prompt(&msg)
-            .interact_text()?;
-
-        let proceed: &str = proceed.as_ref();
-        if proceed == YES {
-            return Ok(true);
-        }
-
-        match proceed.to_lowercase().as_str() {
-            NO | "n" => return Ok(false),
-            _ => {
-                continue;
-            }
-        }
-    }
-}
-
 /// Prompt the user for an onion address.
-fn get_onion_address(quiet: bool) -> Result<HsId, anyhow::Error> {
+fn get_onion_address(args: &CommonArgs) -> Result<HsId, anyhow::Error> {
     let mut addr = String::new();
-    if !quiet {
+    if !args.batch {
         print!("Enter an onion address: ");
         io::stdout().flush().map_err(|e| anyhow!(e))?;
     };

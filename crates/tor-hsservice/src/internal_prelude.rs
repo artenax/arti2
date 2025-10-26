@@ -12,15 +12,15 @@
 //!
 //!  * Broad names from specific contexts, that are unsuitable for wide imports.
 //!    For example, individual cell and message names from `tor-cell`,
-//!    and the types from `tor_proto::stream` other than the high-level `DataStream`.
+//!    and the types from `tor_proto::client::stream` other than the high-level `DataStream`.
 
 //---------- std ----------
 
 pub(crate) use {
     std::any::Any,
     std::borrow::Cow,
-    std::cmp::max,
     std::cmp::Ordering,
+    std::cmp::max,
     std::collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     std::error::Error as StdError,
     std::ffi::OsStr,
@@ -45,8 +45,8 @@ pub(crate) use {
 pub(crate) use {
     async_trait::async_trait,
     derive_builder::Builder,
-    derive_deftly::{define_derive_deftly, Deftly},
-    derive_more::{Constructor, Deref, DerefMut, From, Into},
+    derive_deftly::{Deftly, define_derive_deftly},
+    derive_more::{Constructor, Deref, DerefMut, Into},
     educe::Educe,
     futures::channel::mpsc,
     futures::future::{self, Either},
@@ -55,7 +55,7 @@ pub(crate) use {
     futures::task::{SpawnError, SpawnExt as _},
     futures::{AsyncRead, AsyncWrite, Stream},
     futures::{FutureExt as _, SinkExt as _, StreamExt as _, TryStreamExt as _},
-    itertools::{chain, Itertools as _},
+    itertools::{Itertools as _, chain},
     postage::{broadcast, watch},
     rand::Rng,
     rand_core::{CryptoRng, RngCore},
@@ -70,29 +70,29 @@ pub(crate) use {
 pub(crate) use {
     oneshot_fused_workaround as oneshot,
     retry_error::RetryError,
-    safelog::{sensitive, Redactable as _},
+    safelog::{DisplayRedacted as _, Redactable as _},
     tor_async_utils::mpsc_channel_no_memquota,
     tor_async_utils::{DropNotifyWatchSender, PostageWatchSenderExt as _},
-    tor_basic_utils::{impl_debug_hex, retry::RetryDelay, PathExt as _, RngExt as _},
-    tor_cell::relaycell::{msg::AnyRelayMsg, RelayMsg as _},
-    tor_circmgr::hspool::{HsCircKind, HsCircPool},
+    tor_basic_utils::{PathExt as _, RngExt as _, impl_debug_hex, retry::RetryDelay},
+    tor_cell::relaycell::{RelayMsg as _, msg::AnyRelayMsg},
+    tor_circmgr::hspool::HsCircPool,
     tor_config::{ConfigBuildError, Reconfigure, ReconfigureError},
     tor_dirclient::request::HsDescUploadRequest,
-    tor_dirclient::{send_request, Error as DirClientError, RequestFailedError},
+    tor_dirclient::{Error as DirClientError, RequestFailedError, send_request},
     tor_error::define_asref_dyn_std_error,
+    tor_error::{Bug, ErrorKind, ErrorReport as _, HasKind},
     tor_error::{bad_api_usage, internal, into_bad_api_usage, into_internal},
     tor_error::{debug_report, error_report, info_report, warn_report},
-    tor_error::{Bug, ErrorKind, ErrorReport as _, HasKind},
+    tor_hscrypto::RevisionCounter,
     tor_hscrypto::ope::AesOpeKey,
     tor_hscrypto::pk::{
         HsBlindId, HsBlindIdKey, HsBlindIdKeypair, HsClientDescEncKey, HsDescSigningKeypair,
         HsIdKey, HsIdKeypair, HsIntroPtSessionIdKey, HsIntroPtSessionIdKeypair, HsSvcNtorKeypair,
     },
     tor_hscrypto::time::TimePeriod,
-    tor_hscrypto::RevisionCounter,
     tor_keymgr::{
-        derive_deftly_template_KeySpecifier, KeyMgr, KeySpecifier,
-        KeySpecifierComponentViaDisplayFromStr, KeySpecifierPattern as _, KeystoreSelector,
+        KeyMgr, KeySpecifier, KeySpecifierComponentViaDisplayFromStr, KeySpecifierPattern as _,
+        KeystoreSelector, derive_deftly_template_KeySpecifier,
         {ArtiPathRange, KeySpecifierComponent},
     },
     tor_linkspec::{
@@ -101,14 +101,14 @@ pub(crate) use {
     tor_llcrypto::pk::{curve25519, ed25519},
     tor_log_ratelim::log_ratelim,
     tor_netdir::{HsDirParams, NetDirProvider, Relay, Timeliness},
-    tor_netdoc::doc::hsdesc::{create_desc_sign_key_cert, HsDescBuilder},
     tor_netdoc::NetdocBuilder,
+    tor_netdoc::doc::hsdesc::{HsDescBuilder, create_desc_sign_key_cert},
     tor_persist::slug::Slug,
     tor_persist::state_dir::{
         ContainsInstanceStateGuard as _, InstanceRawSubdir, LockFileGuard, StateDirectory,
     },
-    tor_proto::circuit::{ClientCirc, MetaCellDisposition},
-    tor_proto::stream::DataStream,
+    tor_proto::MetaCellDisposition,
+    tor_proto::client::stream::DataStream,
     tor_rtcompat::SleepProvider,
     tor_rtcompat::{Runtime, SleepProviderExt as _},
 };
@@ -116,10 +116,12 @@ pub(crate) use {
 //---------- names from this crate ----------
 
 pub(crate) use {
+    crate::OnionServiceConfig,
+    crate::StartupError,
+    crate::StreamRequest,
     crate::err::IptStoreError,
     crate::err::StateExpiryError,
     crate::ipt_lid::{InvalidIptLocalId, IptLocalId},
-    crate::ipt_mgr::CreateIptError,
     crate::ipt_mgr::IptManager,
     crate::ipt_set::IptSet,
     crate::ipt_set::IptsManagerView,
@@ -137,21 +139,18 @@ pub(crate) use {
     crate::status::{OnionServiceStatus, OnionServiceStatusStream, StatusSender},
     crate::time_store,
     crate::timeout_track::{TrackingInstantOffsetNow, TrackingNow, Update as _},
-    crate::OnionServiceConfig,
-    crate::StartupError,
-    crate::StreamRequest,
-    crate::{ipt_establish, ShutdownStatus},
-    crate::{
-        keys::BlindIdKeypairSpecifierPattern,
-        rend_handshake::{self, RendCircConnector},
-        ClientError,
-    },
-    crate::{req::RendRequestContext, HsNickname, LinkSpecs, NtorPublicKey},
     crate::{
         BlindIdKeypairSpecifier, DescSigningKeypairSpecifier, HsIdKeypairSpecifier,
         HsIdPublicKeySpecifier,
     },
+    crate::{
+        ClientError,
+        keys::BlindIdKeypairSpecifierPattern,
+        rend_handshake::{self, RendCircConnector},
+    },
     crate::{DescUploadError, IptError},
     crate::{FatalError, RendRequest},
+    crate::{HsNickname, LinkSpecs, NtorPublicKey, req::RendRequestContext},
+    crate::{ShutdownStatus, ipt_establish},
     ipt_establish::{IptEstablisher, IptParameters, IptStatus, IptStatusStatus, IptWantsToRetire},
 };

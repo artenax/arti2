@@ -15,21 +15,21 @@
 //!
 //!  * Create a TLS connection as an object that implements AsyncRead +
 //!    AsyncWrite + StreamOps, and pass it to a [ChannelBuilder].  This will
-//!    yield an [handshake::OutboundClientHandshake] that represents
+//!    yield an [handshake::ClientInitiatorHandshake] that represents
 //!    the state of the handshake.
-//!  * Call [handshake::OutboundClientHandshake::connect] on the result
+//!  * Call [handshake::ClientInitiatorHandshake::connect] on the result
 //!    to negotiate the rest of the handshake.  This will verify
 //!    syntactic correctness of the handshake, but not its cryptographic
 //!    integrity.
-//!  * Call [handshake::UnverifiedChannel::check] on the result.  This
+//!  * Call handshake::UnverifiedChannel::check on the result.  This
 //!    finishes the cryptographic checks.
-//!  * Call [handshake::VerifiedChannel::finish] on the result. This
+//!  * Call handshake::VerifiedChannel::finish on the result. This
 //!    completes the handshake and produces an open channel and Reactor.
 //!  * Launch an asynchronous task to call the reactor's run() method.
 //!
 //! One you have a running channel, you can create circuits on it with
-//! its [Channel::new_circ] method.  See
-//! [crate::tunnel::circuit::PendingClientCirc] for information on how to
+//! its [Channel::new_tunnel] method.  See
+//! [crate::client::circuit::PendingClientTunnel] for information on how to
 //! proceed from there.
 //!
 //! # Design
@@ -45,20 +45,16 @@
 //!
 //! # Limitations
 //!
-//! This is client-only, and only supports link protocol version 4.
-//!
-//! TODO: There is no channel padding.
-//!
-//! TODO: There is no flow control, rate limiting, queueing, or
-//! fairness.
+//! TODO: There is no rate limiting or fairness.
 
 /// The size of the channel buffer for communication between `Channel` and its reactor.
 pub const CHANNEL_BUFFER_SIZE: usize = 128;
 
 mod circmap;
-mod codec;
-mod handshake;
+mod handler;
+pub(crate) mod handshake;
 pub mod kist;
+mod msg;
 pub mod padding;
 pub mod params;
 mod reactor;
@@ -67,26 +63,32 @@ mod unique_id;
 pub use crate::channel::params::*;
 use crate::channel::reactor::{BoxedChannelSink, BoxedChannelStream, Reactor};
 pub use crate::channel::unique_id::UniqId;
+use crate::client::circuit::padding::{PaddingController, QueuedCellPaddingInfo};
+use crate::client::circuit::{PendingClientTunnel, TimeoutEstimator};
 use crate::memquota::{ChannelAccount, CircuitAccount, SpecificAccount as _};
 use crate::util::err::ChannelClosed;
 use crate::util::oneshot_broadcast;
 use crate::util::ts::AtomicOptTimestamp;
-use crate::{tunnel, tunnel::circuit, ClockSkew};
+use crate::{ClockSkew, client};
 use crate::{Error, Result};
+use cfg_if::cfg_if;
 use reactor::BoxedChannelStreamOps;
 use safelog::sensitive as sv;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+use tor_cell::chancell::ChanMsg;
 use tor_cell::chancell::msg::AnyChanMsg;
-use tor_cell::chancell::{msg, msg::PaddingNegotiate, AnyChanCell, CircId};
-use tor_cell::chancell::{ChanCell, ChanMsg};
+use tor_cell::chancell::{AnyChanCell, CircId, msg::PaddingNegotiate};
 use tor_cell::restricted_msg;
 use tor_error::internal;
 use tor_linkspec::{HasRelayIds, OwnedChanTarget};
 use tor_memquota::mq_queue::{self, ChannelSpec as _, MpscSpec};
 use tor_rtcompat::{CoarseTimeProvider, DynTimeProvider, SleepProvider, StreamOps};
+
+#[cfg(feature = "circ-padding")]
+use tor_async_utils::counting_streams::{self, CountingSink, CountingStream};
 
 /// Imports that are re-exported pub if feature `testing` is enabled
 ///
@@ -95,7 +97,7 @@ use tor_rtcompat::{CoarseTimeProvider, DynTimeProvider, SleepProvider, StreamOps
 mod testing_exports {
     #![allow(unreachable_pub)]
     pub use super::reactor::CtrlMsg;
-    pub use crate::tunnel::circuit::celltypes::CreateResponse;
+    pub use crate::circuit::celltypes::CreateResponse;
 }
 #[cfg(feature = "testing")]
 pub use testing_exports::*;
@@ -116,10 +118,10 @@ use std::task::{Context, Poll};
 use tracing::trace;
 
 // reexport
+#[cfg(feature = "relay")]
+pub use super::relay::channel::handshake::RelayInitiatorHandshake;
 use crate::channel::unique_id::CircUniqIdContext;
-#[cfg(test)]
-pub(crate) use codec::CodecError;
-pub use handshake::{OutboundClientHandshake, UnverifiedChannel, VerifiedChannel};
+pub use handshake::ClientInitiatorHandshake;
 
 use kist::KistParams;
 
@@ -148,14 +150,61 @@ restricted_msg! {
     }
 }
 
-/// A channel cell that we allot to be sent on an open channel from
-/// a server to a client.
-pub(crate) type OpenChanCellS2C = ChanCell<OpenChanMsgS2C>;
+/// This indicate what type of channel it is. It allows us to decide for the correct channel cell
+/// state machines and authentication process (if any).
+///
+/// It is created when a channel is requested for creation which means the subsystem wanting to
+/// open a channel needs to know what type it wants.
+#[derive(Clone, Copy, Debug, derive_more::Display)]
+#[non_exhaustive]
+pub enum ChannelType {
+    /// Client: Initiated from a client to a relay. Client is unauthenticated and relay is
+    /// authenticated.
+    ClientInitiator,
+    /// Relay: Initiating as a relay to a relay. Both sides are authenticated.
+    RelayInitiator,
+    /// Relay: Responding as a relay to a relay or client. Authenticated or Unauthenticated.
+    RelayResponder {
+        /// Indicate if the channel is authenticated. Responding as a relay can be either from a
+        /// Relay (authenticated) or a Client/Bridge (Unauthenticated). We only know this
+        /// information once the handshake is completed.
+        ///
+        /// This side is always authenticated, the other side can be if a relay or not if
+        /// bridge/client. This is set to false unless we end up authenticating the other side
+        /// meaning a relay.
+        authenticated: bool,
+    },
+}
 
-/// Type alias: A Sink and Stream that transforms a TLS connection into
-/// a cell-based communication mechanism.
-type CellFrame<T> =
-    asynchronous_codec::Framed<T, crate::channel::codec::ChannelCodec<OpenChanMsgS2C, AnyChanMsg>>;
+impl ChannelType {
+    /// Return true if this channel type is an initiator.
+    pub(crate) fn is_initiator(&self) -> bool {
+        matches!(self, Self::ClientInitiator | Self::RelayInitiator)
+    }
+}
+
+/// A channel cell frame used for sending and receiving cells on a channel. The handler takes care
+/// of the cell codec transition depending in which state the channel is.
+///
+/// ChannelFrame is used to basically handle all in and outbound cells on a channel for its entire
+/// lifetime.
+pub(crate) type ChannelFrame<T> = asynchronous_codec::Framed<T, handler::ChannelCellHandler>;
+
+/// An entry in a channel's queue of cells to be flushed.
+pub(crate) type ChanCellQueueEntry = (AnyChanCell, Option<QueuedCellPaddingInfo>);
+
+/// Helper: Return a new channel frame [ChannelFrame] from an object implementing AsyncRead + AsyncWrite. In the
+/// tor context, it is always a TLS stream.
+///
+/// The ty (type) argument needs to be able to transform into a [handler::ChannelCellHandler] which would
+/// generally be a [ChannelType].
+pub(crate) fn new_frame<T, I>(tls: T, ty: I) -> ChannelFrame<T>
+where
+    T: AsyncRead + AsyncWrite,
+    I: Into<handler::ChannelCellHandler>,
+{
+    asynchronous_codec::Framed::new(tls, ty.into())
+}
 
 /// An open client channel, ready to send and receive Tor cells.
 ///
@@ -188,16 +237,22 @@ type CellFrame<T> =
 /// with an error.
 #[derive(Debug)]
 pub struct Channel {
+    /// The channel type.
+    #[expect(unused)] // TODO: Remove once used.
+    channel_type: ChannelType,
     /// A channel used to send control messages to the Reactor.
     control: mpsc::UnboundedSender<CtrlMsg>,
     /// A channel used to send cells to the Reactor.
-    cell_tx: mq_queue::Sender<AnyChanCell, mq_queue::MpscSpec>,
+    cell_tx: CellTx,
 
     /// A receiver that indicates whether the channel is closed.
     ///
     /// Awaiting will return a `CancelledError` event when the reactor is dropped.
     /// Read to decide if operations may succeed, and is returned by `wait_for_close`.
     reactor_closed_rx: oneshot_broadcast::Receiver<Result<CloseInfo>>,
+
+    /// Padding controller, used to report when data is queued for this channel.
+    padding_ctrl: PaddingController,
 
     /// A unique identifier for this channel.
     unique_id: UniqId,
@@ -294,33 +349,53 @@ enum PaddingControlState {
 
 use PaddingControlState as PCS;
 
+cfg_if! {
+    if #[cfg(feature="circ-padding")] {
+        /// Implementation type for a ChannelSender.
+        type CellTx = CountingSink<mq_queue::Sender<ChanCellQueueEntry, mq_queue::MpscSpec>>;
+
+        /// Implementation type for a cell queue held by a reactor.
+        type CellRx = CountingStream<mq_queue::Receiver<ChanCellQueueEntry, mq_queue::MpscSpec>>;
+    } else {
+        /// Implementation type for a ChannelSender.
+        type CellTx = mq_queue::Sender<ChanCellQueueEntry, mq_queue::MpscSpec>;
+
+        /// Implementation type for a cell queue held by a reactor.
+        type CellRx = mq_queue::Receiver<ChanCellQueueEntry, mq_queue::MpscSpec>;
+    }
+}
+
 /// A handle to a [`Channel`]` that can be used, by circuits, to send channel cells.
 #[derive(Debug)]
 pub(crate) struct ChannelSender {
     /// MPSC sender to send cells.
-    cell_tx: mq_queue::Sender<AnyChanCell, mq_queue::MpscSpec>,
+    cell_tx: CellTx,
     /// A receiver used to check if the channel is closed.
     reactor_closed_rx: oneshot_broadcast::Receiver<Result<CloseInfo>>,
     /// Unique ID for this channel. For logging.
     unique_id: UniqId,
+    /// Padding controller for this channel:
+    /// used to report when we queue data that will eventually wind up on the channel.
+    padding_ctrl: PaddingController,
 }
 
 impl ChannelSender {
     /// Check whether a cell type is permissible to be _sent_ on an
     /// open client channel.
     fn check_cell(&self, cell: &AnyChanCell) -> Result<()> {
-        use msg::AnyChanMsg::*;
+        use tor_cell::chancell::msg::AnyChanMsg::*;
         let msg = cell.msg();
         match msg {
             Created(_) | Created2(_) | CreatedFast(_) => Err(Error::from(internal!(
                 "Can't send {} cell on client channel",
                 msg.cmd()
             ))),
-            Certs(_) | Versions(_) | Authenticate(_) | Authorize(_) | AuthChallenge(_)
-            | Netinfo(_) => Err(Error::from(internal!(
-                "Can't send {} cell after handshake is done",
-                msg.cmd()
-            ))),
+            Certs(_) | Versions(_) | Authenticate(_) | AuthChallenge(_) | Netinfo(_) => {
+                Err(Error::from(internal!(
+                    "Can't send {} cell after handshake is done",
+                    msg.cmd()
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -330,11 +405,39 @@ impl ChannelSender {
     /// (This can sometimes be used to avoid having to keep
     /// a separate clone of the time provider.)
     pub(crate) fn time_provider(&self) -> &DynTimeProvider {
-        self.cell_tx.time_provider()
+        cfg_if! {
+            if #[cfg(feature="circ-padding")] {
+                self.cell_tx.inner().time_provider()
+            } else {
+                self.cell_tx.time_provider()
+            }
+        }
+    }
+
+    /// Return an approximate count of the number of outbound cells queued for this channel.
+    ///
+    /// This count is necessarily approximate,
+    /// because the underlying count can be modified by other senders and receivers
+    /// between when this method is called and when its return value is used.
+    ///
+    /// Does not include cells that have already been passed to the TLS connection.
+    ///
+    /// Circuit padding uses this count to determine
+    /// when messages are already outbound for the first hop of a circuit.
+    #[cfg(feature = "circ-padding")]
+    pub(crate) fn approx_count(&self) -> usize {
+        self.cell_tx.approx_count()
+    }
+
+    /// Note that a cell has been queued that will eventually be placed onto this sender.
+    ///
+    /// We use this as an input for padding machines.
+    pub(crate) fn note_cell_queued(&self) {
+        self.padding_ctrl.queued_data(crate::HopNum::from(0));
     }
 }
 
-impl Sink<AnyChanCell> for ChannelSender {
+impl Sink<ChanCellQueueEntry> for ChannelSender {
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
@@ -344,21 +447,21 @@ impl Sink<AnyChanCell> for ChannelSender {
             .map_err(|_| ChannelClosed.into())
     }
 
-    fn start_send(self: Pin<&mut Self>, cell: AnyChanCell) -> Result<()> {
+    fn start_send(self: Pin<&mut Self>, cell: ChanCellQueueEntry) -> Result<()> {
         let this = self.get_mut();
         if this.reactor_closed_rx.is_ready() {
             return Err(ChannelClosed.into());
         }
-        this.check_cell(&cell)?;
+        this.check_cell(&cell.0)?;
         {
-            use msg::AnyChanMsg::*;
-            match cell.msg() {
+            use tor_cell::chancell::msg::AnyChanMsg::*;
+            match cell.0.msg() {
                 Relay(_) | Padding(_) | Vpadding(_) => {} // too frequent to log.
                 _ => trace!(
-                    "{}: Sending {} for {}",
-                    this.unique_id,
-                    cell.msg().cmd(),
-                    CircId::get_or_zero(cell.circid())
+                    channel_id = %this.unique_id,
+                    "Sending {} for {}",
+                    cell.0.msg().cmd(),
+                    CircId::get_or_zero(cell.0.circid())
                 ),
             }
         }
@@ -423,17 +526,17 @@ impl ChannelBuilder {
     /// authentication info from the relay: call `check()` on the result
     /// to check that.  Finally, to finish the handshake, call `finish()`
     /// on the result of _that_.
-    pub fn launch<T, S>(
+    pub fn launch_client<T, S>(
         self,
         tls: T,
         sleep_prov: S,
         memquota: ChannelAccount,
-    ) -> OutboundClientHandshake<T, S>
+    ) -> ClientInitiatorHandshake<T, S>
     where
         T: AsyncRead + AsyncWrite + StreamOps + Send + Unpin + 'static,
         S: CoarseTimeProvider + SleepProvider,
     {
-        handshake::OutboundClientHandshake::new(tls, self.target, sleep_prov, memquota)
+        handshake::ClientInitiatorHandshake::new(tls, self.target, sleep_prov, memquota)
     }
 }
 
@@ -443,8 +546,12 @@ impl Channel {
     /// Internal method, called to finalize the channel when we've
     /// sent our netinfo cell, received the peer's netinfo cell, and
     /// we're finally ready to create circuits.
+    ///
+    /// Quick note on the allow clippy. This is has one call site so for now, it is fine that we
+    /// bust the mighty 7 arguments.
     #[allow(clippy::too_many_arguments)] // TODO consider if we want a builder
     fn new<S>(
+        channel_type: ChannelType,
         link_protocol: u16,
         sink: BoxedChannelSink,
         stream: BoxedChannelStream,
@@ -465,6 +572,8 @@ impl Channel {
         let (control_tx, control_rx) = mpsc::unbounded();
         let (cell_tx, cell_rx) = mq_queue::MpscSpec::new(CHANNEL_BUFFER_SIZE)
             .new_mq(dyn_time.clone(), memquota.as_raw_account())?;
+        #[cfg(feature = "circ-padding")]
+        let (cell_tx, cell_rx) = counting_streams::channel(cell_tx, cell_rx);
         let unused_since = AtomicOptTimestamp::new();
         unused_since.update();
 
@@ -477,10 +586,20 @@ impl Channel {
         };
         let details = Arc::new(details);
 
+        // We might be using experimental maybenot padding; this creates the padding framework for that.
+        //
+        // TODO: This backend is currently optimized for circuit padding,
+        // so it might allocate a bit more than necessary to account for multiple hops.
+        // We should tune it when we deploy padding in production.
+        let (padding_ctrl, padding_event_stream) =
+            client::circuit::padding::new_padding(DynTimeProvider::new(sleep_prov.clone()));
+
         let channel = Arc::new(Channel {
+            channel_type,
             control: control_tx,
             cell_tx,
             reactor_closed_rx,
+            padding_ctrl: padding_ctrl.clone(),
             unique_id,
             peer_id,
             clock_skew,
@@ -490,9 +609,17 @@ impl Channel {
         });
 
         // We start disabled; the channel manager will `reconfigure` us soon after creation.
-        let padding_timer = Box::pin(padding::Timer::new_disabled(sleep_prov, None)?);
+        let padding_timer = Box::pin(padding::Timer::new_disabled(sleep_prov.clone(), None)?);
+
+        cfg_if! {
+            if #[cfg(feature = "circ-padding")] {
+                use crate::util::sink_blocker::{SinkBlocker,CountingPolicy};
+                let sink = SinkBlocker::new(sink, CountingPolicy::new_unlimited());
+            }
+        }
 
         let reactor = Reactor {
+            runtime: sleep_prov,
             control: control_rx,
             cells: cell_rx,
             reactor_closed_tx,
@@ -505,6 +632,9 @@ impl Channel {
             unique_id,
             details,
             padding_timer,
+            padding_ctrl,
+            padding_event_stream,
+            padding_blocker: None,
             special_outgoing: Default::default(),
         };
 
@@ -526,7 +656,13 @@ impl Channel {
     /// (This can sometimes be used to avoid having to keep
     /// a separate clone of the time provider.)
     pub fn time_provider(&self) -> &DynTimeProvider {
-        self.cell_tx.time_provider()
+        cfg_if! {
+            if #[cfg(feature="circ-padding")] {
+                self.cell_tx.inner().time_provider()
+            } else {
+                self.cell_tx.time_provider()
+            }
+        }
     }
 
     /// Return an OwnedChanTarget representing the actual handshake used to
@@ -663,28 +799,31 @@ impl Channel {
             cell_tx: self.cell_tx.clone(),
             reactor_closed_rx: self.reactor_closed_rx.clone(),
             unique_id: self.unique_id,
+            padding_ctrl: self.padding_ctrl.clone(),
         }
     }
 
-    /// Return a newly allocated PendingClientCirc object with
-    /// a corresponding circuit reactor. A circuit ID is allocated, but no
+    /// Return a newly allocated PendingClientTunnel object with
+    /// a corresponding tunnel reactor. A circuit ID is allocated, but no
     /// messages are sent, and no cryptography is done.
     ///
     /// To use the results of this method, call Reactor::run() in a
     /// new task, then use the methods of
-    /// [crate::tunnel::circuit::PendingClientCirc] to build the circuit.
-    pub async fn new_circ(
+    /// [crate::client::circuit::PendingClientTunnel] to build the circuit.
+    pub async fn new_tunnel(
         self: &Arc<Self>,
-    ) -> Result<(circuit::PendingClientCirc, tunnel::reactor::Reactor)> {
+        timeouts: Arc<dyn TimeoutEstimator>,
+    ) -> Result<(PendingClientTunnel, client::reactor::Reactor)> {
         if self.is_closing() {
             return Err(ChannelClosed.into());
         }
 
-        let time_prov = self.cell_tx.time_provider().clone();
+        let time_prov = self.time_provider().clone();
         let memquota = CircuitAccount::new(&self.details.memquota)?;
 
         // TODO: blocking is risky, but so is unbounded.
-        let (sender, receiver) = MpscSpec::new(128).new_mq(time_prov, memquota.as_raw_account())?;
+        let (sender, receiver) =
+            MpscSpec::new(128).new_mq(time_prov.clone(), memquota.as_raw_account())?;
         let (createdsender, createdreceiver) = oneshot::channel::<CreateResponse>();
 
         let (tx, rx) = oneshot::channel();
@@ -693,17 +832,22 @@ impl Channel {
             sender,
             tx,
         })?;
-        let (id, circ_unique_id) = rx.await.map_err(|_| ChannelClosed)??;
+        let (id, circ_unique_id, padding_ctrl, padding_stream) =
+            rx.await.map_err(|_| ChannelClosed)??;
 
         trace!("{}: Allocated CircId {}", circ_unique_id, id);
 
-        Ok(circuit::PendingClientCirc::new(
+        Ok(PendingClientTunnel::new(
             id,
             self.clone(),
             createdreceiver,
             receiver,
             circ_unique_id,
+            time_prov,
             memquota,
+            padding_ctrl,
+            padding_stream,
+            timeouts,
         ))
     }
 
@@ -731,7 +875,7 @@ impl Channel {
     /// Note that this method does not _cause_ the channel to shut down on its own.
     pub fn wait_for_close(
         &self,
-    ) -> impl Future<Output = StdResult<CloseInfo, ClosedUnexpectedly>> + Send + Sync + 'static
+    ) -> impl Future<Output = StdResult<CloseInfo, ClosedUnexpectedly>> + Send + Sync + 'static + use<>
     {
         self.reactor_closed_rx
             .clone()
@@ -741,6 +885,36 @@ impl Channel {
                 Ok(Err(e)) => Err(ClosedUnexpectedly::ReactorError(e)),
                 Err(oneshot_broadcast::SenderDropped) => Err(ClosedUnexpectedly::ReactorDropped),
             })
+    }
+
+    /// Install a [`CircuitPadder`](client::CircuitPadder) for this channel.
+    ///
+    /// Replaces any previous padder installed.
+    #[cfg(feature = "circ-padding-manual")]
+    pub async fn start_padding(self: &Arc<Self>, padder: client::CircuitPadder) -> Result<()> {
+        self.set_padder_impl(Some(padder)).await
+    }
+
+    /// Remove any [`CircuitPadder`](client::CircuitPadder) installed for this channel.
+    ///
+    /// Does nothing if there was not a padder installed there.
+    #[cfg(feature = "circ-padding-manual")]
+    pub async fn stop_padding(self: &Arc<Self>) -> Result<()> {
+        self.set_padder_impl(None).await
+    }
+
+    /// Replace the [`CircuitPadder`](client::CircuitPadder) installed for this channel with `padder`.
+    #[cfg(feature = "circ-padding-manual")]
+    async fn set_padder_impl(
+        self: &Arc<Self>,
+        padder: Option<client::CircuitPadder>,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let msg = CtrlMsg::SetChannelPadder { padder, sender: tx };
+        self.control
+            .unbounded_send(msg)
+            .map_err(|_| Error::ChannelClosed(ChannelClosed))?;
+        rx.await.map_err(|_| Error::ChannelClosed(ChannelClosed))?
     }
 
     /// Make a new fake reactor-less channel.  For testing only, obviously.
@@ -755,7 +929,10 @@ impl Channel {
     //  * It returns the mpsc Receiver
     //  * It does not require explicit specification of details
     #[cfg(feature = "testing")]
-    pub fn new_fake() -> (Channel, mpsc::UnboundedReceiver<CtrlMsg>) {
+    pub fn new_fake(
+        rt: impl SleepProvider + CoarseTimeProvider,
+        channel_type: ChannelType,
+    ) -> (Channel, mpsc::UnboundedReceiver<CtrlMsg>) {
         let (control, control_recv) = mpsc::unbounded();
         let details = fake_channel_details();
 
@@ -768,11 +945,14 @@ impl Channel {
 
         // This will make rx trigger immediately.
         let (_tx, rx) = oneshot_broadcast::channel();
+        let (padding_ctrl, _) = client::circuit::padding::new_padding(DynTimeProvider::new(rt));
 
         let channel = Channel {
+            channel_type,
             control,
             cell_tx: fake_mpsc().0,
             reactor_closed_rx: rx,
+            padding_ctrl,
             unique_id,
             peer_id,
             clock_skew: ClockSkew::None,
@@ -788,7 +968,7 @@ impl Channel {
 /// `my_ident`, return a ChanMismatch error.
 ///
 /// This is a helper for [`Channel::check_match`] and
-/// [`UnverifiedChannel::check_internal`].
+/// UnverifiedChannel::check_internal.
 fn check_id_match_helper<T, U>(my_ident: &T, wanted_ident: &U) -> Result<()>
 where
     T: HasRelayIds + ?Sized,
@@ -809,7 +989,7 @@ where
                 return Err(Error::ChanMismatch(format!(
                     "Peer does not have {} identity",
                     id_type
-                )))
+                )));
             }
         }
     }
@@ -860,11 +1040,11 @@ fn fake_channel_details() -> Arc<ChannelDetails> {
 
 /// Make an MPSC queue, of the type we use in Channels, but a fake one for testing
 #[cfg(any(test, feature = "testing"))] // Used by Channel::new_fake which is also feature=testing
-pub(crate) fn fake_mpsc() -> (
-    mq_queue::Sender<AnyChanCell, mq_queue::MpscSpec>,
-    mq_queue::Receiver<AnyChanCell, mq_queue::MpscSpec>,
-) {
-    crate::fake_mpsc(CHANNEL_BUFFER_SIZE)
+pub(crate) fn fake_mpsc() -> (CellTx, CellRx) {
+    let (tx, rx) = crate::fake_mpsc(CHANNEL_BUFFER_SIZE);
+    #[cfg(feature = "circ-padding")]
+    let (tx, rx) = counting_streams::channel(tx, rx);
+    (tx, rx)
 }
 
 #[cfg(test)]
@@ -873,15 +1053,18 @@ pub(crate) mod test {
     // reactor code; there are just a few more cases to examine here.
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use crate::channel::codec::test::MsgBuf;
-    pub(crate) use crate::channel::reactor::test::new_reactor;
+    use crate::channel::handler::test::MsgBuf;
+    pub(crate) use crate::channel::reactor::test::{CodecResult, new_reactor};
     use crate::util::fake_mq;
     use tor_cell::chancell::msg::HandshakeType;
-    use tor_cell::chancell::{msg, AnyChanCell};
-    use tor_rtcompat::PreferredRuntime;
+    use tor_cell::chancell::{AnyChanCell, msg};
+    use tor_rtcompat::{PreferredRuntime, test_with_one_runtime};
 
     /// Make a new fake reactor-less channel.  For testing only, obviously.
-    pub(crate) fn fake_channel(details: Arc<ChannelDetails>) -> Channel {
+    pub(crate) fn fake_channel(
+        rt: impl SleepProvider + CoarseTimeProvider,
+        channel_type: ChannelType,
+    ) -> Channel {
         let unique_id = UniqId::new();
         let peer_id = OwnedChanTarget::builder()
             .ed_identity([6_u8; 32].into())
@@ -890,35 +1073,42 @@ pub(crate) mod test {
             .expect("Couldn't construct peer id");
         // This will make rx trigger immediately.
         let (_tx, rx) = oneshot_broadcast::channel();
+        let (padding_ctrl, _) = client::circuit::padding::new_padding(DynTimeProvider::new(rt));
         Channel {
+            channel_type,
             control: mpsc::unbounded().0,
             cell_tx: fake_mpsc().0,
             reactor_closed_rx: rx,
+            padding_ctrl,
             unique_id,
             peer_id,
             clock_skew: ClockSkew::None,
             opened_at: coarsetime::Instant::now(),
             mutable: Default::default(),
-            details,
+            details: fake_channel_details(),
         }
     }
 
     #[test]
     fn send_bad() {
-        tor_rtcompat::test_with_all_runtimes!(|_rt| async move {
+        tor_rtcompat::test_with_all_runtimes!(|rt| async move {
             use std::error::Error;
-            let chan = fake_channel(fake_channel_details());
+            let chan = fake_channel(rt, ChannelType::ClientInitiator);
 
             let cell = AnyChanCell::new(CircId::new(7), msg::Created2::new(&b"hihi"[..]).into());
             let e = chan.sender().check_cell(&cell);
             assert!(e.is_err());
-            assert!(format!("{}", e.unwrap_err().source().unwrap())
-                .contains("Can't send CREATED2 cell on client channel"));
+            assert!(
+                format!("{}", e.unwrap_err().source().unwrap())
+                    .contains("Can't send CREATED2 cell on client channel")
+            );
             let cell = AnyChanCell::new(None, msg::Certs::new_empty().into());
             let e = chan.sender().check_cell(&cell);
             assert!(e.is_err());
-            assert!(format!("{}", e.unwrap_err().source().unwrap())
-                .contains("Can't send CERTS cell after handshake is done"));
+            assert!(
+                format!("{}", e.unwrap_err().source().unwrap())
+                    .contains("Can't send CERTS cell after handshake is done")
+            );
 
             let cell = AnyChanCell::new(
                 CircId::new(5),
@@ -936,50 +1126,57 @@ pub(crate) mod test {
     fn chanbuilder() {
         let rt = PreferredRuntime::create().unwrap();
         let mut builder = ChannelBuilder::default();
-        builder.set_declared_method(tor_linkspec::ChannelMethod::Direct(vec!["127.0.0.1:9001"
-            .parse()
-            .unwrap()]));
+        builder.set_declared_method(tor_linkspec::ChannelMethod::Direct(vec![
+            "127.0.0.1:9001".parse().unwrap(),
+        ]));
         let tls = MsgBuf::new(&b""[..]);
-        let _outbound = builder.launch(tls, rt, fake_mq());
+        let _outbound = builder.launch_client(tls, rt, fake_mq());
     }
 
     #[test]
     fn check_match() {
-        let chan = fake_channel(fake_channel_details());
+        test_with_one_runtime!(|rt| async move {
+            let chan = fake_channel(rt, ChannelType::ClientInitiator);
 
-        let t1 = OwnedChanTarget::builder()
-            .ed_identity([6; 32].into())
-            .rsa_identity([10; 20].into())
-            .build()
-            .unwrap();
-        let t2 = OwnedChanTarget::builder()
-            .ed_identity([1; 32].into())
-            .rsa_identity([3; 20].into())
-            .build()
-            .unwrap();
-        let t3 = OwnedChanTarget::builder()
-            .ed_identity([3; 32].into())
-            .rsa_identity([2; 20].into())
-            .build()
-            .unwrap();
+            let t1 = OwnedChanTarget::builder()
+                .ed_identity([6; 32].into())
+                .rsa_identity([10; 20].into())
+                .build()
+                .unwrap();
+            let t2 = OwnedChanTarget::builder()
+                .ed_identity([1; 32].into())
+                .rsa_identity([3; 20].into())
+                .build()
+                .unwrap();
+            let t3 = OwnedChanTarget::builder()
+                .ed_identity([3; 32].into())
+                .rsa_identity([2; 20].into())
+                .build()
+                .unwrap();
 
-        assert!(chan.check_match(&t1).is_ok());
-        assert!(chan.check_match(&t2).is_err());
-        assert!(chan.check_match(&t3).is_err());
+            assert!(chan.check_match(&t1).is_ok());
+            assert!(chan.check_match(&t2).is_err());
+            assert!(chan.check_match(&t3).is_err());
+        });
     }
 
     #[test]
     fn unique_id() {
-        let ch1 = fake_channel(fake_channel_details());
-        let ch2 = fake_channel(fake_channel_details());
-        assert_ne!(ch1.unique_id(), ch2.unique_id());
+        test_with_one_runtime!(|rt| async move {
+            let ch1 = fake_channel(rt.clone(), ChannelType::ClientInitiator);
+            let ch2 = fake_channel(rt, ChannelType::ClientInitiator);
+            assert_ne!(ch1.unique_id(), ch2.unique_id());
+        });
     }
 
     #[test]
     fn duration_unused_at() {
-        let details = fake_channel_details();
-        let ch = fake_channel(Arc::clone(&details));
-        details.unused_since.update();
-        assert!(ch.duration_unused().is_some());
+        test_with_one_runtime!(|rt| async move {
+            let details = fake_channel_details();
+            let mut ch = fake_channel(rt, ChannelType::ClientInitiator);
+            ch.details = details.clone();
+            details.unused_since.update();
+            assert!(ch.duration_unused().is_some());
+        });
     }
 }

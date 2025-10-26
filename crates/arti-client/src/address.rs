@@ -1,16 +1,17 @@
 //! Types and traits for converting objects to addresses which
 //! Tor can connect to.
 
-use crate::err::ErrorDetail;
 use crate::StreamPrefs;
+use crate::err::ErrorDetail;
 use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
 use thiserror::Error;
 use tor_basic_utils::StrExt;
+use tor_error::{ErrorKind, HasKind};
 
 #[cfg(feature = "onion-service-client")]
-use tor_hscrypto::pk::{HsId, HSID_ONION_SUFFIX};
+use tor_hscrypto::pk::{HSID_ONION_SUFFIX, HsId};
 
 /// Fake plastic imitation of some of the `tor-hs*` functionality
 #[cfg(not(feature = "onion-service-client"))]
@@ -349,7 +350,6 @@ impl std::fmt::Display for TorAddr {
 // to it, or expose lower-level errors in it, without careful consideration!
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 #[non_exhaustive]
-// TODO Should implement ErrorKind
 pub enum TorAddrError {
     /// Tried to parse a string that can never be interpreted as a valid host.
     #[error("String can never be a valid hostname")]
@@ -360,6 +360,19 @@ pub enum TorAddrError {
     /// Tried to parse a port that wasn't a valid nonzero `u16`.
     #[error("Could not parse port")]
     BadPort,
+}
+
+impl HasKind for TorAddrError {
+    fn kind(&self) -> ErrorKind {
+        use ErrorKind as EK;
+        use TorAddrError as TAE;
+
+        match self {
+            TAE::InvalidHostname => EK::InvalidStreamTarget,
+            TAE::NoPort => EK::InvalidStreamTarget,
+            TAE::BadPort => EK::InvalidStreamTarget,
+        }
+    }
 }
 
 /// A host that Tor can connect to: either a hostname or an IP address.
@@ -568,6 +581,18 @@ mod test {
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
 
+    #[test]
+    fn test_error_kind() {
+        use tor_error::ErrorKind as EK;
+
+        assert_eq!(
+            TorAddrError::InvalidHostname.kind(),
+            EK::InvalidStreamTarget
+        );
+        assert_eq!(TorAddrError::NoPort.kind(), EK::InvalidStreamTarget);
+        assert_eq!(TorAddrError::BadPort.kind(), EK::InvalidStreamTarget);
+    }
+
     /// Make a `StreamPrefs` with `.onion` enabled, if cfg-enabled
     fn mk_stream_prefs() -> StreamPrefs {
         let prefs = crate::StreamPrefs::default();
@@ -764,9 +789,9 @@ mod test {
     #[test]
     fn prefs_onion_services() {
         use crate::err::ErrorDetailDiscriminants;
-        use tor_error::{ErrorKind, HasKind as _};
         use ErrorDetailDiscriminants as EDD;
         use ErrorKind as EK;
+        use tor_error::{ErrorKind, HasKind as _};
 
         #[allow(clippy::redundant_closure)] // for symmetry with prefs_of, below, and clarity
         let prefs_def = || StreamPrefs::default();

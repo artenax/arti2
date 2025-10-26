@@ -6,12 +6,12 @@
 use caret::caret_int;
 use derive_builder::Builder;
 
-use tor_config::{impl_standard_builder, ConfigBuildError};
+use tor_config::{ConfigBuildError, impl_standard_builder};
 use tor_units::Percentage;
 
 /// Fixed window parameters that are for the SENDME v0 world of fixed congestion window.
 #[non_exhaustive]
-#[derive(Builder, Clone, Debug, amplify::Getters)]
+#[derive(Builder, Copy, Clone, Debug, amplify::Getters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct FixedWindowParams {
     /// Circuit window starting point. From the "circwindow" param.
@@ -29,7 +29,7 @@ impl_standard_builder! { FixedWindowParams: !Deserialize + !Default }
 /// Vegas queuing parameters taken from the consensus only which are different depending if the
 /// circuit is an onion service one, an exit or used for SBWS.
 #[non_exhaustive]
-#[derive(Clone, Debug, amplify::Getters)]
+#[derive(Copy, Clone, Debug, amplify::Getters)]
 pub struct VegasQueueParams {
     /// Alpha parameter is used to know when to increase the window.
     #[getter(as_copy)]
@@ -67,7 +67,7 @@ impl From<(u32, u32, u32, u32, u32)> for VegasQueueParams {
 
 /// Vegas algorithm parameters taken from the consensus.
 #[non_exhaustive]
-#[derive(Builder, Clone, Debug, amplify::Getters)]
+#[derive(Builder, Copy, Clone, Debug, amplify::Getters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct VegasParams {
     /// The amount of queued cells that Vegas can tolerate before reacting.
@@ -96,6 +96,21 @@ pub enum Algorithm {
     FixedWindow(FixedWindowParams),
     /// Vegas algorithm.
     Vegas(VegasParams),
+}
+
+impl Algorithm {
+    /// Return true if this algorithm can be used along with CGO.
+    ///
+    /// CGO requires the V1 relay cell format, where every relay command
+    /// implies either the presence or absence of a StreamID.
+    /// But that format is not compatible with (legacy) stream-level SENDME messages
+    /// for flow control.
+    pub(crate) fn compatible_with_cgo(&self) -> bool {
+        match self {
+            Algorithm::FixedWindow(_) => false,
+            Algorithm::Vegas(_) => true,
+        }
+    }
 }
 
 caret_int! {
@@ -140,7 +155,7 @@ impl_standard_builder! { RoundTripEstimatorParams: !Deserialize + !Default }
 /// The parameters of what constitute a congestion window. This is used by all congestion control
 /// algorithms as in it is not specific to an algorithm.
 #[non_exhaustive]
-#[derive(Builder, Clone, Debug, amplify::Getters)]
+#[derive(Builder, Clone, Copy, Debug, amplify::Getters)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 pub struct CongestionWindowParams {
     /// Initial size of the congestion window.
@@ -167,6 +182,17 @@ pub struct CongestionWindowParams {
 }
 impl_standard_builder! { CongestionWindowParams: !Deserialize + !Default}
 
+impl CongestionWindowParams {
+    /// Set the `sendme_inc` value.
+    ///
+    /// This is used to override the default increment value from when this was constructed with a
+    /// [`CongestionWindowParamsBuilder`].
+    /// Typically the default when built should be from the network parameters from the consensus.
+    pub(crate) fn set_sendme_inc(&mut self, inc: u8) {
+        self.sendme_inc = u32::from(inc);
+    }
+}
+
 /// Global congestion control parameters taken from consensus. These are per-circuit.
 #[non_exhaustive]
 #[derive(Builder, Clone, Debug, amplify::Getters)]
@@ -174,9 +200,72 @@ impl_standard_builder! { CongestionWindowParams: !Deserialize + !Default}
 pub struct CongestionControlParams {
     /// The congestion control algorithm to use.
     alg: Algorithm,
+    /// Parameters to the fallback fixed-window algorithm, which we use
+    /// when the one in `alg` is not supported by a given relay.
+    ///
+    /// It is put in here because by the time we do path selection, we don't have access to the
+    /// consensus and so we have to keep our fallback ready.
+    fixed_window_params: FixedWindowParams,
     /// Congestion window parameters.
+    #[getter(as_mut)]
+    #[getter(as_copy)]
     cwnd_params: CongestionWindowParams,
     /// RTT calculation parameters.
     rtt_params: RoundTripEstimatorParams,
 }
 impl_standard_builder! { CongestionControlParams: !Deserialize + !Default }
+
+impl CongestionControlParams {
+    /// Return true iff congestion control is enabled that is the algorithm is anything other than
+    /// the fixed window SENDMEs.
+    ///
+    /// C-tor ref: congestion_control_enabled()
+    pub(crate) fn is_enabled(&self) -> bool {
+        !matches!(self.alg(), Algorithm::FixedWindow(_))
+    }
+
+    /// Make these parameters to use the fallback algorithm. This can't be reversed.
+    pub(crate) fn use_fallback_alg(&mut self) {
+        self.alg = Algorithm::FixedWindow(self.fixed_window_params);
+    }
+}
+
+/// Return true iff the given sendme increment is valid with regards to the value in the circuit
+/// parameters that is taken from the consensus.
+pub(crate) fn is_sendme_inc_valid(inc: u8, params: &CongestionControlParams) -> bool {
+    // Ease our lives a bit because the consensus value is u32.
+    let inc_u32 = u32::from(inc);
+    // A consensus value of 1 would allow this sendme increment to be 0 and thus
+    // we have to special case it before evaluating.
+    if inc == 0 {
+        return false;
+    }
+    let inc_consensus = params.cwnd_params().sendme_inc();
+    // See prop324 section 10.3
+    if inc_u32 > (inc_consensus.saturating_add(1)) || inc_u32 < (inc_consensus.saturating_sub(1)) {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{
+        ccparams::is_sendme_inc_valid, congestion::test_utils::params::build_cc_vegas_params,
+    };
+
+    #[test]
+    fn test_sendme_inc_valid() {
+        let params = build_cc_vegas_params();
+        let ref_inc = params.cwnd_params().sendme_inc() as u8;
+
+        // In range.
+        assert!(is_sendme_inc_valid(ref_inc, &params));
+        assert!(is_sendme_inc_valid(ref_inc + 1, &params));
+        assert!(is_sendme_inc_valid(ref_inc - 1, &params));
+        // Out of range.
+        assert!(!is_sendme_inc_valid(0, &params));
+        assert!(!is_sendme_inc_valid(ref_inc + 2, &params));
+        assert!(!is_sendme_inc_valid(ref_inc - 2, &params));
+    }
+}

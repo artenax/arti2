@@ -36,13 +36,13 @@
 // in a database.  But we don't need or want to write a generic "look up stuff in a database" API;
 // that can be (at least for now) a bespoke API just for HS restricted discovery."
 
+use ssh_key::Algorithm;
 use ssh_key::private::KeypairData;
 use ssh_key::public::KeyData;
-use ssh_key::Algorithm;
-use tor_error::{bad_api_usage, internal, Bug};
+use tor_error::{Bug, bad_api_usage, internal};
 
-use crate::ssh::{ED25519_EXPANDED_ALGORITHM_NAME, X25519_ALGORITHM_NAME};
 use crate::Result;
+use crate::ssh::{ED25519_EXPANDED_ALGORITHM_NAME, X25519_ALGORITHM_NAME};
 
 use std::fmt;
 use std::result::Result as StdResult;
@@ -252,6 +252,7 @@ impl KeyType {
     pub(crate) fn try_from_key_data(key: &KeyData) -> Result<KeyType> {
         match key.algorithm() {
             Algorithm::Ed25519 => Ok(KeyType::Ed25519PublicKey),
+            Algorithm::Rsa { hash: _ } => Ok(KeyType::RsaPublicKey),
             Algorithm::Other(algo) if algo.as_str() == X25519_ALGORITHM_NAME => {
                 Ok(KeyType::X25519PublicKey)
             }
@@ -266,6 +267,7 @@ impl KeyType {
         let algo = key.algorithm().map_err(|e| internal!("invalid algr {e}"))?;
         match algo {
             Algorithm::Ed25519 => Ok(KeyType::Ed25519Keypair),
+            Algorithm::Rsa { hash: _ } => Ok(KeyType::RsaKeypair),
             Algorithm::Other(algo) if algo.as_str() == X25519_ALGORITHM_NAME => {
                 Ok(KeyType::X25519StaticKeypair)
             }
@@ -292,6 +294,10 @@ declare_item_type! {
         X25519PublicKey => "x25519_public",
         /// An expanded Ed25519 keypair.
         Ed25519ExpandedKeypair => "ed25519_expanded_private",
+        /// A RSA keypair. 1024 bits long, exponent 65537.
+        RsaKeypair => "rsa_private",
+        /// A RSA public key. 1024 bits long, exponent 65537.
+        RsaPublicKey => "rsa_public",
     }
 
     /// A type of certificate stored in the keystore.

@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,11 +41,15 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 // TODO #1645 (either remove this, or decide to have it everywhere)
 #![cfg_attr(not(all(feature = "full", feature = "experimental")), allow(unused))]
 
+#[cfg(feature = "parse2")]
+#[macro_use]
+pub mod parse2;
 #[cfg(feature = "hs-service")]
 pub(crate) mod build;
 #[macro_use]
@@ -54,6 +58,9 @@ pub mod doc;
 mod err;
 pub mod types;
 mod util;
+
+#[doc(hidden)]
+pub use derive_deftly;
 
 // Use `#[doc(hidden)]` rather than pub(crate), because otherwise the doctest
 // doesn't work.
@@ -86,4 +93,77 @@ pub enum AllowAnnotations {
     AnnotationsAllowed,
     /// Parsing a document where annotations are not allowed.
     AnnotationsNotAllowed,
+}
+
+/// A "normally formatted" argument to a netdoc item
+///
+/// A type that is represented as a single argument
+/// whose representation is as for the type's `FromStr` and `Display`.
+///
+/// Implementing this trait enables a blanket impl of `parse2::ItemArgumentParseable`
+/// and `build::ItemArgument`.
+pub trait NormalItemArgument: std::str::FromStr + std::fmt::Display {}
+// TODO: should we implement ItemArgument for, say, tor_llcrypto::pk::rsa::RsaIdentity ?
+// It's not clear whether it's always formatted the same way in all parts of the spec.
+// The Display impl of RsaIdentity adds a `$` which is not supposed to be present
+// in (for example) an authority certificate (authcert)'s "fingerprint" line.
+
+impl NormalItemArgument for usize {}
+impl NormalItemArgument for u8 {}
+impl NormalItemArgument for u16 {}
+impl NormalItemArgument for u32 {}
+impl NormalItemArgument for u64 {}
+impl NormalItemArgument for u128 {}
+
+impl NormalItemArgument for isize {}
+impl NormalItemArgument for i8 {}
+impl NormalItemArgument for i16 {}
+impl NormalItemArgument for i32 {}
+impl NormalItemArgument for i64 {}
+impl NormalItemArgument for i128 {}
+
+impl NormalItemArgument for String {}
+
+/// Return a list of the protocols [supported](tor_protover::doc_supported)
+/// by this crate.
+pub fn supported_protocols() -> tor_protover::Protocols {
+    use tor_protover::named::*;
+    // WARNING: REMOVING ELEMENTS FROM THIS LIST CAN BE DANGEROUS!
+    // SEE [`tor_protover::doc_changing`]
+    [
+        DESC_CROSSSIGN,
+        DESC_NO_TAP,
+        DESC_FAMILY_IDS,
+        MICRODESC_ED25519_KEY,
+        MICRODESC_NO_TAP,
+        CONS_ED25519_MDS,
+    ]
+    .into_iter()
+    .collect()
+}
+
+#[cfg(test)]
+mod test {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_duration_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+
+    use super::*;
+
+    #[test]
+    fn protocols() {
+        let pr = supported_protocols();
+        let expected = "Cons=2 Desc=2-4 Microdesc=2-3".parse().unwrap();
+        assert_eq!(pr, expected);
+    }
 }

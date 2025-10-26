@@ -28,7 +28,18 @@ we intend to add this in the future.
 
 ### ⚠ Warnings ⚠
 
-Also note that the APIs for this crate are not all yet completely stable.
+If you integrate Arti, you need to be prepared to upgrade it over time,
+or it might stop working entirely.
+The Tor network protocols change over time, and sufficiently obsolete protocols
+are not supported.
+
+This library can call `exit(1)` and terminate your process
+if it receives a network consensus document telling it that it is obsolete.
+We know that this is not desirable behavior for a library;
+[we plan to improve it in the future.](https://gitlab.torproject.org/tpo/core/arti/-/issues/1932).
+(This behavior may occur while Arti is running, but never occurs on startup.)
+
+Note that the APIs for this crate are not all yet completely stable.
 We'll try not to break things without good reason, and we'll follow semantic
 versioning when we do, but please expect a certain amount of breakage
 between now and us declaring `arti-client` 1.x.
@@ -146,8 +157,8 @@ Streams can be isolated in two ways:
 ## Multiple runtime support
 
 Arti uses the [`tor_rtcompat`] crate to support multiple asynchronous
-runtimes; currently, both [Tokio](https://tokio.rs) and
-[async-std](https://async.rs) are supported.
+runtimes; currently [Tokio](https://tokio.rs), [async-std](https://async.rs)
+and [smol](https://github.com/smol-rs/smol) (experimental) are supported.
 
 The backend Arti uses for TCP connections ([`tor_rtcompat::NetStreamProvider`])
 and for creating TLS sessions ([`tor_rtcompat::TlsProvider`]) is also
@@ -156,6 +167,11 @@ environments where you want lots of control over how it uses the network.
 
 [**View the `tor_rtcompat` crate documentation**](tor_rtcompat) for more
 about these features.
+
+**Note**:
+The process [**may not fork**](tor_rtcompat#do-not-fork)
+(except, very carefully, before exec)
+after creating a Rust async runtime.
 
 ## Reporting Arti errors
 
@@ -204,13 +220,12 @@ match tor_client.connect(("example.com", 80)).await {
 * `tokio` (default) -- build with [Tokio](https://tokio.rs/) support
 * `native-tls` (default) -- build with the
   [native-tls](https://github.com/sfackler/rust-native-tls) crate for TLS
-  support
-* `async-std` -- build with [async-std](https://async.rs/) support
+  support.
+* `async-std` -- build with [async-std](https://async.rs/) support.
 * `compression` (default) -- Build support for downloading compressed
   documents. Requires a C compiler.
 * `bridge-client` -- Build with support for bridges.
-* `memquota` -- Build with support for memory use tracking and limiting.
-* `onion-service-client` -- Build with support for connecting to onion 
+* `onion-service-client` -- Build with support for connecting to onion
   services. Note that this is not yet as secure as C-Tor and shouldn't be used
   for security-sensitive purposes.
 * `onion-service-service` -- Build with support for running onion services.
@@ -227,11 +242,9 @@ match tor_client.connect(("example.com", 80)).await {
   flag.)
 
 * `rustls` -- build with the [rustls](https://github.com/rustls/rustls)
-  crate for TLS support.  This is not included in `full`, since it uses the
-  `ring` crate, which uses the old (3BSD/SSLEay) OpenSSL license, which may
-  introduce licensing compatibility issues.
+  crate for TLS support.  This is not currently included in `full`.
 
-Note that flags `tokio`, `native-tls`, `async-std`, `rustls` and `static`
+Note that flags `tokio`, `native-tls`, `async-std`, `smol`, `rustls` and `static`
 will enable the flags of the same name on the [`tor_rtcompat`] crate.
 
 ### Build-flag related features
@@ -264,11 +277,22 @@ implementation with another.
 * `error_detail` -- expose the `arti_client::Error` inner error type.
 * `dirfilter` -- expose the `DirFilter` API, which lets you modify a network
   directory before it is used.
-* `experimental` -- Build with all experimental features above, along with
+* `onion-service-cli-extra` -- build with additional key and state management
+  command line functionalities.
+* `smol` -- build with [smol](https://github.com/smol-rs/smol) support.
+* `experimental` -- build with all experimental features above, along with
   all experimental features from other arti crates.
 
 [^1]: Remember, semantic versioning is what makes various `cargo` features
 work reliably. To be explicit: if you want `cargo update` to _only_ make safe
 changes, then you cannot enable these features.
+
+### Deprecated features
+
+These features are either not recommended, or are no-op features.
+They are included for backwards compatibility.
+
+* `memquota` -- Memory quota tracking is now always supported,
+  regardless of if this feature is enabled.
 
 License: MIT OR Apache-2.0

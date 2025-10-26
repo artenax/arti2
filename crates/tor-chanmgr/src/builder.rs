@@ -5,15 +5,18 @@ use std::sync::{Arc, Mutex};
 
 use crate::factory::{BootstrapReporter, ChannelFactory, IncomingChannelFactory};
 use crate::transport::TransportImplHelper;
-use crate::{event::ChanMgrEventSender, Error};
+use crate::{Error, event::ChanMgrEventSender};
 
 use std::time::Duration;
+use tor_basic_utils::rand_hostname;
 use tor_error::internal;
+use tor_keymgr::KeyMgr;
 use tor_linkspec::{BridgeAddr, HasChanMethod, IntoOwnedChanTarget, OwnedChanTarget};
 use tor_proto::channel::kist::KistParams;
 use tor_proto::channel::params::ChannelPaddingInstructionsUpdates;
 use tor_proto::memquota::ChannelAccount;
-use tor_rtcompat::{tls::TlsConnector, Runtime, TlsProvider};
+use tor_rtcompat::{Runtime, TlsProvider, tls::TlsConnector};
+use tracing::instrument;
 
 use async_trait::async_trait;
 use futures::task::SpawnExt;
@@ -40,6 +43,9 @@ where
     transport: H,
     /// Object to build TLS connections.
     tls_connector: <R as TlsProvider<H::Stream>>::Connector,
+    /// Relay only: Key manager to get keys for channel authentication.
+    #[expect(dead_code)]
+    keymgr: Option<Arc<KeyMgr>>,
 }
 
 impl<R: Runtime, H: TransportImplHelper> ChanBuilder<R, H>
@@ -47,12 +53,13 @@ where
     R: TlsProvider<H::Stream>,
 {
     /// Construct a new ChanBuilder.
-    pub fn new(runtime: R, transport: H) -> Self {
+    pub fn new(runtime: R, transport: H, keymgr: Option<Arc<KeyMgr>>) -> Self {
         let tls_connector = <R as TlsProvider<H::Stream>>::tls_connector(&runtime);
         ChanBuilder {
             runtime,
             transport,
             tls_connector,
+            keymgr,
         }
     }
 }
@@ -62,6 +69,7 @@ where
     R: tor_rtcompat::TlsProvider<H::Stream> + Send + Sync,
     H: Send + Sync,
 {
+    #[instrument(skip_all, level = "trace")]
     async fn connect_via_transport(
         &self,
         target: &OwnedChanTarget,
@@ -125,6 +133,7 @@ where
     H: Send + Sync,
 {
     /// Perform the work of `connect_via_transport`, but without enforcing a timeout.
+    #[instrument(skip_all, level = "trace")]
     async fn connect_no_timeout(
         &self,
         target: &OwnedChanTarget,
@@ -169,10 +178,11 @@ where
 
         // 1b. Negotiate TLS.
 
-        // TODO: add a random hostname here if it will be used for SNI?
+        let hostname = rand_hostname::random_hostname(&mut rand::rng());
+
         let tls = self
             .tls_connector
-            .negotiate_unvalidated(stream, "ignored")
+            .negotiate_unvalidated(stream, hostname.as_str())
             .await
             .map_err(map_ioe("TLS negotiation"))?;
 
@@ -192,7 +202,7 @@ where
         let mut builder = ChannelBuilder::new();
         builder.set_declared_method(using_method);
         let chan = builder
-            .launch(
+            .launch_client(
                 tls,
                 self.runtime.clone(), /* TODO provide ZST SleepProvider instead */
                 memquota,
@@ -279,8 +289,8 @@ mod test {
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
     use crate::{
-        mgr::{AbstractChannel, AbstractChannelFactory},
         Result,
+        mgr::{AbstractChannel, AbstractChannelFactory},
     };
     use futures::StreamExt as _;
     use std::net::SocketAddr;
@@ -290,7 +300,7 @@ mod test {
     use tor_llcrypto::pk::rsa::RsaIdentity;
     use tor_proto::channel::Channel;
     use tor_proto::memquota::{ChannelAccount, SpecificAccount as _};
-    use tor_rtcompat::{test_with_one_runtime, NetStreamListener};
+    use tor_rtcompat::{NetStreamListener, test_with_one_runtime};
     use tor_rtmock::{io::LocalStream, net::MockNetwork};
 
     #[allow(deprecated)] // TODO #1885
@@ -344,7 +354,7 @@ mod test {
 
             // Create the channel builder that we want to test.
             let transport = crate::transport::DefaultTransport::new(client_rt.clone());
-            let builder = ChanBuilder::new(client_rt, transport);
+            let builder = ChanBuilder::new(client_rt, transport, None);
 
             let (r1, r2): (Result<Arc<Channel>>, Result<LocalStream>) = futures::join!(
                 async {

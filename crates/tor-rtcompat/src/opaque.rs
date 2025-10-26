@@ -31,7 +31,7 @@ macro_rules! implement_opaque_runtime {
         #[inline]
         fn reenter_block_on<F>(&self, future: F) -> F::Output
         where
-            F: futures::Future + Send + 'static,
+            F: futures::Future,
             F::Output: Send + 'static
         {
             self.$member.reenter_block_on(future)
@@ -120,6 +120,7 @@ macro_rules! implement_opaque_runtime {
     }
 
     // This boilerplate will fail unless $t implements Runtime.
+    #[allow(unused)]
     const _ : () = {
         fn assert_runtime<R: $crate::Runtime>() {}
         fn check() {

@@ -242,6 +242,24 @@ impl<T: NotAutoValue> ExplicitOrAuto<T> {
             ExplicitOrAuto::Explicit(v) => Some(v),
         }
     }
+
+    /// Maps an `ExplicitOrAuto<T>` to an `ExplicitOrAuto<U>` by applying a function to a contained
+    /// value.
+    pub fn map<U: NotAutoValue>(self, f: impl FnOnce(T) -> U) -> ExplicitOrAuto<U> {
+        match self {
+            Self::Auto => ExplicitOrAuto::Auto,
+            Self::Explicit(x) => ExplicitOrAuto::Explicit(f(x)),
+        }
+    }
+}
+
+impl<T> From<T> for ExplicitOrAuto<T>
+where
+    T: NotAutoValue,
+{
+    fn from(x: T) -> Self {
+        Self::Explicit(x)
+    }
 }
 
 /// A marker trait for types that do not serialize to the same value as [`ExplicitOrAuto::Auto`].
@@ -268,6 +286,9 @@ impl_not_auto_value_for_types!(
     bool
 );
 
+use tor_basic_utils::ByteQty;
+impl_not_auto_value!(ByteQty);
+
 // TODO implement `NotAutoValue` for other types too
 
 /// Padding enablement - rough amount of padding requested
@@ -276,7 +297,9 @@ impl_not_auto_value_for_types!(
 /// obscure traffic patterns, and impede router-level data collection.
 ///
 /// This same enum is used to control padding at various levels of the Tor system.
-/// (TODO: actually we don't do circuit padding yet.)
+//
+// (TODO circpad: actually we don't negotiate circuit padding yet. But when we do, we should look at
+// this.)
 //
 // This slightly-odd interleaving of derives and attributes stops rustfmt doing a daft thing
 #[derive(Clone, Copy, Hash, Debug, Ord, PartialOrd, Eq, PartialEq)]

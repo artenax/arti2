@@ -1,8 +1,8 @@
 //! Define the internal hash program representation used by HashX.
 
+use crate::Error;
 use crate::generator::Generator;
 use crate::register::{RegisterFile, RegisterId};
-use crate::Error;
 use fixed_capacity_vec::FixedCapacityVec;
 use rand_core::RngCore;
 use std::fmt;
@@ -162,7 +162,7 @@ impl Instruction {
             Instruction::Rotate { .. } => Opcode::Rotate,
             Instruction::SMulH { .. } => Opcode::SMulH,
             Instruction::Sub { .. } => Opcode::Sub,
-            Instruction::Target { .. } => Opcode::Target,
+            Instruction::Target => Opcode::Target,
             Instruction::UMulH { .. } => Opcode::UMulH,
             Instruction::Xor { .. } => Opcode::Xor,
             Instruction::XorConst { .. } => Opcode::XorConst,
@@ -180,7 +180,7 @@ impl Instruction {
             Instruction::Rotate { dst, .. } => Some(*dst),
             Instruction::SMulH { dst, .. } => Some(*dst),
             Instruction::Sub { dst, .. } => Some(*dst),
-            Instruction::Target { .. } => None,
+            Instruction::Target => None,
             Instruction::UMulH { dst, .. } => Some(*dst),
             Instruction::Xor { dst, .. } => Some(*dst),
             Instruction::XorConst { dst, .. } => Some(*dst),

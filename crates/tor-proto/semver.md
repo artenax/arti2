@@ -1,1 +1,1 @@
-BREAKING: Functions for constructing padding parameters are now fallible.
+BREAKING: `VerifiedChannel` and `UnverifiedChannel` are not public anymore.

@@ -1,6 +1,6 @@
 //! Different kinds of messages that can be encoded in channel cells.
 
-use super::{BoxedCellBody, ChanCmd, RawCellBody, CELL_DATA_LEN};
+use super::{BoxedCellBody, CELL_DATA_LEN, ChanCmd, RawCellBody};
 use std::net::{IpAddr, Ipv4Addr};
 use tor_basic_utils::skip_fmt;
 use tor_bytes::{self, EncodeError, EncodeResult, Error, Readable, Reader, Result, Writer};
@@ -73,8 +73,6 @@ pub enum AnyChanMsg : ChanMsg {
     /// Part of channel negotiation: used to authenticate relays when they
     /// initiate the channel.
     Authenticate,
-    /// Not yet used
-    Authorize,
     _ =>
     /// Any cell whose command we don't recognize
     Unrecognized,
@@ -732,11 +730,7 @@ impl Versions {
             .iter()
             .filter(|p| self.versions.contains(p))
             .fold(0_u16, |a, b| u16::max(a, *b));
-        if p == 0 {
-            None
-        } else {
-            Some(p)
-        }
+        if p == 0 { None } else { Some(p) }
     }
 }
 impl Body for Versions {
@@ -1028,6 +1022,11 @@ impl AuthChallenge {
             methods: methods.into(),
         }
     }
+
+    /// Return a reference to the list of methods.
+    pub fn methods(&self) -> &[u16] {
+        &self.methods
+    }
 }
 
 impl Body for AuthChallenge {
@@ -1106,37 +1105,6 @@ impl Readable for Authenticate {
     }
 }
 
-/// The Authorize message type is not yet used.
-#[derive(Clone, Debug, Deftly)]
-#[derive_deftly(HasMemoryCost)]
-pub struct Authorize {
-    /// The cell's content, which isn't really specified yet.
-    content: Vec<u8>,
-}
-impl Authorize {
-    /// Construct a new Authorize cell.
-    pub fn new<B>(content: B) -> Self
-    where
-        B: Into<Vec<u8>>,
-    {
-        let content = content.into();
-        Authorize { content }
-    }
-}
-impl Body for Authorize {
-    fn encode_onto<W: Writer + ?Sized>(self, w: &mut W) -> EncodeResult<()> {
-        w.write_all(&self.content[..]);
-        Ok(())
-    }
-}
-impl Readable for Authorize {
-    fn take_from(r: &mut Reader<'_>) -> Result<Self> {
-        Ok(Authorize {
-            content: r.take(r.remaining())?.into(),
-        })
-    }
-}
-
 /// Holds any message whose command we don't recognize.
 ///
 /// Well-behaved Tor implementations are required to ignore commands
@@ -1211,7 +1179,6 @@ msg_into_cell!(PaddingNegotiate);
 msg_into_cell!(Certs);
 msg_into_cell!(AuthChallenge);
 msg_into_cell!(Authenticate);
-msg_into_cell!(Authorize);
 
 /// Helper: declare a ChanMsg implementation for a message type that has a
 /// fixed command.
@@ -1262,7 +1229,6 @@ msg_impl_chanmsg!(
     Certs,
     AuthChallenge,
     Authenticate,
-    Authorize,
 );
 
 #[cfg(test)]

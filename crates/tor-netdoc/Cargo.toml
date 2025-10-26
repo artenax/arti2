@@ -1,9 +1,9 @@
 [package]
 name = "tor-netdoc"
-version = "0.28.0"
+version = "0.35.0"
 authors = ["The Tor Project, Inc.", "Nick Mathewson <nickm@torproject.org>"]
-edition = "2021"
-rust-version = "1.77"
+edition = "2024"
+rust-version = "1.86"
 license = "MIT OR Apache-2.0"
 homepage = "https://gitlab.torproject.org/tpo/core/arti/-/wikis/home"
 description = "Network document formats used with the Tor protocols."
@@ -19,6 +19,7 @@ full = [
     "hs-service",
     "routerdesc",
     "ns_consensus",
+    "plain-consensus",
     "tor-basic-utils/full",
     "tor-bytes/full",
     "tor-cert/full",
@@ -33,11 +34,13 @@ full = [
 ]
 experimental = [
     "build_docs",
+    "dangerous-expose-struct-fields",
     "experimental-api",
+    "hsdesc-inner-docs",
     "hs-dir",
     "hs-pow-full",
-    "hsdesc-inner-docs",
-    "dangerous-expose-struct-fields",
+    "ns-vote",
+    "parse2",
 ]
 
 # Enable code to build the objects that represent different network documents.
@@ -51,7 +54,13 @@ routerdesc = []
 testing = ["hex-literal", "hsdesc-inner-docs", "visibility"]
 
 # Enable the "ns consensus" document type, which some relays cache and serve.
-ns_consensus = []
+plain-consensus = []
+ns_consensus = ["plain-consensus"] # deprecated
+# Enable support for votes.  Very very experimental!
+ns-vote = ["__is_experimental"]
+
+# Enable the `parse` derive-based netdoc parser
+parse2 = ["__is_experimental"]
 
 # Client-side, directory-side, and service-side support for onion services.
 # Experimental: not covered by semver guarantees.
@@ -61,7 +70,10 @@ hs-client = ["hs-common"]
 hs-service = ["hs-common", "tor-cert/encode"]
 hs-common = ["rand", "tor-hscrypto", "tor-linkspec", "tor-units"]
 # Testing only : expose code to parse inner layers of onion service descriptors.
-hsdesc-inner-docs = ["visibility", "__is_experimental"] # TODO maybe fold this feature into `testing`
+hsdesc-inner-docs = [
+    "visibility",
+    "__is_experimental",
+] # TODO maybe fold this feature into `testing`
 
 # Onion service proof of work schemes
 hs-pow-full = ["tor-hscrypto/hs-pow-full", "__is_experimental"]
@@ -72,16 +84,8 @@ hs-pow-full = ["tor-hscrypto/hs-pow-full", "__is_experimental"]
 # feature voids your "semver warrantee".
 experimental-api = ["testing", "__is_experimental"]
 
-# Expose various struct fields as "pub", for testing.
-#
-# This feature is *super* dangerous for stability and correctness. If you use it
-# for anything besides testing, you are probably putting your users in danger.
-#
-# The struct fields exposed by this feature are not covered by semantic version.
-# In fact, using this feature will give you the opposite of a "semver
-# guarantee": you should be mildly surprised when your code _doesn't_ break from
-# version to version.
-dangerous-expose-struct-fields = ["visible", "visibility", "__is_experimental"]
+# Obsolete cargo feature.  The items exposed by this are now exposed by default.
+dangerous-expose-struct-fields = ["__is_experimental"]
 __is_experimental = []
 
 [dependencies]
@@ -89,37 +93,39 @@ amplify = { version = "4", default-features = false, features = ["derive"] }
 base64ct = { version = "1.5.1", features = ["alloc"] }
 bitflags = "2"
 cipher = { version = "0.4.1", features = ["zeroize"] }
+derive-deftly = { version = "~1.3.0", features = ["full", "beta"] }
 derive_builder = { version = "0.11.2", package = "derive_builder_fork_arti" }
 derive_more = { version = "2.0.1", features = ["full"] }
 digest = "0.10.0"
 educe = "0.4.22"
 hex = "0.4"
-hex-literal = { version = "0.4", optional = true }
+hex-literal = { version = "1.0", optional = true }
 humantime = "2"
 itertools = "0.14.0"
 memchr = "2.5"
-once_cell = "1"
-phf = { version = "0.11.1", features = ["macros"] }
-rand = { version = "0.9", optional = true }
-serde = "1.0.103"
+paste = "1"
+phf = { version = "0.13.1", features = ["macros"] }
+rand = { version = "0.9.1", optional = true }
+serde = { version = "1.0.103", features = ["derive"] }
 serde_with = "3.0.0"
 signature = "2"
 smallvec = "1.10"
+strum = { version = "0.27.1", features = ["derive"] }
 subtle = "2"
 thiserror = "2"
 time = { version = "0.3", features = ["std", "parsing", "macros", "formatting"] }
 tinystr = "0.8.0"
-tor-basic-utils = { path = "../tor-basic-utils", version = "0.28.0" }
-tor-bytes = { path = "../tor-bytes", version = "0.28.0" }
-tor-cell = { path = "../tor-cell", version = "0.28.0" }
-tor-cert = { path = "../tor-cert", version = "0.28.0" }
-tor-checkable = { path = "../tor-checkable", version = "0.28.0" }
-tor-error = { path = "../tor-error", version = "0.28.0" }
-tor-hscrypto = { path = "../tor-hscrypto", version = "0.28.0", optional = true }
-tor-linkspec = { path = "../tor-linkspec", version = "0.28.0", optional = true }
-tor-llcrypto = { path = "../tor-llcrypto", version = "0.28.0" }
-tor-protover = { path = "../tor-protover", version = "0.28.0" }
-tor-units = { version = "0.28.0", path = "../tor-units", optional = true }
+tor-basic-utils = { path = "../tor-basic-utils", version = "0.35.0" }
+tor-bytes = { path = "../tor-bytes", version = "0.35.0" }
+tor-cell = { path = "../tor-cell", version = "0.35.0" }
+tor-cert = { path = "../tor-cert", version = "0.35.0" }
+tor-checkable = { path = "../tor-checkable", version = "0.35.0" }
+tor-error = { path = "../tor-error", version = "0.35.0" }
+tor-hscrypto = { path = "../tor-hscrypto", version = "0.35.0", optional = true }
+tor-linkspec = { path = "../tor-linkspec", version = "0.35.0", optional = true }
+tor-llcrypto = { path = "../tor-llcrypto", version = "0.35.0" }
+tor-protover = { path = "../tor-protover", version = "0.35.0", features = ["serde"] }
+tor-units = { version = "0.35.0", path = "../tor-units", optional = true }
 visibility = { version = "0.1.0", optional = true }
 visible = { version = "0.0.1", optional = true }
 void = "1"
@@ -128,10 +134,11 @@ zeroize = "1"
 
 [dev-dependencies]
 anyhow = "1.0.23"
-hex-literal = "0.4"
+hex-literal = "1.0"
 itertools = "0.14.0"
 serde_json = "1.0.50"
-tor-basic-utils = { version = "0.28.0", path = "../tor-basic-utils" }
+testresult = "0.4.1"
+tor-basic-utils = { version = "0.35.0", path = "../tor-basic-utils" }
 
 [package.metadata.docs.rs]
 all-features = true

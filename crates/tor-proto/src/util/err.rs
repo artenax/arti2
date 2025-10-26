@@ -1,9 +1,13 @@
 //! Define an error type for the tor-proto crate.
+use safelog::Sensitive;
 use std::{sync::Arc, time::Duration};
 use thiserror::Error;
-use tor_cell::relaycell::{msg::EndReason, StreamId};
+use tor_cell::relaycell::{StreamId, msg::EndReason};
 use tor_error::{Bug, ErrorKind, HasKind};
 use tor_linkspec::RelayIdType;
+
+use crate::HopNum;
+use crate::client::circuit::PathEntry;
 
 /// An error type for the tor-proto crate.
 ///
@@ -115,6 +119,19 @@ pub enum Error {
     /// Received a cell with a stream ID of zero.
     #[error("Received a cell with a stream ID of zero")]
     StreamIdZero,
+    /// Received a cell on a closed or non-existent stream.
+    #[error(
+        "Received a cell from {} on a closed or non-existent stream {}. \
+         Either they are violating the protocol, or we are expiring streams too aggressively",
+        src,
+        streamid
+    )]
+    UnknownStream {
+        /// The hop the cell originated from.
+        src: Sensitive<PathEntry>,
+        /// The stream ID of the cell.
+        streamid: StreamId,
+    },
     /// Couldn't extend a circuit because the extending relay or the
     /// target relay refused our request.
     #[error("Circuit extension refused: {0}")]
@@ -131,6 +148,17 @@ pub enum Error {
     /// Stream protocol violation
     #[error("Stream protocol violation: {0}")]
     StreamProto(String),
+
+    /// Excessive data received from a circuit hop.
+    #[error("Received too many inbound cells")]
+    ExcessInboundCells,
+    /// Tried to send too many cells to a circuit hop.
+    #[error("Tried to send too many outbound cells")]
+    ExcessOutboundCells,
+
+    /// Received unexpected or excessive inbound circuit
+    #[error("Received unexpected or excessive circuit padding from {}", _1.display())]
+    ExcessPadding(#[source] ExcessPadding, HopNum),
 
     /// Channel does not match target
     #[error("Peer identity mismatch: {0}")]
@@ -183,15 +211,6 @@ impl Error {
         Error::CellEncodeErr { object, err }
     }
 
-    /// Create an error from a tor_cell error that has occurred while trying to
-    /// decode something of type `object`
-    pub(crate) fn from_cell_dec(err: tor_cell::Error, object: &'static str) -> Error {
-        match err {
-            tor_cell::Error::ChanProto(msg) => Error::ChanProto(msg),
-            _ => Error::CellDecodeErr { err, object },
-        }
-    }
-
     /// Create an error for a tor_bytes error that occurred while parsing
     /// something of type `object`.
     pub(crate) fn from_bytes_err(err: tor_bytes::Error, object: &'static str) -> Error {
@@ -205,10 +224,16 @@ impl Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Self::ChanIoErr(Arc::new(err))
+    }
+}
+
 impl From<Error> for std::io::Error {
     fn from(err: Error) -> std::io::Error {
-        use std::io::ErrorKind;
         use Error::*;
+        use std::io::ErrorKind;
         let kind = match err {
             ChanIoErr(e) | HandshakeIoErr(e) => match Arc::try_unwrap(e) {
                 Ok(e) => return e,
@@ -241,7 +266,11 @@ impl From<Error> for std::io::Error {
             | StreamProto(_)
             | MissingId(_)
             | IdUnavailable(_)
-            | StreamIdZero => ErrorKind::InvalidData,
+            | StreamIdZero
+            | UnknownStream { .. }
+            | ExcessInboundCells
+            | ExcessOutboundCells
+            | ExcessPadding(_, _) => ErrorKind::InvalidData,
 
             Bug(ref e) if e.kind() == tor_error::ErrorKind::BadApiUsage => ErrorKind::InvalidData,
 
@@ -253,9 +282,9 @@ impl From<Error> for std::io::Error {
 
 impl HasKind for Error {
     fn kind(&self) -> ErrorKind {
-        use tor_bytes::Error as BytesError;
         use Error as E;
         use ErrorKind as EK;
+        use tor_bytes::Error as BytesError;
         match self {
             E::BytesErr {
                 err: BytesError::Bug(e),
@@ -291,6 +320,10 @@ impl HasKind for Error {
             E::MissingId(_) => EK::BadApiUsage,
             E::IdUnavailable(_) => EK::BadApiUsage,
             E::StreamIdZero => EK::BadApiUsage,
+            E::UnknownStream { .. } => EK::TorProtocolViolation,
+            E::ExcessInboundCells => EK::TorProtocolViolation,
+            E::ExcessOutboundCells => EK::Internal,
+            E::ExcessPadding(_, _) => EK::TorProtocolViolation,
             E::Memquota(err) => err.kind(),
             E::Bug(e) => e.kind(),
         }
@@ -334,4 +367,28 @@ impl ReactorError {
             ReactorError::Err(e) => e,
         }
     }
+}
+
+/// An error type for client-side conflux handshakes.
+#[derive(Debug)]
+#[cfg(feature = "conflux")]
+#[allow(unused)] // TODO(conflux): remove
+pub(crate) enum ConfluxHandshakeError {
+    /// Timeout while waiting for CONFLUX_LINKED response.
+    Timeout,
+    /// An error that occurred while sending the CONFLUX_LINK message.
+    Link(Error),
+    /// The channel was closed.
+    ChannelClosed,
+}
+
+#[derive(Debug, Clone, Error)]
+#[non_exhaustive]
+pub enum ExcessPadding {
+    /// We received circuit padding when we hadn't negotiated a padding framework.
+    #[error("Padding received when not negotiated with given hop")]
+    NoPaddingNegotiated,
+    /// We received more padding than our negotiated framework permits.
+    #[error("Received padding in excess of negotiated framework's limit")]
+    PaddingExceedsLimit,
 }

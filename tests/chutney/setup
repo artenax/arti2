@@ -1,133 +1,214 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 
-set -xeuo pipefail
+import argparse
+import dataclasses
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
 
-SCRIPT_NAME=$(basename "$0")
+from argparse import ArgumentParser, Namespace
+from pathlib import Path
 
-function usage()
-{
-    cat <<EOF
-${SCRIPT_NAME}: Launch a chutney network to test arti
+_SCRIPT_NAME = Path(sys.argv[0]).name
+_SCRIPT_DIR = Path(sys.argv[0]).parent.resolve()
+_TOP_LEVEL = Path(
+    subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+)
 
-Usage:
-  ${SCRIPT_NAME} [modules] : Launch chutney, and the provided modules.
 
-Options:
-  -h: Print this message.
-  -n <network>: Name of the chutney network to launch (default: basic)
+class JqBinResolver:
+    def __init__(self, parser: ArgumentParser) -> None:
+        parser.add_argument("--jq-bin", help="jq executable")
 
-Modules:
-  "proxy": Launch a arti-based SOCKS proxy.
-EOF
-}
+    def resolve(self, args: Namespace) -> Path:
+        res_str = args.jq_bin or shutil.which("jq")
+        if res_str is None:
+            print(
+                textwrap.dedent(
+                    """
+                    jq not found.
+                    Try setting --jq-bin or ensuring it's on your PATH.
+                    On debian, it can be installed with:
+                    apt install jq
+                    """
+                )
+            )
+            sys.exit(1)
+        res = Path(res_str)
+        if not os.access(res, os.X_OK):
+            print(f"jq resolved to {res}, but it isn't an executable file")
+            sys.exit(1)
+        return res
 
-PROXY=no
-NETWORK="basic"
-while getopts "hn:" opt ; do
-    case "$opt" in
-	h) usage
-	   exit 0
-	   ;;
-	n) NETWORK="$OPTARG"
-	   ;;
-	*) echo "Unknown option. (Run $0 -h for usage)"
-	   exit 1
-	   ;;
-    esac
-done
 
-# Remove the parsed flags
-shift $((OPTIND-1))
+class ChutneyBinResolver:
+    def __init__(self, parser: ArgumentParser) -> None:
+        parser.add_argument("--chutney-bin", help="chutney executable")
 
-for module in "$@"; do
-    case "$module" in
-	proxy) PROXY=yes
-	       ;;
-	*) echo "Unrecognized module. (Run $0 -h for usage)"
-	   ;;
-    esac
-done
+    def resolve(self, args: Namespace) -> Path:
+        res_str = args.chutney_bin or shutil.which("chutney")
+        if res_str is None:
+            print(
+                textwrap.dedent(
+                    """
+                    chutney (https://gitlab.torproject.org/tpo/core/chutney) not found.
+                    Try setting --chutney-bin or ensuring it's on your PATH.
+                    quick install:
+                    python3 -m pip install git+https://gitlab.torproject.org/tpo/core/chutney.git
+                    """
+                )
+            )
+            sys.exit(1)
+        res = Path(res_str)
+        if not os.access(res, os.X_OK):
+            print(f"chutney resolved to {res}, but it isn't an executable file")
+            sys.exit(1)
+        return res
 
-target="$NETWORK"
-cd "$(git rev-parse --show-toplevel)"
-echo "target=$target" > tests/chutney/arti.run
 
-# Set and fully resolve chutney bin if not already set.
-: "${CHUTNEY_BIN:=$(type -P chutney)}"
-if [ -z "${CHUTNEY_BIN:-}" ]; then
-    echo "Couldn't locate chutney bin. Ensure it's on PATH or set CHUTNEY_BIN."
-    echo "You can install with:"
-    echo "python3 -m pip install git+https://gitlab.torproject.org/tpo/core/chutney.git"
-    exit 1
-elif [ ! -x "$CHUTNEY_BIN" ]; then
-    echo "CHUTNEY_BIN='$CHUTNEY_BIN' doesn't exist or isn't executable"
-    exit 1
-else
-    # CHUTNEY_BIN is set; tell the user so.
-    echo "Using chutney at '${CHUTNEY_BIN}'"
-fi
+class ArtiBinResolver:
+    def __init__(self, parser: ArgumentParser) -> None:
+        parser.add_argument("--arti-bin", help="arti executable")
 
-# Use consistent CHUTNEY_BIN for all steps. We export it in case we end up
-# calling other tools/scripts that directly look for chutney there.
-echo "export CHUTNEY_BIN=\"$CHUTNEY_BIN\"" >> tests/chutney/arti.run
+    def resolve(self, args: Namespace) -> Path:
+        res_str = args.arti_bin
+        if res_str is None:
+            for s in [
+                "target/x86_64-unknown-linux-gnu/quicktest/arti",
+                "target/quicktest/arti",
+                "target/x86_64-unknown-linux-gnu/debug/arti",
+                "target/debug/arti",
+            ]:
+                p = _TOP_LEVEL.joinpath(Path(s))
+                if p.exists():
+                    res_str = str(p)
+                    break
+        if res_str is None:
+            print(
+                textwrap.dedent(
+                    """
+                    arti client not found.
+                    Try setting --arti-bin or building one in this repo:
+                    cargo build --locked --profile=quicktest -p arti
+                    """
+                )
+            )
+            sys.exit(1)
+        res = Path(res_str)
+        if not os.access(res, os.X_OK):
+            print(f"arti resolved to {res}, but it isn't an executable file")
+            sys.exit(1)
+        return res
 
-# Likewise use a consistent CHUTNEY_DATA_DIR
-export CHUTNEY_DATA_DIR="${CHUTNEY_DATA_DIR:-$(pwd)}"
-echo "export CHUTNEY_DATA_DIR=\"$CHUTNEY_DATA_DIR\"" >> tests/chutney/arti.run
 
-"${CHUTNEY_BIN}" configure "$target"
-"${CHUTNEY_BIN}" start "$target"
-CHUTNEY_START_TIME=180 "${CHUTNEY_BIN}" wait_for_bootstrap "$target"
-"${CHUTNEY_BIN}" verify "$target"
+class ArtiBenchBinResolver:
+    def __init__(self, parser: ArgumentParser) -> None:
+        parser.add_argument("--arti-bench-bin", help="arti-bench executable")
 
-if [ "$PROXY" = "no" ] ; then
-    exit 0
-fi
+    def resolve(self, args: Namespace) -> Path:
+        res_str = args.arti_bin
+        if res_str is None:
+            for s in [
+                "target/x86_64-unknown-linux-gnu/release/arti-bench",
+                "target/release/arti-bench",
+                "target/x86_64-unknown-linux-gnu/quicktest/arti-bench",
+                "target/quicktest/arti-bench",
+                "target/x86_64-unknown-linux-gnu/debug/arti-bench",
+                "target/debug/arti-bench",
+            ]:
+                p = _TOP_LEVEL.joinpath(Path(s))
+                if p.exists():
+                    res_str = str(p)
+                    break
+        if res_str is None:
+            print(
+                textwrap.dedent(
+                    """
+                    arti-bench not found.
+                    Try setting --arti-bench-bin or building one in this repo:
+                    cargo build --locked --profile=quicktest -p arti-bench
+                    """
+                )
+            )
+            sys.exit(1)
+        res = Path(res_str)
+        if not os.access(res, os.X_OK):
+            print(f"arti-bench resolved to {res}, but it isn't an executable file")
+            sys.exit(1)
+        return res
 
-ARTI_FLAGS=()
-if [ "$(id -u)" = "0" ] ; then
-    # If we are root, then we're probably running from CI.  Tell Arti
-    # that's okay.
-    ARTI_FLAGS+=("-o" "application.allow_running_as_root=true")
-fi
 
-if [ -x ./target/x86_64-unknown-linux-gnu/debug/arti ]; then
-	cmd=./target/x86_64-unknown-linux-gnu/debug/arti
-else
-	cargo build
-	cmd=./target/debug/arti
-fi
+class ChutneyDataDirResolver:
+    def __init__(self, parser: ArgumentParser) -> None:
+        parser.add_argument(
+            "--chutney-data-dir", help="directory for chutney to put its data"
+        )
 
-(
-	set +e
-	"$cmd" proxy -c "${CHUTNEY_DATA_DIR}/nodes/arti.toml" -d 35353 \
-	       "${ARTI_FLAGS[@]}" &
-	arti_pid=$!
-	echo "pid=$arti_pid" >> tests/chutney/arti.run
-	wait "$arti_pid"
-	echo "result=$?" >> tests/chutney/arti.run
-) & disown
+    def resolve(self, args: Namespace) -> Path:
+        return Path(
+            args.chutney_data_dir or os.getenv("CHUTNEY_DATA_DIR") or os.getcwd()
+        )
 
-# Wait for arti to start listening (it does so "immediately", but we don't want to get there first)
-# Really there should be a proper daemon startup protocol here, but arti doesn't have one yet.
-for idx in $(seq 30); do
-    if : >&/dev/null </dev/tcp/127.0.0.1/9150 ; then
-	echo "Port 9150 seems open."
-	break
-    elif [ "$idx" == 30 ]; then
-	echo "Waited 30 seconds without result; giving up on port 9150."
-	exit 1
-    else
-	echo "waiting for port 9150..."
-	sleep 1
-    fi
-    # verify Arti did not fail early
-    # shellcheck disable=SC1091
-    source tests/chutney/arti.run
-    pid="${pid:?}"
-    if ! kill -0 "$pid"; then
-	result="${result:?}"
-        echo "Arti failed to start with code $result"
-	exit 1
-    fi
-done
+
+class ChutneyNetworkResolver:
+    def __init__(self, parser: ArgumentParser) -> None:
+        parser.add_argument(
+            "--network", "-n", help="name or path of a chutney network to launch"
+        )
+
+    def resolve(self, args: Namespace) -> str:
+        return args.network or str(_SCRIPT_DIR.joinpath("networks", "arti-ci"))
+
+
+@dataclasses.dataclass
+class Config:
+    chutney: Path
+    arti: Path
+    arti_bench: Path
+    jq: Path
+    chutney_data_dir: Path
+    network: str
+
+
+class ConfigResolver:
+    def __init__(self, parser: ArgumentParser) -> None:
+        self._jq_resolver = JqBinResolver(parser)
+        self._chutney_resolver = ChutneyBinResolver(parser)
+        self._arti_resolver = ArtiBinResolver(parser)
+        self._arti_bench_resolver = ArtiBenchBinResolver(parser)
+        self._chutney_data_dir_resolver = ChutneyDataDirResolver(parser)
+        self._network_resolver = ChutneyNetworkResolver(parser)
+
+    def resolve(self, args: Namespace) -> Config:
+        return Config(
+            chutney=self._chutney_resolver.resolve(args),
+            arti=self._arti_resolver.resolve(args),
+            arti_bench=self._arti_bench_resolver.resolve(args),
+            jq=self._jq_resolver.resolve(args),
+            chutney_data_dir=self._chutney_data_dir_resolver.resolve(args),
+            network=self._network_resolver.resolve(args),
+        )
+
+
+def _main() -> None:
+    # Set up command-line parser, registering config options
+    parser = argparse.ArgumentParser(
+        prog=_SCRIPT_NAME, description="Configure a chutney testbed"
+    )
+    config_resolver = ConfigResolver(parser)
+    args = parser.parse_args()
+    config = config_resolver.resolve(args)
+
+    with Path(_SCRIPT_DIR).joinpath("arti.run").open("w") as c:
+        print(f'target="{config.network}"', file=c)
+        print(f'jq_bin="{config.jq}"', file=c)
+        print(f'arti_bench_bin="{config.arti_bench}"', file=c)
+        print(f'chutney_bin="{config.chutney}"', file=c)
+        print(f'export CHUTNEY_ARTI="{config.arti}"', file=c)
+        print(f'export CHUTNEY_DATA_DIR="{config.chutney_data_dir}"', file=c)
+
+
+if __name__ == "__main__":
+    _main()

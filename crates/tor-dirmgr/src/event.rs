@@ -9,15 +9,15 @@ use std::{
     marker::PhantomData,
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     task::Poll,
     time::SystemTime,
 };
 
 use educe::Educe;
-use futures::{stream::Stream, Future, StreamExt};
+use futures::{Future, StreamExt, stream::Stream};
 use itertools::chain;
 use paste::paste;
 use time::OffsetDateTime;
@@ -58,7 +58,7 @@ pub(crate) trait FlagEvent: Sized {
 ///  * `$ty` must implement [`strum::EnumCount`] [`strum::IntoEnumIterator`]
 ///
 ///  * `$ty` type must implement [`Into<u16>`] and [`TryFrom<u16>`]
-///     (for example using the `num_enum` crate).
+///    (for example using the `num_enum` crate).
 ///
 ///  * The discriminants must be densely allocated.
 ///    This will be done automatically by the compiler
@@ -444,16 +444,19 @@ impl fmt::Display for DirProgress {
         /// Format this time in a format useful for displaying
         /// lifetime boundaries.
         fn fmt_time(t: SystemTime) -> String {
-            use once_cell::sync::Lazy;
+            use std::sync::LazyLock;
             /// Formatter object for lifetime boundaries.
             ///
             /// We use "YYYY-MM-DD HH:MM:SS UTC" here, since we never have
             /// sub-second times here, and using non-UTC offsets is confusing
             /// in this context.
-            static FORMAT: Lazy<Vec<time::format_description::FormatItem>> = Lazy::new(|| {
-                time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second] UTC")
+            static FORMAT: LazyLock<Vec<time::format_description::FormatItem>> =
+                LazyLock::new(|| {
+                    time::format_description::parse(
+                        "[year]-[month]-[day] [hour]:[minute]:[second] UTC",
+                    )
                     .expect("Invalid time format")
-            });
+                });
             OffsetDateTime::from(t)
                 .format(&FORMAT)
                 .unwrap_or_else(|_| "(could not format)".into())
@@ -1105,7 +1108,8 @@ mod test {
             },
         });
 
-        assert_eq!(bs.to_string(),
+        assert_eq!(
+            bs.to_string(),
             "directory is usable, fresh until 2022-01-17 12:00:00 UTC, and valid until 2022-01-17 14:00:00 UTC; next directory is fetching microdescriptors (5/40)"
         );
 

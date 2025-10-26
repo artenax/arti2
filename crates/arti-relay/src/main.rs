@@ -2,6 +2,13 @@
 //!
 //! NOTE: This binary is still highly experimental as in in active development, not stable and
 //! without any type of guarantee of running or even working.
+//!
+//! ## Error handling
+//!
+//! We return [`anyhow::Error`] for functions whose errors will always result in an exit and don't
+//! need to be handled individually.
+//! When we do need to handle errors, functions should return a more comprehensive error type (for
+//! example one created with `thiserror`).
 
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -44,25 +51,31 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 mod cli;
 mod config;
-mod err;
 mod relay;
+mod tasks;
 
+use std::fmt::Display;
 use std::io::IsTerminal as _;
 
 use anyhow::Context;
 use clap::Parser;
+use futures::FutureExt;
+use futures::task::SpawnExt;
 use safelog::with_safe_logging_suppressed;
-use tor_rtcompat::{PreferredRuntime, Runtime};
+use tor_rtcompat::tokio::TokioRustlsRuntime;
+use tor_rtcompat::{Runtime, ToplevelRuntime};
+use tracing::{debug, info, trace};
+use tracing_subscriber::FmtSubscriber;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::FmtSubscriber;
 
-use crate::config::{base_resolver, TorRelayConfig, DEFAULT_LOG_LEVEL};
-use crate::relay::TorRelay;
+use crate::config::{DEFAULT_LOG_LEVEL, TorRelayConfig, base_resolver};
+use crate::relay::InertTorRelay;
 
 fn main() {
     // Will exit if '--help' used or there's a parse error.
@@ -90,14 +103,10 @@ fn main_main(cli: cli::Cli) -> anyhow::Result<()> {
         .with_default_directive(level.into())
         .parse("")
         .expect("empty filter directive should be trivially parsable");
-    #[allow(clippy::print_stderr)]
     FmtSubscriber::builder()
         .with_env_filter(filter)
         .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(|| {
-            eprint!("arti-relay: ");
-            std::io::stderr()
-        })
+        .with_writer(std::io::stderr)
         .finish()
         .init();
 
@@ -124,11 +133,16 @@ fn main_main(cli: cli::Cli) -> anyhow::Result<()> {
 // Pass by value so that we don't need to clone fields, which keeps the code simpler.
 #[allow(clippy::needless_pass_by_value)]
 fn start_relay(_args: cli::RunArgs, global_args: cli::GlobalArgs) -> anyhow::Result<()> {
-    let runtime = init_runtime().context("Failed to initialize the runtime")?;
+    // TODO: Warn (or exit?) if running as root; see 'arti::process::running_as_root()'.
 
     let mut cfg_sources = global_args
         .config()
         .context("Failed to get configuration sources")?;
+
+    debug!(
+        "Using override options: {}",
+        iter_join(", ", cfg_sources.options()),
+    );
 
     // A Mistrust object to use for loading our configuration.
     // Elsewhere, we use the value _from_ the configuration.
@@ -164,38 +178,118 @@ fn start_relay(_args: cli::RunArgs, global_args: cli::GlobalArgs) -> anyhow::Res
                 config.logging.console,
             )
         })?;
-    #[allow(clippy::print_stderr)]
     let logger = tracing_subscriber::FmtSubscriber::builder()
         .with_env_filter(filter)
         .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(|| {
-            eprint!("arti-relay: ");
-            std::io::stderr()
-        })
+        .with_writer(std::io::stderr)
         .finish();
     let logger = tracing::Dispatch::new(logger);
 
     tracing::dispatcher::with_default(&logger, || {
+        let runtime = init_runtime().context("Failed to initialize the runtime")?;
+
         let path_resolver = base_resolver();
         let relay =
-            TorRelay::new(runtime, &config, path_resolver).context("Failed to initialize relay")?;
-        run_relay(relay)
-    })?;
+            InertTorRelay::new(config, path_resolver).context("Failed to initialize the relay")?;
 
-    Ok(())
+        match mainloop(&runtime, run_relay(runtime.clone(), relay))? {
+            MainloopStatus::Finished(result) => result,
+            MainloopStatus::CtrlC => {
+                info!("Received a ctrl-c; stopping the relay");
+                Ok(())
+            }
+        }
+    })
+}
+
+/// A helper to drive a future using a runtime.
+///
+/// This calls `block_on` on the runtime.
+/// The future will be cancelled on a ctrl-c event.
+fn mainloop<T: Send + 'static>(
+    runtime: &impl ToplevelRuntime,
+    fut: impl Future<Output = T> + Send + 'static,
+) -> anyhow::Result<MainloopStatus<T>> {
+    trace!("Starting runtime");
+
+    let rv = runtime.block_on(async {
+        // Code running in 'block_on' runs slower than in a task (in tokio at least),
+        // so the future is run on a task.
+        let mut handle = runtime
+            .spawn_with_handle(fut)
+            .context("Failed to spawn task")?
+            .fuse();
+
+        futures::select!(
+            // Signal handler is registered on the first poll.
+            res = tokio::signal::ctrl_c().fuse() => {
+                let () = res.context("Failed to listen for ctrl-c event")?;
+                trace!("Received a ctrl-c");
+                // Dropping the handle will cancel the task, so we do that explicitly here.
+                drop(handle);
+                Ok(MainloopStatus::CtrlC)
+            }
+            x = handle => Ok(MainloopStatus::Finished(x)),
+        )
+    });
+
+    trace!("Finished runtime");
+    rv
 }
 
 /// Run the relay.
-#[allow(clippy::unnecessary_wraps)] // TODO: not implemented yet; remove me
-fn run_relay<R: Runtime>(_relay: TorRelay<R>) -> anyhow::Result<()> {
-    Ok(())
+///
+/// This blocks until the relay stops.
+async fn run_relay<R: Runtime>(runtime: R, inert_relay: InertTorRelay) -> anyhow::Result<()> {
+    let relay = inert_relay
+        .bootstrap(runtime)
+        .await
+        .context("Failed to bootstrap")?;
+    // This blocks until end of time or an error.
+    relay.run().await
 }
 
 /// Initialize a runtime.
 ///
-/// Any commands that need a runtime should call this so that we use a consistent runtime.
-fn init_runtime() -> std::io::Result<impl Runtime> {
-    // Use the tokio runtime from tor_rtcompat unless we later find a reason to use tokio directly;
-    // see https://gitlab.torproject.org/tpo/core/arti/-/work_items/1744
-    PreferredRuntime::create()
+/// Any cli commands that need a runtime should call this so that we use a consistent runtime.
+fn init_runtime() -> std::io::Result<impl ToplevelRuntime> {
+    // Use the tokio runtime from tor_rtcompat unless we later find a reason to use tokio directly.
+    // See https://gitlab.torproject.org/tpo/core/arti/-/work_items/1744.
+    // Relays must use rustls as native-tls doesn't support
+    // `CertifiedConn::export_keying_material()`.
+    TokioRustlsRuntime::create()
+}
+
+/// The result of [`mainloop`].
+enum MainloopStatus<T> {
+    /// The result from the completed future.
+    Finished(T),
+    /// The future was cancelled due to a ctrl-c event.
+    CtrlC,
+}
+
+/// Formats an iterator as an object whose display implementation is a `separator`-separated string
+/// of items from `iter`.
+// TODO: This can be replaced with `std::fmt::from_fn()` once stabilised and within our MSRV.
+fn iter_join(separator: &str, iter: impl Iterator<Item: Display> + Clone) -> impl Display {
+    struct Fmt<'a, I: Iterator<Item: Display> + Clone> {
+        /// Separates items in `iter`.
+        separator: &'a str,
+        /// Iterator to join.
+        iter: I,
+    }
+    impl<'a, I: Iterator<Item: Display> + Clone> Display for Fmt<'a, I> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let Self { separator, iter } = self;
+            let mut iter = iter.clone();
+            if let Some(first) = iter.next() {
+                write!(f, "{first}")?;
+            }
+            for x in iter {
+                write!(f, "{separator}{x}")?;
+            }
+            Ok(())
+        }
+    }
+    Fmt { separator, iter }
 }

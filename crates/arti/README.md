@@ -1,6 +1,6 @@
 # arti
 
-A minimal command line program for connecting to the Tor network
+A minimal command-line program for connecting to the Tor network.
 
 (If you want a more general Tor client library interface, use
 [`arti_client`].)
@@ -50,7 +50,7 @@ and also
 [in the Arti repository](https://gitlab.torproject.org/tpo/core/arti/-/blob/main/crates/arti/src/arti-example-config.toml)).
 That example config file documents the configuration options.
 
-More detailed information about for the individual fields is available in the documentation
+More detailed information about the individual fields is available in the documentation
 for the Rust APIs [`ApplicationConfigBuilder`] and
 [`TorClientConfigBuilder`](arti_client::config::TorClientConfigBuilder).
 
@@ -76,7 +76,7 @@ Tor Browser and instruct it to use that SOCKS port.
 $ TOR_SKIP_LAUNCH=1 TOR_SOCKS_PORT=9150 TOR_SKIP_CONTROLPORTTEST=1 ./start-tor-browser.desktop
 ```
 
-#### OS X
+#### MacOS
 
 ```text
 $ TOR_SKIP_LAUNCH=1 TOR_SOCKS_PORT=9150 TOR_SKIP_CONTROLPORTTEST=1 /path/to/Tor\ Browser/Contents/MacOS/firefox
@@ -99,7 +99,7 @@ and `Start in` set to:
 (You may need to adjust the actual path to wherever you have put your Tor
 Browser.)
 
-The resulting Tor Browser should be using arti.  Note that onion services
+The resulting Tor Browser should be using arti. Note that onion services
 and bridges won't work (Arti doesn't support them yet), and neither will
 any feature depending on Tor's control-port protocol. Features not depending
 on the control-port such as the "New circuit for this site" button should
@@ -109,8 +109,8 @@ work.
 
 ### Additive features
 
-* `tokio` (default): Use the tokio runtime library as our backend.
-* `async-std`: Use the async-std runtime library as our backend. This
+* `tokio` (default) -- Use the tokio runtime library as our backend.
+* `async-std` -- Use the async-std runtime library as our backend. This
   feature has no effect unless building with `--no-default-features` to
   disable tokio.
 * `native-tls` -- Build with support for the `native_tls` TLS backend.
@@ -121,7 +121,6 @@ work.
   DNS queries over the Tor network.
 * `harden` (default) -- Build with support for hardening the Arti process by
   disabling debugger attachment and other local memory-inspection vectors.
-* `memquota` -- Build with support for memory use tracking and limiting.
 * `compression` (default) -- Build support for downloading compressed
   documents. Requires a C compiler.
 * `bridge-client` (default) -- Build with support for bridges.
@@ -131,10 +130,12 @@ work.
 * `onion-service-service` -- Build with support for running onion services.
   Note that this is not yet as secure as C-Tor and shouldn't
   be used for security-sensitive purposes.
+* `restricted-discovery` -- Build with support for onion services with
+  [restricted discovery]
 * `pt-client` (default) -- Build with support for pluggable transports.
 * `vanguards` (default) -- Build with support for [Vanguards](https://spec.torproject.org/vanguards-spec/).
 
-* `default-runtime` (default): Use a default async runtime and TLS provider.
+* `default-runtime` (default) -- Use a default async runtime and TLS provider.
   Convenience alias for `tokio` and `native-tls`.
 
 * `full` -- Build with all features above, along with all stable additive
@@ -144,9 +145,7 @@ work.
   flag.)
 
 * `rustls` -- build with the [rustls](https://github.com/rustls/rustls)
-  TLS backend.  This is not included in `full`, since it uses the
-  `ring` crate, which uses the old (3BSD/SSLEay) OpenSSL license, which may
-  introduce licensing compatibility issues.
+  TLS backend.  This is not currently included in `full`.
 
 ### Build-flag related features
 
@@ -176,17 +175,29 @@ implementation with another.
  versions.
 
 * `experimental-api` -- build with experimental, unstable API support.
-   (Right now, most APIs in the `arti` crate are experimental, since this
-   crate was originally written to run as a binary only.)
+  (Right now, most APIs in the `arti` crate are experimental, since this
+  crate was originally written to run as a binary only.)
 * `experimental` -- Build with all experimental features above, along with
   all experimental features from other arti crates.
-* `restricted-discovery` -- Build with experimental restricted discovery
+* `metrics` -- Build support for exporting metrics (to Prometheus).
   support. Restricted discovery support will become non-experimental
   once [#1795] is closed.
+* `onion-service-cli-extra` -- build with additional key and state management
+  command-line functionalities.
 
 [^1]: Remember, semantic versioning is what makes various `cargo` features
 work reliably. To be explicit, if you want `cargo update` to _only_ make
 correct changes, then you cannot enable these features.
+
+### Deprecated features
+
+These features are either not recommended, or are no-op features.
+They are included for backwards compatibility.
+Note that these features will still be enabled if you build with the
+`--all-features` cargo flag.
+
+* `memquota` -- Memory quota tracking is now always supported,
+  regardless of if this feature is enabled.
 
 [#1795]: https://gitlab.torproject.org/tpo/core/arti/-/issues/1795
 
@@ -201,7 +212,9 @@ a more complete list of missing features.
 
 ## Library for building command-line client
 
-This library crate contains code useful for making a command line program
+This library crate contains code useful for making a command-line program
 similar to `arti`. The API should not be considered stable.
 
 License: MIT OR Apache-2.0
+
+[restricted discovery]: https://spec.torproject.org/rend-spec/restricted-discovery.html

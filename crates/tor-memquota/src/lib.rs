@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 #![cfg_attr(not(feature = "memquota"), allow(unused))]
 
@@ -216,6 +216,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 // TODO #1176
@@ -269,7 +270,7 @@ pub use config::{Config, ConfigBuilder};
 pub use error::{Error, MemoryReclaimedError, StartupError};
 pub use if_enabled::EnabledToken;
 pub use memory_cost::HasMemoryCost;
-pub use memory_cost_derive::{assert_copy_static, HasMemoryCostStructural};
+pub use memory_cost_derive::{HasMemoryCostStructural, assert_copy_static};
 pub use mtracker::{Account, MemoryQuotaTracker};
 pub use utils::ArcMemoryQuotaTrackerExt;
 

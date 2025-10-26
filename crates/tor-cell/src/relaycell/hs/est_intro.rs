@@ -2,18 +2,18 @@
 
 use caret::caret_int;
 use derive_deftly::Deftly;
-use tor_bytes::{EncodeError, EncodeResult, Readable, Reader, Result, Writeable, Writer};
+use tor_bytes::{EncodeError, EncodeResult, Reader, Result, Writeable, Writer};
 use tor_error::bad_api_usage;
-use tor_hscrypto::ops::{HsMacKey, HS_MAC_LEN};
+use tor_hscrypto::ops::{HS_MAC_LEN, HsMacKey};
 use tor_llcrypto::{
-    pk::ed25519::{self, Ed25519Identity, ED25519_SIGNATURE_LEN},
+    pk::ed25519::{self, ED25519_SIGNATURE_LEN, Ed25519Identity},
     traits::ShortMac as _,
     util::ct::CtByteArray,
 };
 use tor_memquota::derive_deftly_template_HasMemoryCost;
 use tor_units::BoundedInt32;
 
-use crate::relaycell::{hs::ext::*, hs::AuthKeyType, msg};
+use crate::relaycell::{extlist::*, hs::AuthKeyType, msg};
 
 caret_int! {
     /// The introduction protocol extension type.
@@ -228,7 +228,7 @@ impl msg::Body for EstablishIntro {
             _ => {
                 return Err(tor_bytes::Error::InvalidMessage(
                     format!("unrecognized authkey type {:?}", auth_key_type).into(),
-                ))
+                ));
             }
         };
 

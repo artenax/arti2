@@ -7,7 +7,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use tor_error::ErrorReport;
 use tor_guardmgr::bridge::{BridgeConfig, BridgeParseError};
 use tor_proto::channel::Channel;
@@ -233,7 +233,7 @@ pub async fn detect_bridges_going_down(
                     is_bridge_still_online(channel.as_ref(), bridgeline.clone(), new_expiry_tx)
                         .await
                 {
-                    eprintln!("Error while waiting on close: {:#?}", e);
+                    eprintln!("Error while waiting on close: {e:#?}");
                 }
             });
         }

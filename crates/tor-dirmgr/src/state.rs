@@ -17,20 +17,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
 use tor_basic_utils::RngExt as _;
+use tor_dircommon::retry::DownloadSchedule;
 use tor_error::{internal, warn_report};
 use tor_netdir::{MdReceiver, NetDir, PartialNetDir};
 use tor_netdoc::doc::authcert::UncheckedAuthCert;
-use tor_netdoc::doc::netstatus::Lifetime;
+use tor_netdoc::doc::netstatus::{Lifetime, ProtoStatuses};
 use tracing::{debug, warn};
 
 use crate::event::DirProgress;
 
 use crate::storage::DynStore;
 use crate::{
+    CacheUsage, ClientRequest, DirMgrConfig, DocId, DocumentText, Error, Readiness, Result,
     docmeta::{AuthCertMeta, ConsensusMeta},
     event,
-    retry::DownloadSchedule,
-    CacheUsage, ClientRequest, DirMgrConfig, DocId, DocumentText, Error, Readiness, Result,
 };
 use crate::{DocSource, SharedMutArc};
 use tor_checkable::{ExternallySigned, SelfSigned, Timebound};
@@ -42,12 +42,12 @@ use tor_netdoc::doc::{
     netstatus::MdConsensus,
 };
 use tor_netdoc::{
+    AllowAnnotations,
     doc::{
         authcert::{AuthCert, AuthCertKeyIds},
         microdesc::MicrodescReader,
         netstatus::{ConsensusFlavor, UnvalidatedMdConsensus},
     },
-    AllowAnnotations,
 };
 use tor_rtcompat::Runtime;
 
@@ -69,6 +69,13 @@ pub(crate) enum NetDirChange<'a> {
     },
     /// Add the provided microdescriptors to the current `NetDir`.
     AddMicrodescs(&'a mut Vec<Microdesc>),
+    /// Replace the recommended set of subprotocols.
+    SetRequiredProtocol {
+        /// The time at which the protocol statuses were recommended
+        timestamp: SystemTime,
+        /// The recommended set of protocols.
+        protos: Arc<ProtoStatuses>,
+    },
 }
 
 /// A "state" object used to represent our progress in downloading a
@@ -214,11 +221,7 @@ impl<R: Runtime> GetConsensusState<R> {
         prev_netdir: Option<Arc<dyn PreviousNetDir>>,
         #[cfg(feature = "dirfilter")] filter: Arc<dyn crate::filter::DirFilter>,
     ) -> Self {
-        let authority_ids = config
-            .authorities()
-            .iter()
-            .map(|auth| auth.v3ident)
-            .collect();
+        let authority_ids = config.authorities().v3idents().clone();
         let after = prev_netdir
             .as_ref()
             .and_then(|x| x.get_netdir())
@@ -275,7 +278,7 @@ impl<R: Runtime> DirState for GetConsensusState<R> {
         }
     }
     fn dl_config(&self) -> DownloadSchedule {
-        self.config.schedule.retry_consensus
+        self.config.schedule.retry_consensus()
     }
     fn add_from_cache(
         &mut self,
@@ -402,6 +405,7 @@ impl<R: Runtime> GetConsensusState<R> {
             rt: self.rt.clone(),
             config: self.config.clone(),
             prev_netdir: self.prev_netdir.take(),
+            protocol_statuses: None,
             #[cfg(feature = "dirfilter")]
             filter: self.filter.clone(),
         });
@@ -462,6 +466,9 @@ struct GetCertsState<R: Runtime> {
     config: Arc<DirMgrConfig>,
     /// If one exists, the netdir we're trying to update.
     prev_netdir: Option<Arc<dyn PreviousNetDir>>,
+
+    /// If present a set of protocols to install as our latest recommended set.
+    protocol_statuses: Option<(SystemTime, Arc<ProtoStatuses>)>,
 
     /// A filter that gets applied to directory objects before we use them.
     #[cfg(feature = "dirfilter")]
@@ -529,6 +536,18 @@ impl<R: Runtime> GetCertsState<R> {
         };
         self.consensus = new_consensus;
 
+        // Update our protocol recommendations if we have a validated consensus,
+        // and if we haven't already updated our recommendations.
+        if let GetCertsConsensus::Validated(v) = &self.consensus {
+            if self.protocol_statuses.is_none() {
+                let protoset: &Arc<ProtoStatuses> = v.protocol_statuses();
+                self.protocol_statuses = Some((
+                    self.consensus_meta.lifetime().valid_after(),
+                    Arc::clone(protoset),
+                ));
+            }
+        }
+
         outcome
     }
 }
@@ -576,7 +595,7 @@ impl<R: Runtime> DirState for GetCertsState<R> {
         }
     }
     fn dl_config(&self) -> DownloadSchedule {
-        self.config.schedule.retry_certs
+        self.config.schedule.retry_certs()
     }
     fn add_from_cache(
         &mut self,
@@ -697,10 +716,19 @@ impl<R: Runtime> DirState for GetCertsState<R> {
         }
     }
 
+    fn get_netdir_change(&mut self) -> Option<NetDirChange<'_>> {
+        self.protocol_statuses.as_ref().map(|(timestamp, protos)| {
+            NetDirChange::SetRequiredProtocol {
+                timestamp: *timestamp,
+                protos: Arc::clone(protos),
+            }
+        })
+    }
+
     fn reset_time(&self) -> Option<SystemTime> {
         Some(
             self.consensus_meta.lifetime().valid_until()
-                + self.config.tolerance.post_valid_tolerance,
+                + self.config.tolerance.post_valid_tolerance(),
         )
     }
     fn reset(self: Box<Self>) -> Box<dyn DirState> {
@@ -902,7 +930,8 @@ impl<R: Runtime> GetMicrodescsState<R> {
         prev_netdir: Option<Arc<dyn PreviousNetDir>>,
         #[cfg(feature = "dirfilter")] filter: Arc<dyn crate::filter::DirFilter>,
     ) -> Self {
-        let reset_time = consensus.lifetime().valid_until() + config.tolerance.post_valid_tolerance;
+        let reset_time =
+            consensus.lifetime().valid_until() + config.tolerance.post_valid_tolerance();
         let n_microdescs = consensus.relays().len();
 
         let params = &config.override_net_params;
@@ -1017,7 +1046,7 @@ impl<R: Runtime> DirState for GetMicrodescsState<R> {
         }
     }
     fn dl_config(&self) -> DownloadSchedule {
-        self.config.schedule.retry_microdescs
+        self.config.schedule.retry_microdescs()
     }
     fn add_from_cache(
         &mut self,
@@ -1182,7 +1211,9 @@ fn client_download_range(lt: &Lifetime) -> (SystemTime, Duration) {
     // consensus is no longer fresh, and 7/8 of the time remaining
     // after that before the consensus is invalid."
     let lowbound = voting_interval + (voting_interval * 3) / 4;
-    let remainder = whole_lifetime - lowbound;
+    let remainder = whole_lifetime
+        .checked_sub(lowbound)
+        .expect("Arithmetic did not work as expected");
     let uncertainty = (remainder * 7) / 8;
 
     (valid_after + lowbound, uncertainty)
@@ -1267,11 +1298,14 @@ mod test {
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     #![allow(clippy::cognitive_complexity)]
     use super::*;
-    use crate::{Authority, AuthorityBuilder, DownloadScheduleConfig};
     use std::convert::TryInto;
     use std::sync::Arc;
     use tempfile::TempDir;
     use time::macros::datetime;
+    use tor_dircommon::{
+        authority::{AuthorityContacts, AuthorityContactsBuilder},
+        config::{DownloadScheduleConfig, NetworkConfig},
+    };
     use tor_netdoc::doc::authcert::AuthCertKeyIds;
     use tor_rtcompat::RuntimeSubstExt as _;
     #[allow(deprecated)] // TODO #1885
@@ -1321,11 +1355,11 @@ mod test {
             .with_coarse_time_provider(msp)
     }
 
-    fn make_dirmgr_config(authorities: Option<Vec<AuthorityBuilder>>) -> Arc<DirMgrConfig> {
-        let mut netcfg = crate::NetworkConfig::builder();
+    fn make_dirmgr_config(authorities: Option<AuthorityContactsBuilder>) -> Arc<DirMgrConfig> {
+        let mut netcfg = NetworkConfig::builder();
         netcfg.set_fallback_caches(vec![]);
         if let Some(a) = authorities {
-            netcfg.set_authorities(a);
+            *netcfg.authorities() = a;
         }
         let cfg = DirMgrConfig {
             cache_dir: "/we_will_never_use_this/".into(),
@@ -1348,18 +1382,16 @@ mod test {
     fn rsa(s: &str) -> RsaIdentity {
         RsaIdentity::from_hex(s).unwrap()
     }
-    fn test_authorities() -> Vec<AuthorityBuilder> {
-        fn a(s: &str) -> AuthorityBuilder {
-            Authority::builder().name("ignore").v3ident(rsa(s)).clone()
-        }
-        vec![
-            a("5696AB38CB3852AFA476A5C07B2D4788963D5567"),
-            a("5A23BA701776C9C1AB1C06E734E92AB3D5350D64"),
-            // This is an authority according to the consensus, but we'll
-            // pretend we don't recognize it, to make sure that we
-            // don't fetch or accept it.
-            // a("7C47DCB4A90E2C2B7C7AD27BD641D038CF5D7EBE"),
-        ]
+    fn test_authorities() -> AuthorityContactsBuilder {
+        let mut builder = AuthorityContacts::builder();
+        builder
+            .v3idents()
+            .push(rsa("5696AB38CB3852AFA476A5C07B2D4788963D5567"));
+        builder
+            .v3idents()
+            .push(rsa("5A23BA701776C9C1AB1C06E734E92AB3D5350D64"));
+
+        builder
     }
     fn authcert_id_5696() -> AuthCertKeyIds {
         AuthCertKeyIds {
@@ -1431,7 +1463,7 @@ mod test {
             // Download configuration is simple: only 1 request can be done in
             // parallel.  It uses a consensus retry schedule.
             let retry = state.dl_config();
-            assert_eq!(retry, DownloadScheduleConfig::default().retry_consensus);
+            assert_eq!(retry, DownloadScheduleConfig::default().retry_consensus());
 
             // Do we know what we want?
             let docs = state.missing_docs();
@@ -1461,12 +1493,14 @@ mod test {
             assert!(matches!(outcome, Err(Error::NetDocError { .. })));
             assert!(!changed);
             // make sure it wasn't stored...
-            assert!(store
-                .lock()
-                .unwrap()
-                .latest_consensus(ConsensusFlavor::Microdesc, None)
-                .unwrap()
-                .is_none());
+            assert!(
+                store
+                    .lock()
+                    .unwrap()
+                    .latest_consensus(ConsensusFlavor::Microdesc, None)
+                    .unwrap()
+                    .is_none()
+            );
 
             // Now try again, with a real consensus... but the wrong authorities.
             let mut changed = false;
@@ -1479,12 +1513,14 @@ mod test {
             );
             assert!(matches!(outcome, Err(Error::UnrecognizedAuthorities)));
             assert!(!changed);
-            assert!(store
-                .lock()
-                .unwrap()
-                .latest_consensus(ConsensusFlavor::Microdesc, None)
-                .unwrap()
-                .is_none());
+            assert!(
+                store
+                    .lock()
+                    .unwrap()
+                    .latest_consensus(ConsensusFlavor::Microdesc, None)
+                    .unwrap()
+                    .is_none()
+            );
 
             // Great. Change the receiver to use a configuration where these test
             // authorities are recognized.
@@ -1503,12 +1539,14 @@ mod test {
                 state.add_from_download(CONSENSUS, &req, source, Some(&store), &mut changed);
             assert!(outcome.is_ok());
             assert!(changed);
-            assert!(store
-                .lock()
-                .unwrap()
-                .latest_consensus(ConsensusFlavor::Microdesc, None)
-                .unwrap()
-                .is_some());
+            assert!(
+                store
+                    .lock()
+                    .unwrap()
+                    .latest_consensus(ConsensusFlavor::Microdesc, None)
+                    .unwrap()
+                    .is_some()
+            );
 
             // And with that, we should be asking for certificates
             assert!(state.can_advance());
@@ -1575,13 +1613,13 @@ mod test {
             assert!(!state.is_ready(Readiness::Complete));
             assert!(!state.is_ready(Readiness::Usable));
             let consensus_expires: SystemTime = datetime!(2020-08-07 12:43:20 UTC).into();
-            let post_valid_tolerance = crate::DirTolerance::default().post_valid_tolerance;
+            let post_valid_tolerance = crate::DirTolerance::default().post_valid_tolerance();
             assert_eq!(
                 state.reset_time(),
                 Some(consensus_expires + post_valid_tolerance)
             );
             let retry = state.dl_config();
-            assert_eq!(retry, DownloadScheduleConfig::default().retry_certs);
+            assert_eq!(retry, DownloadScheduleConfig::default().retry_certs());
 
             // Bootstrap status okay?
             assert_eq!(
@@ -1634,12 +1672,14 @@ mod test {
             assert!(!changed);
             let missing2 = state.missing_docs();
             assert_eq!(missing, missing2); // No change.
-            assert!(store
-                .lock()
-                .unwrap()
-                .authcerts(&[authcert_id_5a23()])
-                .unwrap()
-                .is_empty());
+            assert!(
+                store
+                    .lock()
+                    .unwrap()
+                    .authcerts(&[authcert_id_5a23()])
+                    .unwrap()
+                    .is_empty()
+            );
 
             // Now try to add the other from a download ... for real!
             let mut req = tor_dirclient::request::AuthCertRequest::new();
@@ -1653,12 +1693,14 @@ mod test {
             let missing3 = state.missing_docs();
             assert!(missing3.is_empty());
             assert!(state.can_advance());
-            assert!(!store
-                .lock()
-                .unwrap()
-                .authcerts(&[authcert_id_5a23()])
-                .unwrap()
-                .is_empty());
+            assert!(
+                !store
+                    .lock()
+                    .unwrap()
+                    .authcerts(&[authcert_id_5a23()])
+                    .unwrap()
+                    .is_empty()
+            );
 
             let next = state.advance();
             assert_eq!(
@@ -1723,10 +1765,10 @@ mod test {
                 let fresh_until: SystemTime = datetime!(2021-10-27 21:27:00 UTC).into();
                 let valid_until: SystemTime = datetime!(2021-10-27 21:27:20 UTC).into();
                 assert!(reset_time >= fresh_until);
-                assert!(reset_time <= valid_until + state.config.tolerance.post_valid_tolerance);
+                assert!(reset_time <= valid_until + state.config.tolerance.post_valid_tolerance());
             }
             let retry = state.dl_config();
-            assert_eq!(retry, DownloadScheduleConfig::default().retry_microdescs);
+            assert_eq!(retry, DownloadScheduleConfig::default().retry_microdescs());
             assert_eq!(
                 state.bootstrap_progress().to_string(),
                 "fetching microdescriptors (0/4)"

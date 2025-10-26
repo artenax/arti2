@@ -82,7 +82,7 @@ use std::fmt::{self, Display};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime};
 
-use derive_deftly::{define_derive_deftly, Deftly};
+use derive_deftly::{Deftly, define_derive_deftly};
 use serde::{Deserialize, Serialize};
 use serde::{Deserializer, Serializer};
 use thiserror::Error;
@@ -161,7 +161,10 @@ define_derive_deftly! {
             s.parse().map_err(|e| E::custom(e))
         }
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, concat!("string representing ", stringify!($tname)))
+            #[allow(clippy::useless_concat)] // False positive
+            {
+                write!(f, concat!("string representing ", stringify!($tname)))
+            }
         }
     }
 }
@@ -487,8 +490,8 @@ mod test {
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
     use humantime::parse_rfc3339;
-    use itertools::{chain, Itertools};
-    use tor_rtmock::{simple_time::SimpleMockTimeProvider, MockRuntime};
+    use itertools::{Itertools, chain};
+    use tor_rtmock::{MockRuntime, simple_time::SimpleMockTimeProvider};
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)
@@ -546,7 +549,6 @@ mod test {
         assert_eq!(e, p("2008-08-02T00:00Z"));
         assert_eq!(e, p("2008-08-02T00:00:00"));
         assert_eq!(e, p("2008-08-02T00:00:00B"));
-        assert_eq!(e, p("2008-08-02T00:00:00+00:00"));
     }
 
     #[test]

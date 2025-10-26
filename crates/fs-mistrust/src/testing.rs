@@ -175,10 +175,28 @@ pub(crate) fn mistrust_build(ops: &[MistrustOp]) -> Mistrust {
                     #[cfg(all(
                         target_family = "unix",
                         not(target_os = "ios"),
-                        not(target_os = "android")
+                        not(target_os = "android"),
+                        not(target_os = "tvos")
                     ))]
                     return m.trust_no_group_id();
 
+                    #[cfg(not(all(
+                        target_family = "unix",
+                        not(target_os = "ios"),
+                        not(target_os = "android"),
+                        not(target_os = "tvos")
+                    )))]
+                    return m;
+                }
+
+                #[cfg(target_family = "unix")]
+                MistrustOp::TrustAdminOnly() => {
+                    #[cfg(all(
+                        target_family = "unix",
+                        not(target_os = "ios"),
+                        not(target_os = "android")
+                    ))]
+                    return m.trust_admin_only();
                     #[cfg(not(all(
                         target_family = "unix",
                         not(target_os = "ios"),
@@ -188,10 +206,20 @@ pub(crate) fn mistrust_build(ops: &[MistrustOp]) -> Mistrust {
                 }
 
                 #[cfg(target_family = "unix")]
-                MistrustOp::TrustAdminOnly() => m.trust_admin_only(),
-
-                #[cfg(target_family = "unix")]
-                MistrustOp::TrustGroup(gid) => m.trust_group(*gid),
+                MistrustOp::TrustGroup(gid) => {
+                    #[cfg(all(
+                        target_family = "unix",
+                        not(target_os = "ios"),
+                        not(target_os = "android")
+                    ))]
+                    return m.trust_group(*gid);
+                    #[cfg(not(all(
+                        target_family = "unix",
+                        not(target_os = "ios"),
+                        not(target_os = "android")
+                    )))]
+                    return m;
+                }
             }
         })
         .build()

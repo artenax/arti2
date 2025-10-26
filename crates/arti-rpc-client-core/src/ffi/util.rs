@@ -535,14 +535,14 @@ macro_rules! ffi_initialize {
 ///
 /// - It returns  `Err(InvalidInput)` if the conversion fails,
 ///   and `Ok($ty)` if the conversion succeeds.
-///     (Infallible conversions always return `Ok`.)
+///   (Infallible conversions always return `Ok`.)
 ///
 /// Nothing outside of the `ffi_initialize!` macro should actually invoke these functions!
 #[allow(clippy::unnecessary_wraps)]
 pub(super) mod arg_conversion {
     use super::{OutPtr, OutSocketOwned, OutVal};
-    use crate::ffi::{err::InvalidInput, ArtiRpcRawSocket};
-    use std::ffi::{c_char, CStr};
+    use crate::ffi::{ArtiRpcRawSocket, err::InvalidInput};
+    use std::ffi::{CStr, c_char};
     use void::Void;
 
     /// Try to convert a const pointer to an optional reference.

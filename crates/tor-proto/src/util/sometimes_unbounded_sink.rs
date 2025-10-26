@@ -2,9 +2,9 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll, Poll::*};
+use std::task::{Context, Poll, Poll::*, ready};
 
-use futures::{future, Sink};
+use futures::{Sink, future};
 
 use pin_project::pin_project;
 
@@ -32,6 +32,13 @@ use pin_project::pin_project;
 /// You can use [`Sink::poll_ready`] for this.
 /// Any [`Context`]-taking methods is suitable.
 ///
+/// (This is a difference between [`SometimesUnboundedSink`]
+/// and [`mpsc::UnboundedSender`](futures::channel::mpsc::UnboundedSender):
+/// [`UnboundedSender::unbounded_send`](futures::channel::mpsc::UnboundedSender::unbounded_send)
+/// does not require a flush operation.
+/// In this way, [`SometimesUnboundedSink::send_unbounded`] behaves more like
+/// [`Sink::start_send`], which _does_ require a subsequent flush.)
+//
 /// ### Error handling
 ///
 /// Errors from the underlying sink may not be reported immediately,
@@ -97,6 +104,14 @@ impl<T, S: Sink<T>> SometimesUnboundedSink<T, S> {
     /// Return the number of T queued in this sink.
     pub(crate) fn n_queued(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Return an iterator over the items queued in this sink.
+    ///
+    /// (Used by circuit padding to see whether we have a cell queued for a given hop.)
+    #[cfg(feature = "circ-padding")]
+    pub(crate) fn iter_queue(&self) -> impl Iterator<Item = &T> + '_ {
+        self.buf.iter()
     }
 
     /// Hand `item` to the inner Sink if possible, or queue it otherwise
@@ -165,6 +180,17 @@ impl<T, S: Sink<T>> SometimesUnboundedSink<T, S> {
     /// modify it, the `SometimesUnboundedSink` may malfunction.
     pub(crate) fn as_inner(&self) -> &S {
         &self.inner
+    }
+
+    /// Obtain a mutable reference to the inner `Sink`, `S`
+    ///
+    /// This method should be used with extra care, since it bypasses the wrapper.
+    /// Before you call this method,
+    /// make sure you understand the internal invariants for `SometimesUnboundedSink`,
+    /// and make sure that you are not violating them.
+    /// In particular, do not queue anything onto the resulting `Sink` directly.
+    pub(crate) fn as_inner_mut(&mut self) -> &mut S {
+        &mut self.inner
     }
 }
 

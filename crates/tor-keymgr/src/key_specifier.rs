@@ -1,15 +1,16 @@
 //! The [`KeySpecifier`] trait and its implementations.
 
 use std::collections::BTreeMap;
-use std::fmt::{self, Display};
+use std::fmt::{self, Debug, Display};
 use std::ops::Range;
 use std::result::Result as StdResult;
 use std::str::FromStr;
 
 use derive_more::From;
+use safelog::DisplayRedacted as _;
 use thiserror::Error;
-use tor_error::{internal, into_internal, Bug};
-use tor_hscrypto::pk::{HsId, HsIdParseError, HSID_ONION_SUFFIX};
+use tor_error::{Bug, internal, into_internal};
+use tor_hscrypto::pk::{HSID_ONION_SUFFIX, HsId, HsIdParseError};
 use tor_hscrypto::time::TimePeriod;
 use tor_persist::hsnickname::HsNickname;
 use tor_persist::slug::Slug;
@@ -100,7 +101,7 @@ impl KeyPath {
     /// Return the underlying [`ArtiPath`], if this is a `KeyPath::Arti`.
     pub fn arti(&self) -> Option<&ArtiPath> {
         match self {
-            KeyPath::Arti(ref arti) => Some(arti),
+            KeyPath::Arti(arti) => Some(arti),
             KeyPath::CTor(_) => None,
         }
     }
@@ -109,7 +110,7 @@ impl KeyPath {
     pub fn ctor(&self) -> Option<&CTorPath> {
         match self {
             KeyPath::Arti(_) => None,
-            KeyPath::CTor(ref ctor) => Some(ctor),
+            KeyPath::CTor(ctor) => Some(ctor),
         }
     }
 }
@@ -337,7 +338,9 @@ pub enum CTorPath {
     ///
     /// We can't statically know exactly *which* entry has the key for this `HsId`
     /// (we'd need to read and parse each file from `ClientOnionAuthDir` to find out).
-    #[display("ClientHsDescEncKey({})", _0)]
+    //
+    // TODO: Perhaps we should redact this sometimes.
+    #[display("ClientHsDescEncKey({})", _0.display_unredacted())]
     ClientHsDescEncKey(HsId),
     /// A service key path.
     #[display("{path}")]
@@ -560,7 +563,7 @@ impl KeySpecifierComponent for HsId {
         // We can't implement KeySpecifierComponentViaDisplayFromStr for HsId,
         // because its Display impl contains the `.onion` suffix, and Slugs can't
         // contain `.`.
-        let hsid = self.to_string();
+        let hsid = self.display_unredacted().to_string();
         let hsid_slug = hsid
             .strip_suffix(HSID_ONION_SUFFIX)
             .ok_or_else(|| internal!("HsId Display impl missing .onion suffix?!"))?;
@@ -590,7 +593,7 @@ impl KeySpecifierComponent for HsId {
     }
 
     fn fmt_pretty(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        Display::fmt(self, f)
+        Display::fmt(&self.display_redacted(), f)
     }
 }
 

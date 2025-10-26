@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use cfg_if::cfg_if;
 use clap::ArgMatches;
 #[allow(unused)]
 use tor_config_path::CfgPathResolver;
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 use arti_client::TorClientConfig;
 use tor_config::{ConfigurationSources, Listen};
@@ -14,7 +15,7 @@ use tor_rtcompat::ToplevelRuntime;
 
 #[cfg(feature = "dns-proxy")]
 use crate::dns;
-use crate::{exit, process, reload_cfg, socks, ArtiConfig, TorClient};
+use crate::{ArtiConfig, TorClient, exit, process, reload_cfg, socks};
 
 #[cfg(feature = "rpc")]
 use crate::rpc;
@@ -26,6 +27,8 @@ use crate::onion_proxy;
 type PinnedFuture<T> = std::pin::Pin<Box<dyn futures::Future<Output = T>>>;
 
 /// Run the `proxy` subcommand.
+#[instrument(skip_all, level = "trace")]
+#[allow(clippy::cognitive_complexity)]
 pub(crate) fn run<R: ToplevelRuntime>(
     runtime: R,
     proxy_matches: &ArgMatches,
@@ -53,6 +56,32 @@ pub(crate) fn run<R: ToplevelRuntime>(
         );
     }
 
+    if let Some(listen) = {
+        // https://github.com/metrics-rs/metrics/issues/567
+        config
+            .metrics
+            .prometheus
+            .listen
+            .single_address_legacy()
+            .context("can only listen on a single address for Prometheus metrics")?
+    } {
+        cfg_if! {
+            if #[cfg(feature = "metrics")] {
+                metrics_exporter_prometheus::PrometheusBuilder::new()
+                    .with_http_listener(listen)
+                    .install()
+                    .with_context(|| format!(
+                        "set up Prometheus metrics exporter on {listen}"
+                    ))?;
+                info!("Arti Prometheus metrics export scraper endpoint http://{listen}");
+            } else {
+                return Err(anyhow::anyhow!(
+        "`metrics.prometheus.listen` config set but `metrics` cargo feature compiled out in `arti` crate"
+                ));
+            }
+        }
+    }
+
     process::use_max_file_limit(&config);
 
     let rt_copy = runtime.clone();
@@ -75,6 +104,7 @@ pub(crate) fn run<R: ToplevelRuntime>(
 /// Currently, might panic if things go badly enough wrong
 #[cfg_attr(feature = "experimental-api", visibility::make(pub))]
 #[cfg_attr(docsrs, doc(cfg(feature = "experimental-api")))]
+#[instrument(skip_all, level = "trace")]
 async fn run_proxy<R: ToplevelRuntime>(
     runtime: R,
     socks_listen: Listen,
@@ -175,7 +205,9 @@ async fn run_proxy<R: ToplevelRuntime>(
 
     if proxy.is_empty() {
         if !launched_onion_svc {
-            warn!("No proxy port set; specify -p PORT (for `socks_port`) or -d PORT (for `dns_port`). Alternatively, use the `socks_port` or `dns_port` configuration option.");
+            warn!(
+                "No proxy port set; specify -p PORT (for `socks_port`) or -d PORT (for `dns_port`). Alternatively, use the `socks_port` or `dns_port` configuration option."
+            );
             return Ok(());
         } else {
             // Push a dummy future to appease future::select_all,

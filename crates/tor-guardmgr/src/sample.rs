@@ -7,7 +7,7 @@ use crate::filter::GuardFilter;
 use crate::guard::{Guard, NewlyConfirmed, Reachable};
 use crate::skew::SkewObservation;
 use crate::{
-    ids::GuardId, ExternalActivity, GuardParams, GuardUsage, GuardUsageKind, PickGuardError,
+    ExternalActivity, GuardParams, GuardUsage, GuardUsageKind, PickGuardError, ids::GuardId,
 };
 use crate::{FirstHop, GuardSetSelector};
 use tor_basic_utils::iter::{FilterCount, IteratorExt as _};
@@ -825,7 +825,7 @@ impl GuardSet {
                     (_, Reachable::Reachable) => return Some(false),
                     (_, Reachable::Unreachable) => (),
                     (ListKind::Primary, Reachable::Untried | Reachable::Retriable) => {
-                        return Some(false)
+                        return Some(false);
                     }
                     (_, Reachable::Untried | Reachable::Retriable) => {
                         if guard.exploratory_attempt_after(cutoff) {
@@ -987,7 +987,7 @@ pub(crate) struct GuardSample<'a> {
     /// Equivalent to `GuardSet.guards.values()`, except in sample order.
     guards: Vec<Cow<'a, Guard>>,
     /// The identities for the confirmed members of `guards`, in confirmed order.
-    confirmed: Cow<'a, Vec<GuardId>>,
+    confirmed: Cow<'a, [GuardId]>,
     /// Other data from the state file that this version of Arti doesn't recognize.
     #[serde(flatten)]
     remaining: HashMap<String, JsonValue>,
@@ -1140,7 +1140,7 @@ mod test {
         // Pick a guard and mark it as confirmed.
         let id1 = guards.sample[0].clone();
         guards.record_success(&id1, &params, None, t2);
-        assert_eq!(&guards.confirmed, &[id1.clone()]);
+        assert_eq!(&guards.confirmed, std::slice::from_ref(&id1));
 
         // Encode the guards, then decode them.
         let state: GuardSample = (&guards).into();
@@ -1185,7 +1185,7 @@ mod test {
         // Pick a guard and mark it as confirmed.
         let id3 = guards.sample[3].clone();
         guards.record_success(&id3, &params, None, t2);
-        assert_eq!(&guards.confirmed, &[id3.clone()]);
+        assert_eq!(&guards.confirmed, std::slice::from_ref(&id3));
         let id1 = guards.sample[1].clone();
         guards.record_success(&id1, &params, None, t3);
         assert_eq!(&guards.confirmed, &[id3.clone(), id1.clone()]);

@@ -7,6 +7,7 @@
 pub(crate) mod net {
     use crate::{impls, traits};
     use async_trait::async_trait;
+    #[cfg(unix)]
     use tor_general_addr::unix;
 
     pub(crate) use tokio_crate::net::{
@@ -115,7 +116,7 @@ pub(crate) mod net {
         }}
     }
 
-    /// Try to convert a tokio unix SocketAddr into a crate::SocketAddr.
+    /// Try to convert a tokio `unix::SocketAddr` into a crate::SocketAddr.
     ///
     /// Frustratingly, this information is _right there_: Tokio's SocketAddr has a
     /// std::unix::net::SocketAddr internally, but there appears to be no way to get it out.
@@ -129,7 +130,7 @@ pub(crate) mod net {
         } else if let Some(p) = addr.as_pathname() {
             unix::SocketAddr::from_pathname(p)
         } else {
-            Err(crate::unix::UnsupportedUnixAddressType.into())
+            Err(crate::unix::UnsupportedAfUnixAddressType.into())
         }
     }
 
@@ -203,6 +204,7 @@ use async_trait::async_trait;
 use futures::Future;
 use std::io::Result as IoResult;
 use std::time::Duration;
+#[cfg(unix)]
 use tor_general_addr::unix;
 
 impl SleepProvider for TokioRuntimeHandle {
@@ -236,14 +238,14 @@ impl crate::traits::NetStreamProvider<unix::SocketAddr> for TokioRuntimeHandle {
     async fn connect(&self, addr: &unix::SocketAddr) -> IoResult<Self::Stream> {
         let path = addr
             .as_pathname()
-            .ok_or(crate::unix::UnsupportedUnixAddressType)?;
+            .ok_or(crate::unix::UnsupportedAfUnixAddressType)?;
         let s = net::TokioUnixStream::connect(path).await?;
         Ok(s.into())
     }
     async fn listen(&self, addr: &unix::SocketAddr) -> IoResult<Self::Listener> {
         let path = addr
             .as_pathname()
-            .ok_or(crate::unix::UnsupportedUnixAddressType)?;
+            .ok_or(crate::unix::UnsupportedAfUnixAddressType)?;
         let lis = net::TokioUnixListener::bind(path)?;
         Ok(net::UnixListener { lis })
     }
@@ -263,8 +265,7 @@ impl crate::traits::UdpProvider for TokioRuntimeHandle {
 
 /// Create and return a new Tokio multithreaded runtime.
 pub(crate) fn create_runtime() -> IoResult<TokioRuntimeHandle> {
-    let runtime = async_executors::exec::TokioTp::new()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let runtime = async_executors::exec::TokioTp::new().map_err(std::io::Error::other)?;
     Ok(runtime.into())
 }
 

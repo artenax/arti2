@@ -1,23 +1,27 @@
 //! Configure tracing subscribers for Arti
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use derive_builder::Builder;
 use fs_mistrust::Mistrust;
 use serde::{Deserialize, Serialize};
 use std::io::IsTerminal as _;
 use std::path::Path;
 use std::str::FromStr;
-use tor_config::impl_standard_builder;
+use std::time::Duration;
 use tor_config::ConfigBuildError;
+use tor_config::impl_standard_builder;
 use tor_config::{define_list_builder_accessors, define_list_builder_helper};
 use tor_config_path::{CfgPath, CfgPathResolver};
 use tor_error::warn_report;
-use tracing::{error, Subscriber};
+use tracing::{Subscriber, error};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{filter::Targets, fmt, registry, Layer};
+use tracing_subscriber::{Layer, filter::Targets, fmt, registry};
 
+mod fields;
+#[cfg(feature = "opentelemetry")]
+mod otlp_file_exporter;
 mod time;
 
 /// Structure to hold our logging configuration options
@@ -43,6 +47,11 @@ pub struct LoggingConfig {
         field(build = r#"tor_config::resolve_option(&self.journald, || None)"#)
     )]
     journald: Option<String>,
+
+    /// Configuration for logging spans with OpenTelemetry.
+    #[builder_field_attr(serde(default))]
+    #[builder(default)]
+    opentelemetry: OpentelemetryConfig,
 
     /// Configuration for one or more logfiles.
     ///
@@ -134,6 +143,104 @@ pub enum LogRotation {
     Never,
 }
 
+/// Configuration for exporting spans with OpenTelemetry.
+#[derive(Debug, Builder, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[builder(derive(Debug, Serialize, Deserialize))]
+#[builder(build_fn(error = "ConfigBuildError"))]
+pub struct OpentelemetryConfig {
+    /// Write spans to a file in OTLP JSON format.
+    #[builder(default)]
+    file: Option<OpentelemetryFileExporterConfig>,
+    /// Export spans via HTTP.
+    #[builder(default)]
+    http: Option<OpentelemetryHttpExporterConfig>,
+}
+impl_standard_builder! { OpentelemetryConfig }
+
+/// Configuration for the OpenTelemetry HTTP exporter.
+#[derive(Debug, Builder, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[builder(derive(Debug, Serialize, Deserialize))]
+#[builder(build_fn(error = "ConfigBuildError"))]
+pub struct OpentelemetryHttpExporterConfig {
+    /// HTTP(S) endpoint to send spans to.
+    ///
+    /// For Jaeger, this should be something like: `http://localhost:4318/v1/traces`
+    endpoint: String,
+    /// Configuration for how to batch exports.
+    // TODO: If we can figure out the right macro invocations, this shouldn't need to be a Option.
+    batch: Option<OpentelemetryBatchConfig>,
+    /// Timeout for sending data.
+    ///
+    /// If this is set to [`None`], it will be left at the OpenTelemetry default, which is
+    /// currently 10 seconds unless overrided with a environment variable.
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    timeout: Option<Duration>,
+    // TODO: Once opentelemetry-otlp supports more than one protocol over HTTP, add a config option
+    // to choose protocol here.
+}
+impl_standard_builder! { OpentelemetryHttpExporterConfig: !Default }
+
+/// Configuration for the OpenTelemetry HTTP exporter.
+#[derive(Debug, Builder, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[builder(derive(Debug, Serialize, Deserialize))]
+#[builder(build_fn(error = "ConfigBuildError"))]
+pub struct OpentelemetryFileExporterConfig {
+    /// The path to write the JSON file to.
+    path: CfgPath,
+    /// Configuration for how to batch writes.
+    // TODO: If we can figure out the right macro invocations, this shouldn't need to be a Option.
+    batch: Option<OpentelemetryBatchConfig>,
+}
+impl_standard_builder! { OpentelemetryFileExporterConfig: !Default }
+
+/// Configuration for the Opentelemetry batch exporting.
+///
+/// This is a copy of [`opentelemetry_sdk::trace::BatchConfig`].
+#[derive(Debug, Builder, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[builder(derive(Debug, Serialize, Deserialize))]
+#[builder(build_fn(error = "ConfigBuildError"))]
+pub struct OpentelemetryBatchConfig {
+    /// Maximum queue size. See [`opentelemetry_sdk::trace::BatchConfig::max_queue_size`].
+    #[builder(default)]
+    max_queue_size: Option<usize>,
+    /// Maximum export batch size. See [`opentelemetry_sdk::trace::BatchConfig::max_export_batch_size`].
+    #[builder(default)]
+    max_export_batch_size: Option<usize>,
+    /// Scheduled delay. See [`opentelemetry_sdk::trace::BatchConfig::scheduled_delay`].
+    #[builder(default)]
+    #[serde(with = "humantime_serde")]
+    scheduled_delay: Option<Duration>,
+}
+impl_standard_builder! { OpentelemetryBatchConfig }
+
+#[cfg(feature = "opentelemetry")]
+impl From<OpentelemetryBatchConfig> for opentelemetry_sdk::trace::BatchConfig {
+    fn from(config: OpentelemetryBatchConfig) -> opentelemetry_sdk::trace::BatchConfig {
+        let batch_config = opentelemetry_sdk::trace::BatchConfigBuilder::default();
+
+        let batch_config = if let Some(max_queue_size) = config.max_queue_size {
+            batch_config.with_max_queue_size(max_queue_size)
+        } else {
+            batch_config
+        };
+
+        let batch_config = if let Some(max_export_batch_size) = config.max_export_batch_size {
+            batch_config.with_max_export_batch_size(max_export_batch_size)
+        } else {
+            batch_config
+        };
+
+        let batch_config = if let Some(scheduled_delay) = config.scheduled_delay {
+            batch_config.with_scheduled_delay(scheduled_delay)
+        } else {
+            batch_config
+        };
+
+        batch_config.build()
+    }
+}
+
 /// As [`Targets::from_str`], but wrapped in an [`anyhow::Result`].
 //
 // (Note that we have to use `Targets`, not `EnvFilter`: see comment in
@@ -151,8 +258,8 @@ fn filt_from_opt_str(s: &Option<String>, source: &str) -> Result<Option<Targets>
     })
 }
 
-/// Try to construct a tracing [`Layer`] for logging to stdout.
-fn console_layer<S>(config: &LoggingConfig, cli: Option<&str>) -> Result<impl Layer<S>>
+/// Try to construct a tracing [`Layer`] for logging to stderr.
+fn console_layer<S>(config: &LoggingConfig, cli: Option<&str>) -> Result<impl Layer<S> + use<S>>
 where
     S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
@@ -161,15 +268,17 @@ where
         .map(|s| filt_from_str_verbose(s, "--log-level command line parameter"))
         .or_else(|| filt_from_opt_str(&config.console, "logging.console").transpose())
         .unwrap_or_else(|| Ok(Targets::from_str("debug").expect("bad default")))?;
-    let use_color = std::io::stdout().is_terminal();
+    let use_color = std::io::stderr().is_terminal();
     // We used to suppress safe-logging on the console, but we removed that
     // feature: we cannot be certain that the console really is volatile. Even
     // if isatty() returns true on the console, we can't be sure that the
     // terminal isn't saving backlog to disk or something like that.
     Ok(fmt::Layer::default()
+        // we apply custom field formatting so that error fields are listed last
+        .fmt_fields(fields::ErrorsLastFieldFormatter)
         .with_ansi(use_color)
         .with_timer(timer)
-        .with_writer(std::io::stdout) // we make this explicit, to match with use_color.
+        .with_writer(std::io::stderr) // we make this explicit, to match with use_color.
         .with_filter(filter))
 }
 
@@ -188,6 +297,81 @@ where
     }
 }
 
+/// Try to construct a tracing [`Layer`] for exporting spans via OpenTelemetry.
+///
+/// This doesn't allow for filtering, since most of our spans are exported at the trace level
+/// anyways, and filtering can easily be done when viewing the data.
+#[cfg(feature = "opentelemetry")]
+fn otel_layer<S>(config: &LoggingConfig, path_resolver: &CfgPathResolver) -> Result<impl Layer<S>>
+where
+    S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+{
+    use opentelemetry::trace::TracerProvider;
+    use opentelemetry_otlp::WithExportConfig;
+
+    if config.opentelemetry.file.is_some() && config.opentelemetry.http.is_some() {
+        return Err(ConfigBuildError::Invalid {
+            field: "logging.opentelemetry".into(),
+            problem: "Only one OpenTelemetry exporter can be enabled at once.".into(),
+        }
+        .into());
+    }
+
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name("arti")
+        .build();
+
+    let span_processor = if let Some(otel_file_config) = &config.opentelemetry.file {
+        let file = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(otel_file_config.path.path(path_resolver)?)?;
+
+        let exporter = otlp_file_exporter::FileExporter::new(file, resource.clone());
+
+        opentelemetry_sdk::trace::BatchSpanProcessor::builder(exporter)
+            .with_batch_config(otel_file_config.batch.unwrap_or_default().into())
+            .build()
+    } else if let Some(otel_http_config) = &config.opentelemetry.http {
+        if otel_http_config.endpoint.starts_with("http://")
+            && !(otel_http_config.endpoint.starts_with("http://localhost")
+                || otel_http_config.endpoint.starts_with("http://127.0.0.1"))
+        {
+            return Err(ConfigBuildError::Invalid {
+                field: "logging.opentelemetry.http.endpoint".into(),
+                problem: "OpenTelemetry endpoint is set to HTTP on a non-localhost address! For security reasons, this is not supported.".into(),
+            }
+            .into());
+        }
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(otel_http_config.endpoint.clone());
+
+        let exporter = if let Some(timeout) = otel_http_config.timeout {
+            exporter.with_timeout(timeout)
+        } else {
+            exporter
+        };
+
+        let exporter = exporter.build()?;
+
+        opentelemetry_sdk::trace::BatchSpanProcessor::builder(exporter)
+            .with_batch_config(otel_http_config.batch.unwrap_or_default().into())
+            .build()
+    } else {
+        return Ok(None);
+    };
+
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_resource(resource.clone())
+        .with_span_processor(span_processor)
+        .build();
+
+    let tracer = tracer_provider.tracer("otel_file_tracer");
+
+    Ok(Some(tracing_opentelemetry::layer().with_tracer(tracer)))
+}
+
 /// Try to construct a non-blocking tracing [`Layer`] for writing data to an
 /// optionally rotating logfile.
 ///
@@ -198,7 +382,7 @@ fn logfile_layer<S>(
     granularity: std::time::Duration,
     mistrust: &Mistrust,
     path_resolver: &CfgPathResolver,
-) -> Result<(impl Layer<S> + Send + Sync + Sized, WorkerGuard)>
+) -> Result<(impl Layer<S> + Send + Sync + Sized + use<S>, WorkerGuard)>
 where
     S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + Send + Sync,
 {
@@ -225,6 +409,8 @@ where
     let appender = RollingFileAppender::new(rotation, directory, fname);
     let (nonblocking, guard) = non_blocking(appender);
     let layer = fmt::layer()
+        // we apply custom field formatting so that error fields are listed last
+        .fmt_fields(fields::ErrorsLastFieldFormatter)
         .with_ansi(false)
         .with_writer(nonblocking)
         .with_timer(timer)
@@ -240,7 +426,7 @@ fn logfile_layers<S>(
     config: &LoggingConfig,
     mistrust: &Mistrust,
     path_resolver: &CfgPathResolver,
-) -> Result<(impl Layer<S>, Vec<WorkerGuard>)>
+) -> Result<(impl Layer<S> + use<S>, Vec<WorkerGuard>)>
 where
     S: Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + Send + Sync,
 {
@@ -341,6 +527,9 @@ pub(crate) fn setup_logging(
 
     #[cfg(feature = "journald")]
     let registry = registry.with(journald_layer(config)?);
+
+    #[cfg(feature = "opentelemetry")]
+    let registry = registry.with(otel_layer(config, path_resolver)?);
 
     let (layer, guards) = logfile_layers(config, mistrust, path_resolver)?;
     let registry = registry.with(layer);

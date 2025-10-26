@@ -3,10 +3,14 @@
 pub(crate) mod ct;
 pub(crate) mod err;
 pub(crate) mod keyed_futures_unordered;
+pub(crate) mod notify;
 pub(crate) mod oneshot_broadcast;
+pub(crate) mod poll_all;
+pub(crate) mod sink_blocker;
 pub(crate) mod skew;
 pub(crate) mod sometimes_unbounded_sink;
 pub(crate) mod stream_poll_set;
+pub(crate) mod token_bucket;
 pub(crate) mod ts;
 
 use futures::Sink;
@@ -40,4 +44,18 @@ impl<T, S: Sink<T>> SinkExt<T> for S {}
 #[cfg(any(test, feature = "testing"))]
 pub(crate) fn fake_mq<A: crate::memquota::SpecificAccount>() -> A {
     A::new_noop()
+}
+
+/// A timeout estimator that returns dummy values.
+///
+/// Used in the tests where the timeout estimates aren't relevant.
+#[cfg(test)]
+pub(crate) struct DummyTimeoutEstimator;
+
+#[cfg(test)]
+impl crate::client::circuit::TimeoutEstimator for DummyTimeoutEstimator {
+    fn circuit_build_timeout(&self, _length: usize) -> std::time::Duration {
+        // Dummy value
+        std::time::Duration::from_millis(1000)
+    }
 }

@@ -44,18 +44,19 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 // This file uses `unwrap()` a fair deal, but this is fine in test/bench code
 // because it's OK if tests and benchmarks simply crash if things go wrong.
 #![allow(clippy::unwrap_used)]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use arti::cfg::ArtiCombinedConfig;
 use arti_client::{IsolationToken, TorAddr, TorClient, TorClientConfig};
-use clap::{value_parser, Arg, ArgAction};
+use clap::{Arg, ArgAction, value_parser};
 use futures::StreamExt;
-use rand::distr::StandardUniform;
 use rand::Rng;
+use rand::distr::StandardUniform;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsString;

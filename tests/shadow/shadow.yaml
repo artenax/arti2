@@ -1,5 +1,32 @@
+# Some light templatization.
+# See <https://shadow.github.io/docs/guide/shadow_config_complex.html>
+x-constants:
+ # Where to find arti bins
+ - &Arti "../../target/x86_64-unknown-linux-gnu/quicktest/arti"
+ - &ArtiExtra "../../target/x86_64-unknown-linux-gnu/quicktest/arti-extra"
+
 general:
-  stop_time: 30 min
+  stop_time: 60 min
+  model_unblocked_syscall_latency: True
+experimental:
+  # shadow only actually increments simulated time (and potentially
+  # switches threads) if this much time would have been consumed by an
+  # unbroken sequence of unblocked syscalls. Using a relatively large
+  # value here (vs the default 1us) makes the simulation scheduling
+  # more stable and predictable; e.g. adding additional logging to
+  # debug an issue is less likely to make the issue disappear.
+  #
+  # The primary tradeoffs are:
+  # * Time will move forward at a larger granularity when unblocked syscall
+  #   latency is applied. 10ms is still small enough though that this
+  #   shouldn't be terribly strange; e.g. larger time jumps are likely
+  #   to be observed on over-loaded systems with normal preemptive
+  #   scheduling.
+  # * when the simulation does hit a
+  #   busy loop, it may spend a bit longer "spinning" before moving
+  #   time forward, potentially causing the simulation to take a bit
+  #   longer to run. (if it would have otherwise timed out earlier than 10ms)
+  max_unapplied_cpu_latency: "10ms"
 network:
   graph:
     type: gml
@@ -54,7 +81,7 @@ hosts:
       start_time: 1
       expected_final_state: running
       # Currently need the arti-extra binary for HS-server functionality
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti-extra
+    - path: *ArtiExtra
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
@@ -64,7 +91,9 @@ hosts:
       - -p=0
       - -d=0
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -81,7 +110,7 @@ hosts:
       start_time: 1
       expected_final_state: running
       # Currently need the arti-extra binary for HS-server functionality
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti-extra
+    - path: *ArtiExtra
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
@@ -92,7 +121,9 @@ hosts:
       - -p=0
       - -d=0
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -110,7 +141,7 @@ hosts:
       start_time: 1
       expected_final_state: running
       # Currently need the arti-extra binary for HS-server functionality
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti-extra
+    - path: *ArtiExtra
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
@@ -121,7 +152,9 @@ hosts:
       - -p=0
       - -d=0
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -140,7 +173,7 @@ hosts:
       start_time: 1
       expected_final_state: running
       # Currently need the arti-extra binary for HS-server functionality
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti-extra
+    - path: *ArtiExtra
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
@@ -151,7 +184,9 @@ hosts:
       - -p=0
       - -d=0
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -250,13 +285,15 @@ hosts:
     network_node_id: 0
     host_options:
     processes:
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti
+    - path: *Arti
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -273,14 +310,16 @@ hosts:
     network_node_id: 0
     host_options:
     processes:
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti-extra
+    - path: *ArtiExtra
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
       - -c=./arti.d/arti.extra.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -297,15 +336,19 @@ hosts:
     host_options:
       # Enable pcap capture so we can check for leaks
       pcap_enabled: true
+      # Collect enough data for the IP fixed header
+      pcap_capture_size: "40 B"
     processes:
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti
+    - path: *Arti
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
       - -c=./arti.d/arti.bridge.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -322,8 +365,10 @@ hosts:
     host_options:
       # Enable pcap capture so we can check for leaks
       pcap_enabled: true
+      # Collect enough data for the IP fixed header
+      pcap_capture_size: "40 B"
     processes:
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti
+    - path: *Arti
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
@@ -331,7 +376,9 @@ hosts:
       - -c=./arti.d/arti.obfs4-client.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -346,14 +393,16 @@ hosts:
   articlient-onion:
     network_node_id: 0
     processes:
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti
+    - path: *Arti
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -368,14 +417,16 @@ hosts:
   articlient-onion-artiserver:
     network_node_id: 0
     processes:
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti
+    - path: *Arti
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -390,14 +441,16 @@ hosts:
   articlient-onion-artiserver-full-vanguards:
     network_node_id: 0
     processes:
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti
+    - path: *Arti
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -419,7 +472,7 @@ hosts:
   articlient-onion-artiserver-auth:
     network_node_id: 0
     processes:
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti-extra
+    - path: *ArtiExtra
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
@@ -427,7 +480,9 @@ hosts:
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -450,7 +505,7 @@ hosts:
     network_node_id: 0
     processes:
     # Use the version of arti built with keymgr and experimental-api support:
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti-extra
+    - path: *ArtiExtra
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
@@ -458,7 +513,9 @@ hosts:
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -473,7 +530,7 @@ hosts:
     network_node_id: 0
     processes:
     # Use the version of arti built with keymgr and experimental-api support:
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti-extra
+    - path: *ArtiExtra
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
@@ -481,7 +538,9 @@ hosts:
       - -c=./arti.d/arti.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home
@@ -497,7 +556,7 @@ hosts:
     network_node_id: 0
     processes:
     # Use the version of arti built with keymgr and experimental-api support:
-    - path: ../../target/x86_64-unknown-linux-gnu/debug/arti-extra
+    - path: *ArtiExtra
       args:
       - proxy
       - -c=./arti.d/arti.common.toml
@@ -505,7 +564,9 @@ hosts:
       - -c=./arti.d/arti-auth-ctor.onion.toml
       - -o=proxy.socks_listen="127.0.0.1:9000"
       - --disable-fs-permission-checks
-      - -l=debug,tor_proto=trace
+      # Disable console logging. (Already disabled in config file, but that
+      # currently has no effect due to #2025).
+      - -l=
       environment:
         RUST_BACKTRACE: "1"
         HOME: ./home

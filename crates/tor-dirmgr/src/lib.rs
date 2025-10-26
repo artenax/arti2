@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 // This clippy lint produces a false positive on `use strum`, below.
@@ -48,14 +49,12 @@
 // this lint and instead produces another lint about a useless clippy attribute.
 #![allow(clippy::single_component_path_imports)]
 
-pub mod authority;
 mod bootstrap;
 pub mod config;
 mod docid;
 mod docmeta;
 mod err;
 mod event;
-mod retry;
 mod shared_ref;
 mod state;
 mod storage;
@@ -75,10 +74,10 @@ use crate::storage::{DynStore, Store};
 use bootstrap::AttemptId;
 use event::DirProgress;
 use postage::watch;
-pub use retry::{DownloadSchedule, DownloadScheduleBuilder};
 use scopeguard::ScopeGuard;
 use tor_circmgr::CircMgr;
 use tor_dirclient::SourceInfo;
+use tor_dircommon::config::DirTolerance;
 use tor_error::{info_report, into_internal, warn_report};
 use tor_netdir::params::NetParameters;
 use tor_netdir::{DirEvent, MdReceiver, NetDir, NetDirProvider};
@@ -86,8 +85,9 @@ use tor_netdir::{DirEvent, MdReceiver, NetDir, NetDirProvider};
 use async_trait::async_trait;
 use futures::{stream::BoxStream, task::SpawnExt};
 use oneshot_fused_workaround as oneshot;
-use tor_rtcompat::scheduler::{TaskHandle, TaskSchedule};
+use tor_netdoc::doc::netstatus::ProtoStatuses;
 use tor_rtcompat::Runtime;
+use tor_rtcompat::scheduler::{TaskHandle, TaskSchedule};
 use tracing::{debug, info, trace, warn};
 
 use std::marker::PhantomData;
@@ -98,16 +98,12 @@ use std::{collections::HashMap, sync::Weak};
 use std::{fmt::Debug, time::SystemTime};
 
 use crate::state::{DirState, NetDirChange};
-pub use authority::{Authority, AuthorityBuilder};
-pub use config::{
-    DirMgrConfig, DirTolerance, DirToleranceBuilder, DownloadScheduleConfig,
-    DownloadScheduleConfigBuilder, NetworkConfig, NetworkConfigBuilder,
-};
+pub use config::DirMgrConfig;
 pub use docid::DocId;
 pub use err::Error;
 pub use event::{DirBlockage, DirBootstrapEvents, DirBootstrapStatus};
 pub use storage::DocumentText;
-pub use tor_guardmgr::fallback::{FallbackDir, FallbackDirBuilder};
+pub use tor_dircommon::fallback::{FallbackDir, FallbackDirBuilder};
 pub use tor_netdir::Timeliness;
 
 /// Re-export of `strum` crate for use by an internal macro
@@ -221,6 +217,10 @@ impl<R: Runtime> NetDirProvider for DirMgr<R> {
         // have a full directory.  That's significant refactoring, though, for
         // an unclear amount of benefit.
     }
+
+    fn protocol_statuses(&self) -> Option<(SystemTime, Arc<ProtoStatuses>)> {
+        self.protocols.lock().expect("Poisoned lock").clone()
+    }
 }
 
 #[async_trait]
@@ -275,6 +275,9 @@ pub struct DirMgr<R: Runtime> {
     // TODO(eta): Eurgh! This is so many Arcs! (especially considering this
     //            gets wrapped in an Arc)
     netdir: Arc<SharedMutArc<NetDir>>,
+
+    /// Our latest set of recommended protocols.
+    protocols: Mutex<Option<(SystemTime, Arc<ProtoStatuses>)>>,
 
     /// A set of network parameters to hand out when we have no directory.
     default_parameters: Mutex<Arc<NetParameters>>,
@@ -433,6 +436,7 @@ impl<R: Runtime> DirMgr<R> {
     ///
     /// Panics if the `DirMgr` passed to this function was not created in online mode, such as
     /// via `load_once`.
+    #[allow(clippy::cognitive_complexity)] // TODO: Refactor
     pub async fn bootstrap(self: &Arc<Self>) -> Result<()> {
         if self.offline {
             return Err(Error::OfflineMode);
@@ -565,6 +569,7 @@ impl<R: Runtime> DirMgr<R> {
     /// message using `on_complete`.
     ///
     /// If we eventually become the owner, return Ok().
+    #[allow(clippy::cognitive_complexity)] // TODO: Refactor?
     async fn reload_until_owner(
         weak: &Weak<Self>,
         schedule: &mut TaskSchedule<R>,
@@ -587,7 +592,9 @@ impl<R: Runtime> DirMgr<R> {
                     // upgrade_to_readwrite() function is idempotent.)  We can
                     // do our own bootstrapping.
                     if logged {
-                        info!("The previous owning process has given up the lock. We are now in charge of managing the directory.");
+                        info!(
+                            "The previous owning process has given up the lock. We are now in charge of managing the directory."
+                        );
                     }
                     return Ok(());
                 }
@@ -598,7 +605,9 @@ impl<R: Runtime> DirMgr<R> {
                 if bootstrapped {
                     info!("Another process is managing the directory. We'll use its cache.");
                 } else {
-                    info!("Another process is bootstrapping the directory. Waiting till it finishes or exits.");
+                    info!(
+                        "Another process is bootstrapping the directory. Waiting till it finishes or exits."
+                    );
                 }
             }
 
@@ -634,6 +643,7 @@ impl<R: Runtime> DirMgr<R> {
     ///
     /// If we have begin to have a bootstrapped directory, send a
     /// message using `on_complete`.
+    #[allow(clippy::cognitive_complexity)] // TODO: Refactor?
     async fn download_forever(
         weak: Weak<Self>,
         schedule: &mut TaskSchedule<R>,
@@ -665,7 +675,7 @@ impl<R: Runtime> DirMgr<R> {
                 // TODO(nickm): instead of getting this every time we loop, it
                 // might be a good idea to refresh it with each attempt, at
                 // least at the point of checking the number of attempts.
-                dirmgr.config.get().schedule.retry_bootstrap
+                dirmgr.config.get().schedule.retry_bootstrap()
             };
             let mut retry_delay = retry_config.schedule();
 
@@ -684,7 +694,10 @@ impl<R: Runtime> DirMgr<R> {
                 if let Err(err) = outcome {
                     if state.is_ready(Readiness::Usable) {
                         usable = true;
-                        info_report!(err, "Unable to completely download a directory. (Nevertheless, the directory is usable, so we'll pause for now)");
+                        info_report!(
+                            err,
+                            "Unable to completely download a directory. (Nevertheless, the directory is usable, so we'll pause for now)"
+                        );
                         break 'retry_attempt;
                     }
 
@@ -862,11 +875,7 @@ impl<R: Runtime> DirMgr<R> {
             .expect("Directory storage lock poisoned")
             .is_readonly();
         // A race-condition is possible here, but I believe it's harmless.
-        if rw {
-            Some(&self.store)
-        } else {
-            None
-        }
+        if rw { Some(&self.store) } else { None }
     }
 
     /// Construct a DirMgr from a DirMgrConfig.
@@ -898,10 +907,20 @@ impl<R: Runtime> DirMgr<R> {
         let (task_schedule, task_handle) = TaskSchedule::new(runtime.clone());
         let task_schedule = Mutex::new(Some(task_schedule));
 
+        // We load the cached protocol recommendations unconditionally: the caller needs them even
+        // if it does not try to load the reset of the cache.
+        let protocols = {
+            let store = store.store.lock().expect("lock poisoned");
+            store
+                .cached_protocol_recommendations()?
+                .map(|(t, p)| (t, Arc::new(p)))
+        };
+
         Ok(DirMgr {
             config: config.into(),
             store: store.store,
             netdir,
+            protocols: Mutex::new(protocols),
             default_parameters,
             events,
             send_status,
@@ -943,7 +962,7 @@ impl<R: Runtime> DirMgr<R> {
     /// Multiple events may be batched up into a single item: each time
     /// this stream yields an event, all you can assume is that the event has
     /// occurred at least once.
-    pub fn events(&self) -> impl futures::Stream<Item = DirEvent> {
+    pub fn events(&self) -> impl futures::Stream<Item = DirEvent> + use<R> {
         self.events.subscribe()
     }
 
@@ -1088,6 +1107,15 @@ impl<R: Runtime> DirMgr<R> {
                     self.events.publish(DirEvent::NewDescriptors);
                     Ok(())
                 }
+                NetDirChange::SetRequiredProtocol { timestamp, protos } => {
+                    if !store.is_readonly() {
+                        store.update_protocol_recommendations(timestamp, protos.as_ref())?;
+                    }
+                    let mut pr = self.protocols.lock().expect("Poisoned lock");
+                    *pr = Some((timestamp, protos));
+                    self.events.publish(DirEvent::NewProtocolRecommendation);
+                    Ok(())
+                }
             }
         } else {
             Ok(())
@@ -1119,7 +1147,7 @@ pub(crate) fn default_consensus_cutoff(
     /// We _always_ allow at least this much age in our consensuses, to account
     /// for the fact that consensuses have some lifetime.
     const MIN_AGE_TO_ALLOW: Duration = Duration::from_secs(3 * 3600);
-    let allow_skew = std::cmp::max(MIN_AGE_TO_ALLOW, tolerance.post_valid_tolerance);
+    let allow_skew = std::cmp::max(MIN_AGE_TO_ALLOW, tolerance.post_valid_tolerance());
     let cutoff = time::OffsetDateTime::from(now - allow_skew);
     // We now round cutoff to the next hour, so that we aren't leaking our exact
     // time to the directory cache.
@@ -1135,6 +1163,20 @@ pub(crate) fn default_consensus_cutoff(
     let cutoff = cutoff + Duration::from_secs(3600);
 
     Ok(cutoff.into())
+}
+
+/// Return a list of the protocols [supported](tor_protover::doc_supported) by this crate
+/// when running as a client.
+pub fn supported_client_protocols() -> tor_protover::Protocols {
+    use tor_protover::named::*;
+    // WARNING: REMOVING ELEMENTS FROM THIS LIST CAN BE DANGEROUS!
+    // SEE [`tor_protover::doc_changing`]
+    [
+        //
+        DIRCACHE_CONSDIFF,
+    ]
+    .into_iter()
+    .collect()
 }
 
 #[cfg(test)]
@@ -1160,6 +1202,13 @@ mod test {
     use tor_netdoc::doc::netstatus::ConsensusFlavor;
     use tor_netdoc::doc::{authcert::AuthCertKeyIds, netstatus::Lifetime};
     use tor_rtcompat::SleepProvider;
+
+    #[test]
+    fn protocols() {
+        let pr = supported_client_protocols();
+        let expected = "DirCache=2".parse().unwrap();
+        assert_eq!(pr, expected);
+    }
 
     pub(crate) fn new_mgr<R: Runtime>(runtime: R) -> (TempDir, DirMgr<R>) {
         let dir = TempDir::new().unwrap();
@@ -1319,7 +1368,7 @@ mod test {
                 )
                 .unwrap()
             };
-            let tolerance = DirTolerance::default().post_valid_tolerance;
+            let tolerance = DirTolerance::default().post_valid_tolerance();
             match req {
                 ClientRequest::Consensus(r) => {
                     assert_eq!(r.old_consensus_digests().count(), 0);

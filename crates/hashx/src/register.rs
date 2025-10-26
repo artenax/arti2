@@ -1,6 +1,6 @@
 //! Define HashX's register file, and how it's created and digested.
 
-use crate::siphash::{siphash24_ctr, SipState};
+use crate::siphash::{SipState, siphash24_ctr};
 use arrayvec::ArrayVec;
 use std::fmt;
 
@@ -29,6 +29,15 @@ impl RegisterId {
     #[inline(always)]
     pub(crate) fn as_usize(&self) -> usize {
         self.0 as usize
+    }
+
+    /// Return the underlying u8 for this RegisterId.
+    ///
+    /// (Recall that hashx has 8 virtual registers,
+    /// so the output of this method is always in range 0..=7.)
+    #[inline(always)]
+    pub(crate) fn as_u8(&self) -> u8 {
+        self.0
     }
 
     /// Create an iterator over all RegisterId

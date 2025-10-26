@@ -1,19 +1,19 @@
 use anyhow::Result;
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 use futures::StreamExt;
-use hyper::body::Incoming;
 use hyper::Request;
+use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server;
 use tower::Service;
 
 use arti_client::{TorClient, TorClientConfig};
-use safelog::sensitive;
+use safelog::{DisplayRedacted as _, sensitive};
 use tor_cell::relaycell::msg::Connected;
-use tor_hsservice::config::OnionServiceConfigBuilder;
 use tor_hsservice::StreamRequest;
-use tor_proto::stream::IncomingStreamRequest;
+use tor_hsservice::config::OnionServiceConfigBuilder;
+use tor_proto::client::stream::IncomingStreamRequest;
 
 #[tokio::main]
 async fn main() {
@@ -43,7 +43,7 @@ async fn main() {
         .unwrap();
 
     let (service, request_stream) = client.launch_onion_service(svc_cfg).unwrap();
-    println!("{}", service.onion_address().unwrap());
+    println!("{}", service.onion_address().unwrap().display_unredacted());
 
     // Wait until the service is believed to be fully reachable.
     eprintln!("waiting for service to become fully reachable");

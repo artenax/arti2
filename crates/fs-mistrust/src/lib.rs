@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // TODO: Stuff to add before this crate is ready....
 //  - Test the absolute heck out of it.
@@ -47,6 +47,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 // This crate used to have unsafe code to interact with various libc functions.
@@ -65,7 +66,8 @@ mod imp;
 #[cfg(all(
     target_family = "unix",
     not(target_os = "ios"),
-    not(target_os = "android")
+    not(target_os = "android"),
+    not(target_os = "tvos")
 ))]
 mod user;
 
@@ -85,7 +87,7 @@ use std::{
 
 pub use dir::CheckedDir;
 pub use disable::GLOBAL_DISABLE_VAR;
-pub use err::{format_access_bits, Error};
+pub use err::{Error, format_access_bits};
 pub use file_access::FileAccess;
 
 /// A result type as returned by this crate
@@ -94,7 +96,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(all(
     target_family = "unix",
     not(target_os = "ios"),
-    not(target_os = "android")
+    not(target_os = "android"),
+    not(target_os = "tvos")
 ))]
 pub use user::{TrustedGroup, TrustedUser};
 
@@ -180,7 +183,8 @@ pub struct Mistrust {
     #[cfg(all(
         target_family = "unix",
         not(target_os = "ios"),
-        not(target_os = "android")
+        not(target_os = "android"),
+        not(target_os = "tvos")
     ))]
     #[builder(
         setter(into),
@@ -192,7 +196,8 @@ pub struct Mistrust {
     #[cfg(all(
         target_family = "unix",
         not(target_os = "ios"),
-        not(target_os = "android")
+        not(target_os = "android"),
+        not(target_os = "tvos")
     ))]
     #[builder(
         setter(into),
@@ -227,7 +232,8 @@ impl MistrustBuilder {
     #[cfg(all(
         target_family = "unix",
         not(target_os = "ios"),
-        not(target_os = "android")
+        not(target_os = "android"),
+        not(target_os = "tvos"),
     ))]
     pub fn trust_admin_only(&mut self) -> &mut Self {
         self.trust_user = TrustedUser::None;
@@ -246,7 +252,8 @@ impl MistrustBuilder {
     #[cfg(all(
         target_family = "unix",
         not(target_os = "ios"),
-        not(target_os = "android")
+        not(target_os = "android"),
+        not(target_os = "tvos"),
     ))]
     pub fn trust_no_group_id(&mut self) -> &mut Self {
         self.trust_group = TrustedGroup::None;
@@ -651,7 +658,7 @@ mod test {
     #![allow(clippy::needless_pass_by_value)]
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
-    use testing::{mistrust_build, Dir, MistrustOp};
+    use testing::{Dir, MistrustOp, mistrust_build};
 
     #[cfg(target_family = "unix")]
     use testing::LinkType;

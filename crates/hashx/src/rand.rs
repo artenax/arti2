@@ -8,19 +8,19 @@
 //! allowing substitute random number generators for testing or for special
 //! purposes that don't require compatibility with HashX proper.
 //!
-//! The stateful u8 and u32 layer comes from this module's ['RngBuffer'].
+//! The stateful u8 and u32 layer comes from this module's [`RngBuffer`].
 //! It's important for the u8 and u32 queues to share a common generator.
 //! The order of dequeueing u8 items vs u32 items intentionally modifies the
 //! assignment of particular u64 [`RngCore`] values to the two queues.
 
-use crate::siphash::{siphash13_ctr, SipState};
+use crate::siphash::{SipState, siphash13_ctr};
 use arrayvec::ArrayVec;
 use rand_core::RngCore;
 
 /// Wrap a [`RngCore`] implementation for fast `u8` and `u32` output.
 ///
 /// This maintains small queues for each data type: up to one `u32` and up to
-/// 7 bytes. The queueing behavior matches convenions required by HashX:
+/// 7 bytes. The queueing behavior matches conventions required by HashX:
 /// The underlying `u64` values are always generated lazily, and component
 /// values are extracted in big endian order.
 #[derive(Debug)]

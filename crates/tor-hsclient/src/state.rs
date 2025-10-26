@@ -7,19 +7,19 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use futures::task::{SpawnError, SpawnExt as _};
 use futures::FutureExt as _;
+use futures::task::{SpawnError, SpawnExt as _};
 
 use async_trait::async_trait;
 use educe::Educe;
 use either::Either::{self, *};
 use postage::stream::Stream as _;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, instrument, trace};
 
-use safelog::sensitive as sv;
+use safelog::DisplayRedacted as _;
 use tor_basic_utils::define_accessor_trait;
 use tor_circmgr::isolation::Isolation;
-use tor_error::{debug_report, error_report, internal, Bug, ErrorReport as _};
+use tor_error::{Bug, ErrorReport as _, debug_report, error_report, internal};
 use tor_hscrypto::pk::HsId;
 use tor_netdir::NetDir;
 use tor_rtcompat::Runtime;
@@ -181,7 +181,7 @@ enum ServiceState<D: MockableConnectorData> {
         data: D,
         /// The circuit
         #[educe(Debug(ignore))]
-        circuit: Arc<D::ClientCirc>,
+        tunnel: Arc<D::DataTunnel>,
         /// Last time we touched this, including reuse
         ///
         /// This is set when we created the circuit, and updated when we
@@ -305,7 +305,7 @@ fn obtain_circuit_or_continuation_info<D: MockableConnectorData>(
     table_index: TableIndex,
     rechecks: &mut impl Iterator,
     mut guard: MutexGuard<'_, Services<D>>,
-) -> Result<Either<Continuation, Arc<D::ClientCirc>>, ConnError> {
+) -> Result<Either<Continuation, Arc<D::DataTunnel>>, ConnError> {
     let blank_state = || ServiceState::blank(&connector.runtime);
 
     for _recheck in rechecks {
@@ -320,18 +320,18 @@ fn obtain_circuit_or_continuation_info<D: MockableConnectorData>(
         let (data, barrier_send) = match state {
             ServiceState::Open {
                 data: _,
-                circuit,
+                tunnel,
                 last_used,
                 circuit_expiry_task: _,
             } => {
                 let now = connector.runtime.now();
-                if !D::circuit_is_ok(circuit) {
+                if !D::tunnel_is_ok(tunnel) {
                     // Well that's no good, we need a fresh one, but keep the data
                     let data = match mem::replace(state, ServiceState::Dummy) {
                         ServiceState::Open {
                             data,
                             last_used: _,
-                            circuit: _,
+                            tunnel: _,
                             circuit_expiry_task: _,
                         } => data,
                         _ => panic!("state changed between matches"),
@@ -346,7 +346,7 @@ fn obtain_circuit_or_continuation_info<D: MockableConnectorData>(
                 // No need to tell expiry task about revised expiry time;
                 // it will see the new last_used when it wakes up at the old expiry time.
 
-                return Ok::<_, ConnError>(Right(circuit.clone()));
+                return Ok::<_, ConnError>(Right(tunnel.clone()));
             }
             ServiceState::Working {
                 barrier_recv,
@@ -451,10 +451,10 @@ fn obtain_circuit_or_continuation_info<D: MockableConnectorData>(
                 };
 
                 match got {
-                    Ok((circuit, circuit_expiry_task)) => {
+                    Ok((tunnel, circuit_expiry_task)) => {
                         *state = ServiceState::Open {
                             data,
-                            circuit,
+                            tunnel: Arc::new(tunnel),
                             last_used,
                             circuit_expiry_task,
                         }
@@ -474,13 +474,17 @@ fn obtain_circuit_or_continuation_info<D: MockableConnectorData>(
             match (got_error, stored) {
                 (Ok::<(), ConnError>(()), Ok::<(), Bug>(())) => {}
                 (Err(got_error), Ok(())) => {
-                    debug_report!(got_error, "HS connection failure for {}", sv(hsid));
+                    debug_report!(
+                        got_error,
+                        "HS connection failure for {}",
+                        hsid.display_redacted()
+                    );
                 }
                 (Ok(()), Err(bug)) => {
                     error_report!(
                         bug,
                         "internal error storing built HS circuit for {}",
-                        sv(hsid)
+                        hsid.display_redacted()
                     );
                 }
                 (Err(got_error), Err(bug)) => {
@@ -488,7 +492,7 @@ fn obtain_circuit_or_continuation_info<D: MockableConnectorData>(
                     // manually.
                     error!(
                         "internal error storing HS connection error for {}: {}; {}",
-                        sv(hsid),
+                        hsid.display_redacted(),
                         got_error.report(),
                         bug.report(),
                     );
@@ -518,13 +522,14 @@ impl<D: MockableConnectorData> Services<D> {
 
     /// Connect to a hidden service
     // We *do* drop guard.  There is *one* await point, just after drop(guard).
+    #[instrument(skip_all, level = "trace")]
     pub(crate) async fn get_or_launch_connection(
         connector: &HsClientConnector<impl Runtime, D>,
         netdir: &Arc<NetDir>,
         hs_id: HsId,
         isolation: Box<dyn Isolation>,
         secret_keys: HsClientSecretKeys,
-    ) -> Result<Arc<D::ClientCirc>, ConnError> {
+    ) -> Result<Arc<D::DataTunnel>, ConnError> {
         let blank_state = || ServiceState::blank(&connector.runtime);
 
         let mut rechecks = 0..MAX_RECHECKS;
@@ -606,8 +611,11 @@ impl<D: MockableConnectorData> Services<D> {
                     now <= expiry_time
                 }
                 ServiceState::Open { .. } | ServiceState::Working { .. } => true,
-                ServiceState::Dummy { .. } => {
-                    error!("found dummy data during HS housekeeping, for {}", sv(hsid));
+                ServiceState::Dummy => {
+                    error!(
+                        "bug: found dummy data during HS housekeeping, for {}",
+                        hsid.display_redacted()
+                    );
                     false
                 }
             });
@@ -634,7 +642,7 @@ impl<D: MockableConnectorData> ServiceState<D> {
             let expiry = last_used
                 .checked_add(RETAIN_CIRCUIT_AFTER_LAST_USE)
                 .or_else(|| {
-                    error!("time overflow calculating HS circuit expiry, killing circuit!");
+                    error!("bug: time overflow calculating HS circuit expiry, killing circuit!");
                     None
                 })?;
             let wait = expiry.checked_duration_since(now).unwrap_or_default();
@@ -676,11 +684,11 @@ impl<D: MockableConnectorData> ServiceState<D> {
                         match mem::replace(state, ServiceState::Dummy) {
                             ServiceState::Open {
                                 data,
-                                circuit,
+                                tunnel: circuit,
                                 last_used,
                                 circuit_expiry_task,
                             } => {
-                                debug!("HS connection expires: {hsid}");
+                                debug!("HS connection expires: {hsid:?}");
                                 drop(circuit);
                                 drop(circuit_expiry_task); // that's us
                                 *state = ServiceState::Closed { data, last_used };
@@ -707,7 +715,7 @@ impl<D: MockableConnectorData> ServiceState<D> {
 #[async_trait]
 pub trait MockableConnectorData: Default + Debug + Send + Sync + 'static {
     /// Client circuit
-    type ClientCirc: Sync + Send + 'static;
+    type DataTunnel: Sync + Send + 'static;
 
     /// Mock state
     type MockGlobalState: Clone + Sync + Send + 'static;
@@ -720,10 +728,10 @@ pub trait MockableConnectorData: Default + Debug + Send + Sync + 'static {
         hsid: HsId,
         data: &mut Self,
         secret_keys: HsClientSecretKeys,
-    ) -> Result<Arc<Self::ClientCirc>, ConnError>;
+    ) -> Result<Self::DataTunnel, ConnError>;
 
     /// Is circuit OK?  Ie, not `.is_closing()`.
-    fn circuit_is_ok(circuit: &Self::ClientCirc) -> bool;
+    fn tunnel_is_ok(tunnel: &Self::DataTunnel) -> bool;
 }
 
 #[cfg(test)]
@@ -743,14 +751,14 @@ pub(crate) mod test {
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use super::*;
     use crate::*;
-    use futures::{poll, SinkExt};
+    use futures::{SinkExt, poll};
     use std::fmt;
     use std::task::Poll::{self, *};
     use tokio::pin;
     use tokio_crate as tokio;
     use tor_memquota::ArcMemoryQuotaTrackerExt as _;
     use tor_proto::memquota::ToplevelAccount;
-    use tor_rtcompat::{test_with_one_runtime, SleepProvider};
+    use tor_rtcompat::{SleepProvider, test_with_one_runtime};
     use tor_rtmock::MockRuntime;
     use tracing_test::traced_test;
 
@@ -772,7 +780,7 @@ pub(crate) mod test {
 
     #[derive(Clone, Educe)]
     #[educe(Debug)]
-    struct MockCirc {
+    struct MockTunnel {
         #[educe(Debug(method = "debug_arc_mutex"))]
         ok: Arc<Mutex<bool>>,
         connect_called: usize,
@@ -789,22 +797,22 @@ pub(crate) mod test {
         Debug::fmt(&*guard, f)
     }
 
-    impl PartialEq for MockCirc {
-        fn eq(&self, other: &MockCirc) -> bool {
+    impl PartialEq for MockTunnel {
+        fn eq(&self, other: &MockTunnel) -> bool {
             Arc::ptr_eq(&self.ok, &other.ok)
         }
     }
 
-    impl MockCirc {
+    impl MockTunnel {
         fn new(connect_called: usize) -> Self {
             let ok = Arc::new(Mutex::new(true));
-            MockCirc { ok, connect_called }
+            MockTunnel { ok, connect_called }
         }
     }
 
     #[async_trait]
     impl MockableConnectorData for MockData {
-        type ClientCirc = MockCirc;
+        type DataTunnel = MockTunnel;
         type MockGlobalState = MockGlobalState;
 
         async fn connect<R: Runtime>(
@@ -814,11 +822,11 @@ pub(crate) mod test {
             _hsid: HsId,
             data: &mut MockData,
             _secret_keys: HsClientSecretKeys,
-        ) -> Result<Arc<Self::ClientCirc>, E> {
+        ) -> Result<Self::DataTunnel, E> {
             data.connect_called += 1;
             let make = {
                 let connect_called = data.connect_called;
-                move |()| Arc::new(MockCirc::new(connect_called))
+                move |()| MockTunnel::new(connect_called)
             };
             let mut give = connector.mock_for_state.give.clone();
             if let Ready(ret) = &*give.borrow() {
@@ -832,7 +840,7 @@ pub(crate) mod test {
             }
         }
 
-        fn circuit_is_ok(circuit: &Self::ClientCirc) -> bool {
+        fn tunnel_is_ok(circuit: &Self::DataTunnel) -> bool {
             *circuit.ok.lock().unwrap()
         }
     }
@@ -861,6 +869,7 @@ pub(crate) mod test {
             tor_chanmgr::Dormancy::Dormant,
             &Default::default(),
             ToplevelAccount::new_noop(),
+            None,
         );
         let guardmgr = tor_guardmgr::GuardMgr::new(
             runtime.clone(),
@@ -903,7 +912,7 @@ pub(crate) mod test {
         id: u8,
         secret_keys: &HsClientSecretKeys,
         isolation: Option<NarrowableIsolation>,
-    ) -> Result<Arc<MockCirc>, ConnError> {
+    ) -> Result<Arc<MockTunnel>, ConnError> {
         let netdir = tor_netdir::testnet::construct_netdir()
             .unwrap_if_sufficient()
             .unwrap();

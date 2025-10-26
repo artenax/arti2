@@ -8,7 +8,7 @@ use std::sync::Arc;
 use futures::task::SpawnError;
 
 #[cfg(feature = "onion-service-client")]
-use safelog::Redacted;
+use safelog::DisplayRedacted as _;
 use safelog::Sensitive;
 use thiserror::Error;
 use tor_circmgr::TargetPorts;
@@ -171,6 +171,11 @@ enum ErrorDetail {
     #[cfg(feature = "onion-service-client")]
     HsClientConnectorSetup(#[from] tor_hsclient::StartupError),
 
+    /// Error setting up onion service.
+    #[cfg(feature= "onion-service-service")]
+    #[error("Error setting up onion service")]
+    OnionServiceSetup(#[source] tor_hsservice::StartupError),
+
     /// Failed to obtain exit circuit
     #[error("Failed to obtain exit circuit for ports {exit_ports}")]
     ObtainExitCircuit {
@@ -184,10 +189,10 @@ enum ErrorDetail {
 
     /// Failed to obtain hidden service circuit
     #[cfg(feature = "onion-service-client")]
-    #[error("Failed to obtain hidden service circuit to {hsid}")]
+    #[error("Failed to obtain hidden service circuit to {}", hsid.display_redacted())]
     ObtainHsCircuit {
         /// The service we were trying to connect to
-        hsid: Redacted<HsId>,
+        hsid: HsId,
 
         /// What went wrong
         #[source]
@@ -206,7 +211,7 @@ enum ErrorDetail {
 
         /// The error that occurred.
         #[source]
-        cause:  tor_proto::Error
+        cause: tor_circmgr::Error
     },
 
     /// An error while interfacing with the persistent data layer.
@@ -329,6 +334,10 @@ enum ErrorDetail {
     #[error("Unable to launch onion service")]
     LaunchOnionService(#[source] tor_hsservice::StartupError),
 
+    /// We found that at least one required protocol was missing.
+    #[error("Arti is missing a required protocol feature")]
+    MissingProtocol(#[source] tor_netdoc::doc::netstatus::ProtocolSupportError),
+
     /// A programming problem, either in our code or the code calling it.
     #[error("Programming problem")]
     Bug(#[from] tor_error::Bug),
@@ -412,6 +421,8 @@ impl tor_error::HasKind for ErrorDetail {
             E::StateMgrSetup(e) => e.kind(),
             #[cfg(feature = "onion-service-client")]
             E::HsClientConnectorSetup(e) => e.kind(),
+            #[cfg(feature = "onion-service-service")]
+            E::OnionServiceSetup(e) => e.kind(),
             E::DirMgrBootstrap(e) => e.kind(),
             #[cfg(feature = "pt-client")]
             E::PluggableTransport(e) => e.kind(),
@@ -428,8 +439,8 @@ impl tor_error::HasKind for ErrorDetail {
             E::BadOnionAddress(_) => EK::InvalidStreamTarget,
             #[cfg(feature = "onion-service-service")]
             E::LaunchOnionService(e) => e.kind(),
-            // TODO Should delegate to TorAddrError EK
-            E::Address(_) | E::InvalidHostname => EK::InvalidStreamTarget,
+            E::Address(e) => e.kind(),
+            E::InvalidHostname => EK::InvalidStreamTarget,
             E::LocalAddress => EK::ForbiddenStreamTarget,
             E::ChanMgrSetup(e) => e.kind(),
             E::NoDir { error, .. } => error.kind(),
@@ -437,6 +448,7 @@ impl tor_error::HasKind for ErrorDetail {
             E::KeystoreRequired { .. } => EK::InvalidConfig,
             E::BadClientSpecifier(_) => EK::InvalidConfig,
             E::FsMistrust(_) => EK::FsPermissions,
+            E::MissingProtocol(_) => EK::SoftwareDeprecated,
             E::Bug(e) => e.kind(),
         }
     }
@@ -499,6 +511,12 @@ enum ErrorHintInner<'a> {
         /// The access bits that, according to fs-mistrust, should not be set.
         badbits: u32,
     },
+
+    /// At least one required protocol was missing.
+    MissingProtocols {
+        /// The list of missing required protocols
+        required: &'a tor_protover::Protocols,
+    },
 }
 
 // TODO: Perhaps we want to lower this logic to fs_mistrust crate, and have a
@@ -530,13 +548,30 @@ impl<'a> Display for ErrorHint<'a> {
                 if 0 != badbits & 0o444 {
                     writeln!(f, "* Untrusted users could read its contents.")?;
                 }
-                writeln!(f,
+                writeln!(
+                    f,
                     "You can fix this by further restricting the permissions of your filesystem, using:\n\
                          chmod {} {}",
-                        fs_mistrust::format_access_bits(badbits, '-'),
-                        filename.anonymize_home())?;
-                writeln!(f, "You can suppress this message by setting storage.permissions.dangerously_trust_everyone=true,\n\
-                    or setting ARTI_FS_DISABLE_PERMISSION_CHECKS=yes in your environment.")?;
+                    fs_mistrust::format_access_bits(badbits, '-'),
+                    filename.anonymize_home()
+                )?;
+                writeln!(
+                    f,
+                    "You can suppress this message by setting storage.permissions.dangerously_trust_everyone=true,\n\
+                    or setting ARTI_FS_DISABLE_PERMISSION_CHECKS=yes in your environment."
+                )?;
+            }
+            ErrorHintInner::MissingProtocols { required } => {
+                writeln!(
+                    f,
+                    "The consensus directory says that we need to support certain protocols which we do not implement."
+                )?;
+                writeln!(f, "The missing protocols are: {}", required)?;
+                writeln!(
+                    f,
+"The best solution is to upgrade to a more recent version of Arti.  If this is not possible,
+you can list the missing protocols in the configuration option 'use_obsolete_software.ignore_missing_required_protocols'"
+                )?;
             }
         }
         Ok(())

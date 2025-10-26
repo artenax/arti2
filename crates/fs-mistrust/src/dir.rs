@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{walk::PathType, Error, Mistrust, Result, Verifier};
+use crate::{Error, Mistrust, Result, Verifier, walk::PathType};
 
 /// A directory whose access properties we have verified, along with accessor
 /// functions to access members of that directory.
@@ -221,10 +221,7 @@ impl CheckedDir {
             // TODO: this is inconsistent with CheckedDir::open()'s behavior, which returns a
             // FilesystemLoop io error in this case (we can't construct such an error here, because
             // ErrorKind::FilesystemLoop is only available on nightly)
-            let err = io::Error::new(
-                io::ErrorKind::Other,
-                format!("Path {:?} is a symlink", path),
-            );
+            let err = io::Error::other(format!("Path {:?} is a symlink", path));
             return Err(Error::io(err, &path, "metadata"));
         }
 
@@ -264,7 +261,7 @@ impl CheckedDir {
         for component in p.components() {
             match component {
                 Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
-                    return Err(Error::InvalidSubdirectory)
+                    return Err(Error::InvalidSubdirectory);
                 }
                 Component::CurDir | Component::Normal(_) => {}
             }

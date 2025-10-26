@@ -4,11 +4,11 @@
 //! version 1, and communicate with them in order to specify configuration parameters and
 //! receive updates as to the current state of the PT.
 
+use crate::PtClientMethod;
 use crate::err;
 use crate::err::PtError;
-use crate::PtClientMethod;
-use futures::channel::mpsc::Receiver;
 use futures::StreamExt;
+use futures::channel::mpsc::Receiver;
 use itertools::Itertools;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -463,6 +463,7 @@ pub(crate) mod sealed {
         /// Receive a message from the pluggable transport binary asynchronously.
         ///
         /// Note: This will convert `PtMessage::Log` into a tracing log call automatically.
+        #[allow(clippy::cognitive_complexity)] // due to tracing
         pub async fn recv(&mut self) -> err::Result<PtMessage> {
             loop {
                 match self.stdout.next().await {
@@ -534,7 +535,7 @@ pub(crate) mod sealed {
                         return Err(PtError::ProtocolViolation(format!(
                             "unknown CMETHOD protocol '{}'",
                             x
-                        )))
+                        )));
                     }
                 },
                 None => SocksVersion::V5,

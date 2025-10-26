@@ -303,6 +303,12 @@ pub trait Blocking: Clone + Send + Sync + 'static {
         T: Send + 'static;
 
     /// Future from [`spawn_blocking`](Self::spawn_blocking)
+    ///
+    /// The function callback (`f: F` in [`spawn_blocking`](Self::spawn_blocking)
+    /// will start to run regardless of whether this future is awaited.
+    ///
+    /// Dropping this future doesn't stop the callback; it detaches it:
+    /// the function will continue to run, but its output can no longer be collected.
     type ThreadHandle<T: Send + 'static>: Future<Output = T>;
 
     /// Block on a future, from within `Blocking::spawn_blocking`
@@ -324,10 +330,10 @@ pub trait Blocking: Clone + Send + Sync + 'static {
     /// **Not** allowed within [`blocking_io`](Blocking::blocking_io).
     ///
     /// Otherwise it may malfunction or panic.
-    /// (`tor_rtmock::MockExecutor`'s implemnetation will usually detect violations.)
+    /// (`tor_rtmock::MockExecutor`'s implementation will usually detect violations.)
     fn reenter_block_on<F>(&self, future: F) -> F::Output
     where
-        F: Future + Send + 'static,
+        F: Future,
         F::Output: Send + 'static;
 
     /// Perform some blocking IO from an async future
@@ -362,13 +368,16 @@ pub trait Blocking: Clone + Send + Sync + 'static {
     ///    Use `spawn_blocking` for that.
     ///  * Performance better than using `spawn_blocking` each time is not guaranteed.
     ///
+    /// Otherwise the semantics are the same as
+    /// [`spawn_blocking`](Self::spawn_blocking).
+    ///
     /// ### Panics
     ///
     /// `Blocking::block_in_place` may only be called from within
     /// a task or future being polled by this `Runtime`.
     ///
     /// Otherwise it may malfunction or panic.
-    /// (`tor_rtmock::MockExecutor`'s implemnetation will usually detect violations.)
+    /// (`tor_rtmock::MockExecutor`'s implementation will usually detect violations.)
     ///
     /// ### Fallback (provided) implementation
     ///

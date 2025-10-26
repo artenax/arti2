@@ -20,6 +20,7 @@ mod net {
     use std::net::SocketAddr;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    #[cfg(unix)]
     use tor_general_addr::unix;
 
     /// Implement NetStreamProvider-related functionality for a single address type.
@@ -127,13 +128,13 @@ mod net {
         async fn connect(&self, addr: &unix::SocketAddr) -> IoResult<Self::Stream> {
             let path = addr
                 .as_pathname()
-                .ok_or(crate::unix::UnsupportedUnixAddressType)?;
+                .ok_or(crate::unix::UnsupportedAfUnixAddressType)?;
             UnixStream::connect(path).await
         }
         async fn listen(&self, addr: &unix::SocketAddr) -> IoResult<Self::Listener> {
             let path = addr
                 .as_pathname()
-                .ok_or(crate::unix::UnsupportedUnixAddressType)?;
+                .ok_or(crate::unix::UnsupportedAfUnixAddressType)?;
             UnixListener::bind(path).await
         }
     }

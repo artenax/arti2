@@ -8,7 +8,7 @@ use std::{
 
 use derive_deftly::define_derive_deftly;
 use downcast_rs::Downcast;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 
 /// The parameters and method name associated with a given Request.
 ///
@@ -170,6 +170,7 @@ define_derive_deftly! {
 /// }
 /// ```
     export DynMethod:
+    #[allow(clippy::incompatible_msrv)] // https://github.com/rust-lang/rust-clippy/issues/15792
     const _: () = {
         ${if not(tmeta(rpc(bypass_method_dispatch))) {
             impl $crate::DynMethod for $ttype {
@@ -197,7 +198,7 @@ define_derive_deftly! {
             $crate::inventory::submit! {
                 $crate::MethodInfo_ {
                     method_name : ${tmeta(rpc(method_name)) as str},
-                    typeid : std::any::TypeId::of::<$ttype>,
+                    typeid : std::any::TypeId::of::<$ttype>, // trips rust-clippy#15792
                     output_name: std::any::type_name::<<$ttype as $crate::RpcMethod>::Output>,
                     update_name: std::any::type_name::<<$ttype as $crate::RpcMethod>::Update>,
                 }
@@ -209,12 +210,13 @@ define_derive_deftly! {
 }
 pub use derive_deftly_template_DynMethod;
 
-use crate::{is_valid_rpc_identifier, InvalidRpcIdentifier, ObjectId};
+use crate::{InvalidRpcIdentifier, ObjectId, is_valid_rpc_identifier};
 
 /// Return true if `name` is the name of some method.
 pub fn is_method_name(name: &str) -> bool {
     /// Lazy set of all method names.
-    static METHOD_NAMES: Lazy<HashSet<&'static str>> = Lazy::new(|| iter_method_names().collect());
+    static METHOD_NAMES: LazyLock<HashSet<&'static str>> =
+        LazyLock::new(|| iter_method_names().collect());
     METHOD_NAMES.contains(name)
 }
 
@@ -228,8 +230,8 @@ pub fn iter_method_names() -> impl Iterator<Item = &'static str> {
 /// Given a type ID, return its RPC MethodInfo_ (if any).
 pub(crate) fn method_info_by_typeid(typeid: any::TypeId) -> Option<&'static MethodInfo_> {
     /// Lazy map from TypeId to RPC method name.
-    static METHOD_INFO_BY_TYPEID: Lazy<HashMap<any::TypeId, &'static MethodInfo_>> =
-        Lazy::new(|| {
+    static METHOD_INFO_BY_TYPEID: LazyLock<HashMap<any::TypeId, &'static MethodInfo_>> =
+        LazyLock::new(|| {
             inventory::iter::<MethodInfo_>()
                 .map(|mi| ((mi.typeid)(), mi))
                 .collect()

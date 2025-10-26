@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 pub mod dispatch;
@@ -53,8 +54,8 @@ use std::{collections::HashSet, convert::Infallible, sync::Arc};
 pub use dispatch::{DispatchTable, InvokeError, UpdateSink};
 pub use err::{RpcError, RpcErrorKind};
 pub use method::{
-    check_method_names, is_method_name, iter_method_names, DeserMethod, DynMethod, Method,
-    NoUpdates, RpcMethod,
+    DeserMethod, DynMethod, Method, NoUpdates, RpcMethod, check_method_names, is_method_name,
+    iter_method_names,
 };
 pub use obj::{Object, ObjectArcExt, ObjectId};
 
@@ -72,7 +73,7 @@ pub use obj::cast::CastTable;
 #[doc(hidden)]
 pub use {
     derive_deftly, dispatch::RpcResult, downcast_rs, erased_serde, futures, inventory,
-    method::MethodInfo_, once_cell, paste, tor_async_utils, tor_error::internal, typetag,
+    method::MethodInfo_, paste, tor_async_utils, tor_error::internal, typetag,
 };
 
 /// Templates for use with [`derive_deftly`]

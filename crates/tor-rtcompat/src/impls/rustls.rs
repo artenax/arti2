@@ -1,15 +1,18 @@
 //! Implementation for using Rustls with a runtime.
+//!
+//! #
 
-use crate::traits::{CertifiedConn, TlsConnector, TlsProvider};
 use crate::StreamOps;
+use crate::traits::{CertifiedConn, TlsConnector, TlsProvider};
 
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncWrite};
-use futures_rustls::rustls::client::WebPkiServerVerifier;
-use futures_rustls::rustls::{self, RootCertStore};
+use futures_rustls::rustls::{self, crypto::CryptoProvider};
 use rustls::client::danger;
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::{CertificateError, Error as TLSError};
 use rustls_pki_types::{CertificateDer, ServerName};
+use tracing::instrument;
 use webpki::EndEntityCert; // this is actually rustls_webpki.
 
 use std::{
@@ -21,12 +24,31 @@ use std::{
 ///
 /// It supports wrapping any reasonable stream type that implements `AsyncRead` + `AsyncWrite`.
 ///
-/// The application is responsible for calling `CryptoProvider::install_default_provider()`
-/// before constructing one of these providers.  If they do not, we will issue a warning,
-/// and install a default (ring) provider.
+/// # Cryptographic providers
+///
+/// The application is responsible for calling [`CryptoProvider::install_default()`]
+/// before constructing [`TlsProvider`].  If they do not, we will issue a warning,
+/// and install a default ([ring]) provider.
+///
+/// We choose ring because, of the two builtin providers that ship with rustls,
+/// it has the best license.
+/// We _could_ instead use [aws-lc-rs] (for its early MLKEM768 support),
+/// but it is [still under the old OpenSSL license][aws-lc-license], which is GPL-incompatible.
+/// (Although Arti isn't under the GPL itself, we are trying to stay compatible with it.)
+///
+/// See the [rustls documentation][all-providers] for a list of other rustls
+/// cryptography providcers.
+///
+/// [ring]: https://crates.io/crates/ring
+/// [aws-lc-rs]: https://github.com/aws/aws-lc-rs
+/// [aws-lc-license]: https://github.com/aws/aws-lc/issues/2203
+/// [all-providers]: https://docs.rs/rustls/latest/rustls/#cryptography-providers
 #[cfg_attr(
     docsrs,
-    doc(cfg(all(feature = "rustls", any(feature = "tokio", feature = "async-std"))))
+    doc(cfg(all(
+        feature = "rustls",
+        any(feature = "tokio", feature = "async-std", feature = "smol")
+    )))
 )]
 #[derive(Clone)]
 #[non_exhaustive]
@@ -81,6 +103,7 @@ where
 {
     type Conn = futures_rustls::client::TlsStream<S>;
 
+    #[instrument(skip_all, level = "trace")]
     async fn negotiate_unvalidated(&self, stream: S, sni_hostname: &str) -> IoResult<Self::Conn> {
         let name: ServerName<'_> = sni_hostname
             .try_into()
@@ -114,7 +137,7 @@ where
 ///
 /// (Warns if we have to do this: the application should be responsible for choosing a provider.)
 fn ensure_provider_installed() {
-    if futures_rustls::rustls::crypto::CryptoProvider::get_default().is_none() {
+    if CryptoProvider::get_default().is_none() {
         // If we haven't installed a CryptoProvider at this point, we warn and install
         // the `ring` provider.  That isn't great, but the alternative would be to
         // panic.  Right now, that would cause many of our tests to fail.
@@ -122,14 +145,14 @@ fn ensure_provider_installed() {
             "Creating a RustlsRuntime, but no CryptoProvider is installed. The application \
                         should call CryptoProvider::install_default()"
         );
-        let _idempotent_ignore = futures_rustls::rustls::crypto::CryptoProvider::install_default(
+        let _idempotent_ignore = CryptoProvider::install_default(
             futures_rustls::rustls::crypto::ring::default_provider(),
         );
     }
 }
 
 impl RustlsProvider {
-    /// Construct a new [`RustlsProvider`.]
+    /// Construct a new [`RustlsProvider`].
     pub(crate) fn new() -> Self {
         ensure_provider_installed();
 
@@ -143,8 +166,10 @@ impl RustlsProvider {
         // handshake.
         let config = futures_rustls::rustls::client::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(std::sync::Arc::new(Verifier::from_cert_der(
-                LETSENCRYPT_ROOT,
+            .with_custom_certificate_verifier(Arc::new(Verifier(
+                CryptoProvider::get_default()
+                    .expect("CryptoProvider not installed")
+                    .signature_verification_algorithms,
             )))
             .with_no_client_auth();
 
@@ -160,7 +185,7 @@ impl Default for RustlsProvider {
     }
 }
 
-/// A [`rustls::client::danger::ServerCertVerifier`] based on the Rustls's [`WebPkiServerVerifier`].
+/// A custom [`rustls::client::danger::ServerCertVerifier`]
 ///
 /// This verifier is necessary since Tor relays doesn't participate in the web
 /// browser PKI, and as such their certificates won't check out as valid ones.
@@ -168,32 +193,7 @@ impl Default for RustlsProvider {
 /// We enforce that the certificate itself has correctly authenticated the TLS
 /// connection, but nothing else.
 #[derive(Clone, Debug)]
-struct Verifier(Arc<WebPkiServerVerifier>);
-
-/// Root certificate for Let's Encrypt, downloaded 27 February 2025.
-/// We don't actually use this certificate for anything here!
-/// We only have it here because the WebPkiServerVerifier
-/// requires that the RootCertStore is nonempty.
-///
-/// The presence of this certificate should be considered a kludge.
-const LETSENCRYPT_ROOT: &[u8] = include_bytes!("letsencrypt-isrg-root-x2.der");
-
-impl Verifier {
-    /// Construct a Verifier from a dummy root certificate, which will not actually be used.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the certificate is not parseable.
-    fn from_cert_der(cert: &[u8]) -> Self {
-        let mut root_certs = RootCertStore::empty();
-        let der = CertificateDer::from_slice(cert);
-        root_certs
-            .add(der)
-            .expect("Unable to add dummy root-certificate for rustls.");
-        let bld = WebPkiServerVerifier::builder(Arc::new(root_certs));
-        Self(bld.build().expect("Could not build default verifier!"))
-    }
-}
+struct Verifier(pub(crate) WebPkiSupportedAlgorithms);
 
 impl danger::ServerCertVerifier for Verifier {
     fn verify_server_cert(
@@ -237,7 +237,7 @@ impl danger::ServerCertVerifier for Verifier {
         cert: &CertificateDer,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<danger::HandshakeSignatureValid, TLSError> {
-        self.0.verify_tls12_signature(message, cert, dss)
+        verify_tls12_signature(message, cert, dss, &self.0)
     }
 
     fn verify_tls13_signature(
@@ -246,11 +246,11 @@ impl danger::ServerCertVerifier for Verifier {
         cert: &CertificateDer,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<danger::HandshakeSignatureValid, TLSError> {
-        self.0.verify_tls13_signature(message, cert, dss)
+        verify_tls13_signature(message, cert, dss, &self.0)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.supported_verify_schemes()
+        self.0.supported_schemes()
     }
 
     fn root_hint_subjects(&self) -> Option<&[rustls::DistinguishedName]> {
@@ -285,22 +285,10 @@ mod test {
     /// which now appears unmaintained.
     const TOR_CERTIFICATE: &[u8] = include_bytes!("./tor-generated.der");
 
-    /// An expired certificate generated using C tor.
-    /// We use this to make sure that we can build a verifier using an expired root cert;
-    /// if we can't, then our verifier code above will stop working when its baked-in
-    /// (unused) letsencrypt certificate expires in 2035.
-    const EXPIRED_TOR_CERTIFICATE: &[u8] = include_bytes!("./tor-generated-expired.der");
-
     #[test]
     fn basic_tor_cert() {
         ensure_provider_installed();
         let der = CertificateDer::from_slice(TOR_CERTIFICATE);
         let _cert = EndEntityCert::try_from(&der).unwrap();
-    }
-
-    #[test]
-    fn verifier_with_expired_root_cert() {
-        ensure_provider_installed();
-        let _verifier = Verifier::from_cert_der(EXPIRED_TOR_CERTIFICATE);
     }
 }

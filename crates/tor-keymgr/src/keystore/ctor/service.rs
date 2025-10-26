@@ -2,11 +2,15 @@
 //!
 //! See [`CTorServiceKeystore`] for more details.
 
-use crate::keystore::ctor::err::{CTorKeystoreError, MalformedServiceKeyError};
 use crate::keystore::ctor::CTorKeystore;
-use crate::keystore::fs_utils::{checked_op, FilesystemAction, FilesystemError};
+use crate::keystore::ctor::err::{CTorKeystoreError, MalformedServiceKeyError};
+use crate::keystore::fs_utils::{FilesystemAction, FilesystemError, checked_op};
 use crate::keystore::{EncodableItem, ErasedKey, KeySpecifier, Keystore, KeystoreId};
-use crate::{CTorPath, CTorServicePath, KeyPath, Result};
+use crate::raw::{RawEntryId, RawKeystoreEntry};
+use crate::{
+    CTorPath, CTorServicePath, KeyPath, KeystoreEntry, KeystoreEntryResult, Result,
+    UnrecognizedEntryError,
+};
 
 use fs_mistrust::Mistrust;
 use tor_basic_utils::PathExt as _;
@@ -15,9 +19,15 @@ use tor_key_forge::{KeyType, KeystoreItemType};
 use tor_llcrypto::pk::ed25519;
 use tor_persist::hsnickname::HsNickname;
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
+#[allow(unused_imports)]
+use std::str::FromStr;
 use std::sync::Arc;
+
+use itertools::Itertools;
+use walkdir::WalkDir;
 
 /// A read-only C Tor service keystore.
 ///
@@ -183,12 +193,12 @@ impl Keystore for CTorServiceKeystore {
         Ok(Some(parsed_key))
     }
 
-    fn insert(
-        &self,
-        _key: &dyn EncodableItem,
-        _key_spec: &dyn KeySpecifier,
-        _item_type: &KeystoreItemType,
-    ) -> Result<()> {
+    #[cfg(feature = "onion-service-cli-extra")]
+    fn raw_entry_id(&self, raw_id: &str) -> Result<RawEntryId> {
+        Ok(RawEntryId::Path(PathBuf::from(raw_id.to_string())))
+    }
+
+    fn insert(&self, _key: &dyn EncodableItem, _key_spec: &dyn KeySpecifier) -> Result<()> {
         Err(CTorKeystoreError::NotSupported { action: "insert" }.into())
     }
 
@@ -200,9 +210,16 @@ impl Keystore for CTorServiceKeystore {
         Err(CTorKeystoreError::NotSupported { action: "remove" }.into())
     }
 
-    fn list(&self) -> Result<Vec<(KeyPath, KeystoreItemType)>> {
+    #[cfg(feature = "onion-service-cli-extra")]
+    fn remove_unchecked(&self, _entry_id: &RawEntryId) -> Result<()> {
+        Err(CTorKeystoreError::NotSupported {
+            action: "remove_unchecked",
+        }
+        .into())
+    }
+
+    fn list(&self) -> Result<Vec<KeystoreEntryResult<KeystoreEntry>>> {
         use crate::CTorServicePath::*;
-        use itertools::Itertools;
 
         // This keystore can contain at most 2 keys (the public and private
         // keys of the service)
@@ -212,24 +229,114 @@ impl Keystore for CTorServiceKeystore {
                     nickname: self.nickname.clone(),
                     path: PublicKey,
                 },
-                KeyType::Ed25519PublicKey.into(),
+                KeyType::Ed25519PublicKey,
             ),
             (
                 CTorPath::Service {
                     nickname: self.nickname.clone(),
                     path: PrivateKey,
                 },
-                KeyType::Ed25519ExpandedKeypair.into(),
+                KeyType::Ed25519ExpandedKeypair,
             ),
         ];
 
-        all_keys
+        let valid_rel_paths = all_keys
             .into_iter()
-            .map(|(path, key_type)| {
-                self.contains(&path, &key_type)
-                    .map(|res: bool| (path, key_type, res))
+            .map(|(ctor_path, key_type)| {
+                let path = rel_path_if_supported!(
+                    self,
+                    ctor_path,
+                    Err(internal!("Failed to build {ctor_path:?} path?!").into()),
+                    KeystoreItemType::Key(key_type.clone())
+                );
+
+                Ok((ctor_path, key_type, path))
             })
-            .filter_map_ok(|(path, key_type, res)| res.then_some((path.into(), key_type)))
+            .collect::<Result<Vec<_>>>()?;
+
+        let keystore_path = self.keystore.keystore_dir.as_path();
+
+        // TODO: this block presents duplication with the equivalent
+        // [`ArtiNativeKeystore`](crate::ArtiNativeKeystore) implementation
+        WalkDir::new(keystore_path)
+            .into_iter()
+            .map(|entry| {
+                let entry = entry
+                    .map_err(|e| {
+                        let msg = e.to_string();
+                        FilesystemError::Io {
+                            action: FilesystemAction::Read,
+                            path: keystore_path.into(),
+                            err: e
+                                .into_io_error()
+                                .unwrap_or_else(|| io::Error::other(msg.clone()))
+                                .into(),
+                        }
+                    })
+                    .map_err(CTorKeystoreError::Filesystem)?;
+
+                let path = entry.path();
+
+                // Skip over directories as they won't be valid ctor-paths
+                if entry.file_type().is_dir() {
+                    return Ok(None);
+                }
+
+                let path = path.strip_prefix(keystore_path).map_err(|_| {
+                    /* This error should be impossible. */
+                    tor_error::internal!(
+                        "found key {} outside of keystore_dir {}?!",
+                        path.display_lossy(),
+                        keystore_path.display_lossy()
+                    )
+                })?;
+
+                if let Some(parent) = path.parent() {
+                    // Check the properties of the parent directory by attempting to list its
+                    // contents.
+                    self.keystore
+                        .keystore_dir
+                        .read_directory(parent)
+                        .map_err(|e| FilesystemError::FsMistrust {
+                            action: FilesystemAction::Read,
+                            path: parent.into(),
+                            err: e.into(),
+                        })
+                        .map_err(CTorKeystoreError::Filesystem)?;
+                }
+
+                // Check if path is one of the valid C Tor service key paths
+                let maybe_path =
+                    valid_rel_paths
+                        .iter()
+                        .find_map(|(ctor_path, key_type, rel_path)| {
+                            (path == rel_path.rel_path_unchecked())
+                                .then_some((ctor_path, key_type, rel_path))
+                        });
+
+                let res = match maybe_path {
+                    Some((ctor_path, key_type, rel_path)) => Ok(KeystoreEntry::new(
+                        KeyPath::CTor(ctor_path.clone()),
+                        KeystoreItemType::Key(key_type.clone()),
+                        self.id(),
+                        RawEntryId::Path(rel_path.rel_path_unchecked().to_owned()),
+                    )),
+                    None => {
+                        let raw_id = RawEntryId::Path(path.into());
+                        let entry = RawKeystoreEntry::new(raw_id, self.id().clone()).into();
+                        Err(UnrecognizedEntryError::new(
+                            entry,
+                            Arc::new(CTorKeystoreError::MalformedKey {
+                                path: path.into(),
+                                err: MalformedServiceKeyError::NotAKey.into(),
+                            }),
+                        ))
+                    }
+                };
+
+                Ok(Some(res))
+            })
+            .flatten_ok()
             .collect()
     }
 }
@@ -316,11 +423,10 @@ mod tests {
 
     use super::*;
     use std::fs;
-    use std::str::FromStr as _;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
-    use crate::test_utils::{assert_found, DummyKey, TestCTorSpecifier};
     use crate::CTorServicePath;
+    use crate::test_utils::{DummyKey, TestCTorSpecifier, assert_found};
 
     const PUBKEY: &[u8] = include_bytes!("../../../testdata/tor-service/hs_ed25519_public_key");
     const PRIVKEY: &[u8] = include_bytes!("../../../testdata/tor-service/hs_ed25519_secret_key");
@@ -417,11 +523,7 @@ mod tests {
         assert_eq!(err.to_string(), "Operation not supported: remove");
 
         let err = keystore
-            .insert(
-                &DummyKey,
-                &TestCTorSpecifier(path.clone()),
-                &KeyType::Ed25519PublicKey.into(),
-            )
+            .insert(&DummyKey, &TestCTorSpecifier(path.clone()))
             .unwrap_err();
 
         assert_eq!(err.to_string(), "Operation not supported: insert");
@@ -452,17 +554,30 @@ mod tests {
 
     #[test]
     fn list() {
-        let (keystore, _keystore_dir) = init_keystore("foo", "allium-cepa");
+        let (keystore, keystore_dir) = init_keystore("foo", "allium-cepa");
+
+        // Insert unrecognized key
+        let _ = fs::File::create(keystore_dir.path().join("unrecognized_key")).unwrap();
+
         let keys: Vec<_> = keystore.list().unwrap();
 
-        assert_eq!(keys.len(), 2);
+        // 2 recognized keys, 1 unrecognized key
+        assert_eq!(keys.len(), 3);
 
-        assert!(keys
-            .iter()
-            .any(|(_, key_type)| *key_type == KeyType::Ed25519ExpandedKeypair.into()));
+        assert!(keys.iter().any(|entry| {
+            if let Ok(e) = entry.as_ref() {
+                return e.key_type() == &KeyType::Ed25519ExpandedKeypair.into();
+            }
+            false
+        }));
 
-        assert!(keys
-            .iter()
-            .any(|(_, key_type)| *key_type == KeyType::Ed25519PublicKey.into()));
+        assert!(keys.iter().any(|entry| {
+            if let Ok(e) = entry.as_ref() {
+                return e.key_type() == &KeyType::Ed25519PublicKey.into();
+            }
+            false
+        }));
+
+        assert!(keys.iter().any(|entry| { entry.is_err() }));
     }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "pt-proxy"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 publish = false
@@ -13,12 +13,18 @@ fast-socks5 = "0.10.0"
 thiserror = "2"
 tokio = { version = "1.7", features = ["full"] }
 tokio-stream = "0.1.14"
-tor-chanmgr = { path = "../../../crates/tor-chanmgr", features = ["pt-client"] }
-tor-linkspec = { path = "../../../crates/tor-linkspec" }
-tor-ptmgr = { path = "../../../crates/tor-ptmgr", features = [ "experimental-api"] }
-tor-rtcompat = { path = "../../../crates/tor-rtcompat", features = ["tokio", "native-tls"] }
-tor-socksproto = { path = "../../../crates/tor-socksproto" }
-tracing-subscriber = "0.3.17"
+tor-chanmgr = { path = "../../../crates/tor-chanmgr", version = "0.35", features = ["pt-client"] }
+tor-linkspec = { path = "../../../crates/tor-linkspec", version = "0.35" }
+tor-ptmgr = { path = "../../../crates/tor-ptmgr", version = "0.35", features = [ "experimental-api"] }
+tor-rtcompat = { path = "../../../crates/tor-rtcompat", version = "0.35", features = ["tokio", "native-tls"] }
+tor-socksproto = { path = "../../../crates/tor-socksproto", version = "0.35" }
+tracing-subscriber = "0.3.20"
 
 [features]
-full = ["tor-chanmgr/full", "tor-linkspec/full", "tor-ptmgr/full", "tor-rtcompat/full", "tor-socksproto/full"]
+full = [
+    "tor-chanmgr/full",
+    "tor-linkspec/full",
+    "tor-ptmgr/full",
+    "tor-rtcompat/full",
+    "tor-socksproto/full",
+]

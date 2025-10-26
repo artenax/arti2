@@ -16,7 +16,7 @@
 //
 // The veneer is rather thin and the types from `futures-rs` show through.
 // If we change this in the future, it will be a breaking change.
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -59,10 +59,11 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
-use futures::channel::oneshot as fut_oneshot;
 use futures::FutureExt as _;
+use futures::channel::oneshot as fut_oneshot;
 
 pub use fut_oneshot::Canceled;
 

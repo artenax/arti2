@@ -10,22 +10,22 @@ use tracing::debug;
 
 use derive_builder::Builder;
 use derive_deftly::Deftly;
-use fs_mistrust::{anon_home::PathExt as _, Mistrust};
+use fs_mistrust::{Mistrust, anon_home::PathExt as _};
 use serde::{Deserialize, Serialize};
 use tor_basic_utils::PathExt as _;
 use tor_config::{
-    define_map_builder, derive_deftly_template_ExtendBuilder, extend_builder::ExtendBuilder as _,
-    extend_builder::ExtendStrategy, impl_standard_builder, ConfigBuildError,
+    ConfigBuildError, define_map_builder, derive_deftly_template_ExtendBuilder,
+    extend_builder::ExtendBuilder as _, extend_builder::ExtendStrategy, impl_standard_builder,
 };
 use tor_config_path::{CfgPath, CfgPathResolver};
 use tor_error::internal;
 use tor_rpc_connect::{
+    ParsedConnectPoint,
     auth::RpcAuth,
     load::{LoadError, LoadOptions, LoadOptionsBuilder},
     server::ListenerGuard,
-    ParsedConnectPoint,
 };
-use tor_rtcompat::{general, Runtime};
+use tor_rtcompat::{Runtime, general};
 
 define_map_builder! {
     /// Builder for a map of RpcListenerSetConfig.
@@ -132,7 +132,7 @@ impl RpcListenerSetConfigBuilder {
 define_map_builder! {
     /// Builder for the `FileOptionsMap` within an `RpcListenerSetConfig`.
     #[derive(Eq, PartialEq)]
-    pub(super) struct FileOptionsMapBuilder =>
+    pub(crate) struct FileOptionsMapBuilder =>
     type FileOptionsMap = BTreeMap<String, ConnectPointOptions>;
 }
 
@@ -155,7 +155,7 @@ define_map_builder! {
 #[derive_deftly(ExtendBuilder)]
 #[builder(build_fn(error = "ConfigBuildError"))]
 #[builder(derive(Debug, Serialize, Deserialize, Eq, PartialEq))]
-pub(super) struct ConnectPointOptions {
+pub(crate) struct ConnectPointOptions {
     /// Used to explicitly disable an entry in a connect point directory.
     #[builder(default = "true")]
     enable: bool,
@@ -306,7 +306,7 @@ impl RpcListenerSetConfig {
                                 "Can't read RPC connect point directory at {}",
                                 dir.anonymize_home()
                             )
-                        })
+                        });
                     }
                 };
             for (path, conn_pt_result) in dir_contents {

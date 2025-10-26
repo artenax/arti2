@@ -29,6 +29,33 @@ macro_rules! def_named {
 
 def_named! {
 
+    Link {
+        /// Obsolete version 1 link protocol.
+        ///
+        /// This protocol used RSA-based TLS certificate chains with specific properties.
+        V1 = 1;
+        /// Obsolete version 2 link protocol.
+        ///
+        /// This protocol used TLS renegotiation.
+        V2 = 2;
+        /// Version 3 link protocol.
+        ///
+        /// This protocol uses a single server certificate in TLS,
+        /// and then exchanges additional certificates and authentication
+        /// within the protocol.
+        V3 = 3;
+        /// Version 4 link protocol.
+        ///
+        /// This protocol extends the version 3 link protocol
+        /// by changing the length of Circuit IDs from 2 bytes to 4 bytes.
+        V4 = 4;
+        /// Version 5 link protocol.
+        ///
+        /// This protocol extends the version 4 link protocol
+        /// by adding support for link padding.
+        V5 = 5;
+    }
+
     LinkAuth {
         /// TLS authentication based on signing key-exported material with an Ed25519 key.
         ///
@@ -54,6 +81,13 @@ def_named! {
         ///
         /// [prop346]: https://spec.torproject.org/proposals/346-protovers-again.html
         NEGOTIATE_SUBPROTO = 5;
+
+        /// Support for counter galois onion relay encryption.
+        ///
+        /// (Reserved.)
+        ///
+        /// [prop359]: https://spec.torproject.org/proposals/359-cgo-redux.html
+        CRYPT_CGO = 6;
     }
 
     HSIntro {
@@ -94,7 +128,7 @@ def_named! {
         FAMILY_IDS = 4;
     }
 
-    MicroDesc {
+    Microdesc {
         /// Support for generating and parsing microdescriptors with Ed25159 identities
         /// (`KP_relayid_ed`)
         ED25519_KEY = 2;

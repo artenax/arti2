@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 pub mod builder;
@@ -54,16 +55,17 @@ mod testing;
 pub mod transport;
 pub(crate) mod util;
 
+use futures::StreamExt;
 use futures::select_biased;
 use futures::task::SpawnExt;
-use futures::StreamExt;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tor_config::ReconfigureError;
 use tor_error::error_report;
+use tor_keymgr::KeyMgr;
 use tor_linkspec::{ChanTarget, OwnedChanTarget};
-use tor_netdir::{params::NetParameters, NetDirProvider};
+use tor_netdir::{NetDirProvider, params::NetParameters};
 use tor_proto::channel::Channel;
 #[cfg(feature = "experimental-api")]
 use tor_proto::memquota::ChannelAccount;
@@ -211,12 +213,16 @@ impl<R: Runtime> ChanMgr<R> {
     /// # Usage note
     ///
     /// For the manager to work properly, you will need to call `ChanMgr::launch_background_tasks`.
+    ///
+    /// The `keymgr` is only needed for a relay which is used for authenticating its channel to
+    /// other relays. Pass `None` for a client.
     pub fn new(
         runtime: R,
         config: &ChannelConfig,
         dormancy: Dormancy,
         netparams: &NetParameters,
         memquota: ToplevelAccount,
+        keymgr: Option<Arc<KeyMgr>>,
     ) -> Self
     where
         R: 'static,
@@ -225,7 +231,7 @@ impl<R: Runtime> ChanMgr<R> {
         let sender = Arc::new(std::sync::Mutex::new(sender));
         let reporter = BootstrapReporter(sender);
         let transport = transport::DefaultTransport::new(runtime.clone());
-        let builder = builder::ChanBuilder::new(runtime, transport);
+        let builder = builder::ChanBuilder::new(runtime, transport, keymgr);
         let factory = factory::CompoundFactory::new(
             Arc::new(builder),
             #[cfg(feature = "pt-client")]
@@ -367,7 +373,7 @@ impl<R: Runtime> ChanMgr<R> {
     ///
     /// Unlike [`get_or_launch`](ChanMgr::get_or_launch), this function always
     /// creates a new channel, never retries transient failure, and does not
-    /// register this channel with the `ChanMgr`.  
+    /// register this channel with the `ChanMgr`.
     ///
     /// Generally you should not use this function; `get_or_launch` is usually a
     /// better choice.  This function is the right choice if, for whatever

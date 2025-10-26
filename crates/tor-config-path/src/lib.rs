@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 use std::collections::HashMap;
@@ -49,7 +50,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 #[cfg(feature = "expand-paths")]
-use {directories::BaseDirs, once_cell::sync::Lazy};
+use {directories::BaseDirs, std::sync::LazyLock};
 
 use tor_error::{ErrorKind, HasKind};
 
@@ -109,7 +110,9 @@ pub enum CfgPathError {
     #[error("Unrecognized variable {0} in path")]
     UnknownVar(String),
     /// We couldn't construct a ProjectDirs object.
-    #[error("Couldn't determine XDG Project Directories, needed to resolve a path; probably, unable to determine HOME directory")]
+    #[error(
+        "Couldn't determine XDG Project Directories, needed to resolve a path; probably, unable to determine HOME directory"
+    )]
     NoProjectDirs,
     /// We couldn't construct a BaseDirs object.
     #[error("Can't construct base directories to resolve a path element")]
@@ -126,7 +129,9 @@ pub enum CfgPathError {
     #[error("Invalid path string: {0:?}")]
     InvalidString(String),
     /// Variable interpolation (`$`) attempted, but not compiled in
-    #[error("Variable interpolation $ is not supported (tor-config/expand-paths feature disabled)); $ must still be doubled")]
+    #[error(
+        "Variable interpolation $ is not supported (tor-config/expand-paths feature disabled)); $ must still be doubled"
+    )]
     VariableInterpolationNotSupported(String),
     /// Home dir interpolation (`~`) attempted, but not compiled in
     #[error("Home dir ~/ is not supported (tor-config/expand-paths feature disabled)")]
@@ -282,9 +287,9 @@ impl std::fmt::Display for CfgPath {
 // use the same home directory expansion that we use in this crate for `~` expansion.
 #[cfg(feature = "expand-paths")]
 pub fn home() -> Result<&'static Path, CfgPathError> {
-    /// Lazy cell holding the home directory.
-    static HOME_DIR: Lazy<Option<PathBuf>> =
-        Lazy::new(|| Some(BaseDirs::new()?.home_dir().to_owned()));
+    /// Lazy lock holding the home directory.
+    static HOME_DIR: LazyLock<Option<PathBuf>> =
+        LazyLock::new(|| Some(BaseDirs::new()?.home_dir().to_owned()));
     HOME_DIR
         .as_ref()
         .map(PathBuf::as_path)
@@ -469,7 +474,7 @@ mod test_serde {
 
     use derive_builder::Builder;
     use tor_config::load::TopLevel;
-    use tor_config::{impl_standard_builder, ConfigBuildError};
+    use tor_config::{ConfigBuildError, impl_standard_builder};
 
     #[derive(Serialize, Deserialize, Builder, Eq, PartialEq, Debug)]
     #[builder(derive(Serialize, Deserialize, Debug))]

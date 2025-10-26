@@ -9,13 +9,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::err::BootstrapAction;
-use crate::state::{DirState, PoisonedState};
 use crate::DirMgrConfig;
 use crate::DocSource;
+use crate::err::BootstrapAction;
+use crate::state::{DirState, PoisonedState};
 use crate::{
+    DirMgr, DocId, DocQuery, DocumentText, Error, Readiness, Result,
     docid::{self, ClientRequest},
-    upgrade_weak_ref, DirMgr, DocId, DocQuery, DocumentText, Error, Readiness, Result,
+    upgrade_weak_ref,
 };
 
 use futures::FutureExt;
@@ -23,13 +24,13 @@ use futures::StreamExt;
 use oneshot_fused_workaround as oneshot;
 use tor_dirclient::DirResponse;
 use tor_error::{info_report, warn_report};
-use tor_rtcompat::scheduler::TaskSchedule;
 use tor_rtcompat::Runtime;
+use tor_rtcompat::scheduler::TaskSchedule;
 use tracing::{debug, info, trace, warn};
 
 use crate::storage::Store;
 #[cfg(test)]
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 #[cfg(test)]
 use std::sync::Mutex;
 use tor_circmgr::{CircMgr, DirInfo};
@@ -226,10 +227,10 @@ pub(crate) fn make_consensus_request(
     request.set_skew_limit(
         // If we are _fast_ by at least this much, then any valid directory will
         // seem to be at least this far in the past.
-        config.tolerance.post_valid_tolerance,
+        config.tolerance.post_valid_tolerance(),
         // If we are _slow_ by this much, then any valid directory will seem to
         // be at least this far in the future.
-        config.tolerance.pre_valid_tolerance,
+        config.tolerance.pre_valid_tolerance(),
     );
 
     Ok(ClientRequest::Consensus(request))
@@ -297,12 +298,13 @@ async fn fetch_single<R: Runtime>(
 /// Note that only one test uses this: otherwise there would be a race
 /// condition. :p
 #[cfg(test)]
-static CANNED_RESPONSE: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(vec![]));
+static CANNED_RESPONSE: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(vec![]));
 
 /// Launch a set of download requests for a set of missing objects in
 /// `missing`, and return each request along with the response it received.
 ///
 /// Don't launch more than `parallelism` requests at once.
+#[allow(clippy::cognitive_complexity)] // TODO: maybe refactor?
 async fn fetch_multiple<R: Runtime>(
     dirmgr: Arc<DirMgr<R>>,
     attempt_id: AttemptId,
@@ -399,6 +401,7 @@ async fn load_once<R: Runtime>(
 /// cache in `dirmgr`, advancing the state to the extent possible.
 ///
 /// No downloads are performed; the provided state will not be reset.
+#[allow(clippy::cognitive_complexity)] // TODO: Refactor? Somewhat due to tracing.
 pub(crate) async fn load<R: Runtime>(
     dirmgr: Arc<DirMgr<R>>,
     mut state: Box<dyn DirState>,
@@ -454,6 +457,7 @@ pub(crate) async fn load<R: Runtime>(
 ///
 /// This can launch one or more download requests, but will not launch more
 /// than `parallelism` requests at a time.
+#[allow(clippy::cognitive_complexity)] // TODO: Refactor?
 async fn download_attempt<R: Runtime>(
     dirmgr: &Arc<DirMgr<R>>,
     state: &mut Box<dyn DirState>,
@@ -537,6 +541,7 @@ async fn download_attempt<R: Runtime>(
 ///
 /// The first time that the state becomes ["usable"](Readiness::Usable), notify
 /// the sender in `on_usable`.
+#[allow(clippy::cognitive_complexity)] // TODO: Refactor!
 pub(crate) async fn download<R: Runtime>(
     dirmgr: Weak<DirMgr<R>>,
     state: &mut Box<dyn DirState>,
@@ -573,12 +578,6 @@ pub(crate) async fn download<R: Runtime>(
             dirmgr.runtime.wallclock()
         };
 
-        // Skip the downloads if we can...
-        if state.can_advance() {
-            advance(state);
-            trace!(attempt=%attempt_id, state=%state.describe(), "State has advanced.");
-            continue 'next_state;
-        }
         // Apply any netdir changes that the state gives us.
         // TODO(eta): Consider deprecating state.is_ready().
         {
@@ -586,6 +585,12 @@ pub(crate) async fn download<R: Runtime>(
             let mut store = dirmgr.store.lock().expect("store lock poisoned");
             dirmgr.apply_netdir_changes(state, &mut **store)?;
             dirmgr.update_progress(attempt_id, state.bootstrap_progress());
+        }
+        // Skip the downloads if we can...
+        if state.can_advance() {
+            advance(state);
+            trace!(attempt=%attempt_id, state=%state.describe(), "State has advanced.");
+            continue 'next_state;
         }
         if state.is_ready(Readiness::Complete) {
             trace!(attempt=%attempt_id, state=%state.describe(), "Directory is now Complete.");
@@ -631,8 +636,7 @@ pub(crate) async fn download<R: Runtime>(
                 futures::select_biased! {
                     outcome = download_attempt(&dirmgr, state, parallelism.into(), attempt_id).fuse() => {
                         if let Err(e) = outcome {
-                            // TODO: get warn_report! to support `attempt=%attempt_id`?
-                            warn_report!(e, "Error while downloading (attempt {})", attempt_id);
+                            warn_report!(e, attempt=%attempt_id, "Error while downloading.");
                             propagate_fatal_errors!(Err(e));
                             continue 'next_attempt;
                         } else {
@@ -736,8 +740,8 @@ mod test {
     use super::*;
     use crate::storage::DynStore;
     use crate::test::new_mgr;
-    use crate::DownloadSchedule;
     use std::sync::Mutex;
+    use tor_dircommon::retry::DownloadSchedule;
     use tor_netdoc::doc::microdesc::MdDigest;
     use tor_rtcompat::SleepProvider;
 

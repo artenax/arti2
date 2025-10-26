@@ -155,6 +155,9 @@ impl<'a> fmt::Display for FcDisp<'a> {
         let mut first = true;
         let mut found_any_rejected = false;
         for (c, r) in counts.iter().zip(restrictions) {
+            if c.n_rejected == 0 {
+                continue;
+            }
             if let Some(desc) = r.restriction.rejection_description() {
                 if first {
                     first = false;
@@ -417,8 +420,8 @@ mod test {
 
     use super::*;
     use crate::{
-        testing::{cfg, split_netdir, testnet},
         RelaySelectionConfig, TargetPort,
+        testing::{cfg, split_netdir, testnet},
     };
 
     #[test]
@@ -510,7 +513,7 @@ mod test {
         let (_, si) = sel.select_relay(&mut rng, &nd);
         assert_eq!(
             si.to_string(),
-            "Success: rejected 12/40 as useless for middle relay; 1/28 as already selected"
+            "Success: rejected 12/40 as not usable as middle relay; 1/28 as already selected"
         );
 
         // Now try failing.
@@ -524,7 +527,7 @@ mod test {
         assert!(r_none.is_none());
         assert_eq!(
             si.to_string(),
-            "Failed: rejected 40/40 as not exiting to desired ports; 0/0 as already selected"
+            "Failed: rejected 40/40 as not exiting to desired ports"
         );
     }
 
@@ -556,9 +559,11 @@ mod test {
         sel.mark_exclusion_flexible();
         let (r_some, si) = sel.select_relay(&mut rng, &nd);
         assert!(r_some.is_some());
-        assert_eq!(si.to_string(), "Failed at first, then succeeded. At first, rejected 12/40 as useless for middle relay; \
+        assert_eq!(
+            si.to_string(),
+            "Failed at first, then succeeded. At first, rejected 12/40 as not usable as middle relay; \
                                     28/28 as in same family as already selected. \
-                                    After relaxing requirements, rejected 12/40 as useless for middle relay; \
-                                    0/28 as in same family as already selected");
+                                    After relaxing requirements, rejected 12/40 as not usable as middle relay"
+        );
     }
 }

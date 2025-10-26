@@ -1,6 +1,6 @@
 //! Entry points for use with async_std runtimes.
 pub use crate::impls::async_std::create_runtime as create_runtime_impl;
-use crate::{compound::CompoundRuntime, RealCoarseTimeProvider, ToplevelBlockOn};
+use crate::{RealCoarseTimeProvider, ToplevelBlockOn, compound::CompoundRuntime};
 use std::io::Result as IoResult;
 
 #[cfg(feature = "native-tls")]
@@ -165,7 +165,7 @@ impl AsyncStdRustlsRuntime {
     }
 }
 
-#[cfg(not(miri))] // async_ztd startup seems to fail under miri
+#[cfg(not(miri))] // async_std startup seems to fail under miri.
 #[cfg(test)]
 mod test {
     // @@ begin test lint list maintained by maint/add_warning @@

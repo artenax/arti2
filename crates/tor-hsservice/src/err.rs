@@ -251,9 +251,15 @@ pub enum FatalError {
     MissingField(#[from] derive_builder::UninitializedFieldError),
 
     /// Invalid restricted discovery configuration.
-    #[error("Restricted discovery is enabled, but no authorized clients are configured. Service will be unreachable")]
+    #[error(
+        "Restricted discovery is enabled, but no authorized clients are configured. Service will be unreachable"
+    )]
     #[cfg(feature = "restricted-discovery")]
     RestrictedDiscoveryNoClients,
+
+    /// Descriptor was too long to upload
+    #[error("HsDesc was too large to upload: try fewer authorized clients or introduction points")]
+    HsDescTooLong,
 
     /// An error caused by a programming issue . or a failure in another
     /// library that we can't work around.
@@ -287,6 +293,7 @@ impl HasKind for FatalError {
             FE::MissingField(_) => EK::BadApiUsage,
             #[cfg(feature = "restricted-discovery")]
             FE::RestrictedDiscoveryNoClients => EK::InvalidConfig,
+            FE::HsDescTooLong => EK::InvalidConfig,
             FE::Bug(e) => e.kind(),
         }
     }
@@ -319,8 +326,8 @@ pub(crate) enum StateExpiryError {
 
 impl HasKind for StateExpiryError {
     fn kind(&self) -> ErrorKind {
-        use tor_error::ErrorKind as EK;
         use StateExpiryError as SEE;
+        use tor_error::ErrorKind as EK;
         match self {
             SEE::Key(e) => e.kind(),
             SEE::ReplayLog { .. } => EK::PersistentStateAccessFailed,

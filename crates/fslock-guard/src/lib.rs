@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 use std::path::Path;
@@ -120,10 +121,7 @@ impl LockFileGuard {
         if os::lockfile_has_path(&self.locked, path)? {
             std::fs::remove_file(path)
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                MismatchedPathError {},
-            ))
+            Err(std::io::Error::other(MismatchedPathError {}))
         }
     }
 }
@@ -262,7 +260,7 @@ mod os {
 #[cfg(windows)]
 mod os {
     use std::{fs::File, mem::MaybeUninit, os::windows::io::AsRawHandle, path::Path};
-    use winapi::um::fileapi::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION as Info};
+    use winapi::um::fileapi::{BY_HANDLE_FILE_INFORMATION as Info, GetFileInformationByHandle};
 
     /// Return true if `lf` currently exists with the given `path`, and false otherwise.
     pub(crate) fn lockfile_has_path(lf: &fslock::LockFile, path: &Path) -> std::io::Result<bool> {

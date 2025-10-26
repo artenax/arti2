@@ -4,7 +4,7 @@ use std::num::NonZeroU16;
 
 use crate::chancell::{BoxedCellBody, CELL_DATA_LEN};
 use derive_deftly::Deftly;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use tor_bytes::{EncodeError, EncodeResult, Error, Result};
 use tor_bytes::{Reader, Writer};
 use tor_error::internal;
@@ -16,6 +16,8 @@ use rand::{CryptoRng, Rng};
 #[cfg(feature = "conflux")]
 pub mod conflux;
 pub mod extend;
+mod extlist;
+pub mod flow_ctrl;
 #[cfg(feature = "hs")]
 pub mod hs;
 pub mod msg;
@@ -99,6 +101,11 @@ caret_int! {
         PADDING_NEGOTIATE = 41,
         /// Padding: reply to a PADDING_NEGOTIATE
         PADDING_NEGOTIATED = 42,
+
+        /// Flow control: rate update (transmit off)
+        XOFF = 43,
+        /// Flow control: rate update (transmit on with rate limit)
+        XON = 44,
     }
 }
 
@@ -108,14 +115,20 @@ enum StreamIdReq {
     WantNone,
     /// Can only be used with a stream ID that isn't 0
     WantSome,
-    /// Can be used with any stream ID
+    /// Can be used with any stream ID.
+    ///
+    /// This result is impossible with `RelayCellFormat::V1`.
     Any,
+    /// Unrecognized; might be used with a stream ID or without.
+    Unrecognized,
 }
 
 impl RelayCmd {
     /// Check whether this command requires a certain kind of
-    /// StreamId, and return a corresponding StreamIdReq.
-    fn expects_streamid(self) -> StreamIdReq {
+    /// StreamId in the provided `format`, and return a corresponding StreamIdReq.
+    ///
+    /// If `format` is None, return a result that is correct for _any_ version.
+    fn expects_streamid(self, format: Option<RelayCellFormat>) -> StreamIdReq {
         match self {
             RelayCmd::BEGIN
             | RelayCmd::DATA
@@ -123,8 +136,13 @@ impl RelayCmd {
             | RelayCmd::CONNECTED
             | RelayCmd::RESOLVE
             | RelayCmd::RESOLVED
-            | RelayCmd::BEGIN_DIR => StreamIdReq::WantSome,
-            #[cfg(feature = "experimental-udp")]
+            | RelayCmd::BEGIN_DIR
+            | RelayCmd::XOFF
+            | RelayCmd::XON => StreamIdReq::WantSome,
+            // NOTE: Even when a RelayCmd is not implemented (like these UDP-based commands),
+            // we need to implement expects_streamid() unconditionally.
+            // Otherwise we leak more information than necessary
+            // when parsing RelayCellFormat::V1 cells.
             RelayCmd::CONNECT_UDP | RelayCmd::CONNECTED_UDP | RelayCmd::DATAGRAM => {
                 StreamIdReq::WantSome
             }
@@ -148,17 +166,32 @@ impl RelayCmd {
             | RelayCmd::INTRO_ESTABLISHED
             | RelayCmd::RENDEZVOUS_ESTABLISHED
             | RelayCmd::INTRODUCE_ACK => StreamIdReq::WantNone,
-            RelayCmd::SENDME => StreamIdReq::Any,
-            _ => StreamIdReq::Any,
+            RelayCmd::SENDME => match format {
+                // There are no stream-level SENDMES in V1, since CC is mandatory.
+                // Further, the 'Any' result is not possible with V1, since
+                // we need be able to decide whether a stream ID is present
+                // from the value of the command.
+                Some(RelayCellFormat::V1) => StreamIdReq::WantNone,
+                // In V0, CC is not mandatory, so stream-level SENDMES are possible.
+                Some(RelayCellFormat::V0) => StreamIdReq::Any,
+                // When we're checking for general compatibility, we need to allow V0 or V1.
+                None => StreamIdReq::Any,
+            },
+            _ => StreamIdReq::Unrecognized,
         }
     }
     /// Return true if this command is one that accepts the particular
-    /// stream ID `id`
+    /// stream ID `id`.
+    ///
+    /// Note that this method does not consider the [`RelayCellFormat`] in use:
+    /// it will return "true" for _any_ stream ID if the command is `SENDME`,
+    /// and if the command is unrecognized.
     pub fn accepts_streamid_val(self, id: Option<StreamId>) -> bool {
-        match self.expects_streamid() {
+        match self.expects_streamid(None) {
             StreamIdReq::WantNone => id.is_none(),
             StreamIdReq::WantSome => id.is_some(),
             StreamIdReq::Any => true,
+            StreamIdReq::Unrecognized => true,
         }
     }
 }
@@ -220,47 +253,11 @@ impl StreamId {
 pub enum RelayCellFormat {
     /// This is the "legacy" pre-prop340 format. No packing or fragmentation.
     V0,
-}
-
-/// Specifies a relay cell format and associated types.
-pub trait RelayCellFormatTrait {
-    /// Which format this object is for.
-    const FORMAT: RelayCellFormat;
-    /// A `RelayCellFields` type for this format.
-    type FIELDS: RelayCellFields;
-    // TODO: Consider making a trait for the decoder as well and adding the
-    // corresponding associated type here.
-}
-
-/// Format type corresponding to `RelayCellFormat::V0`.
-#[non_exhaustive]
-pub struct RelayCellFormatV0;
-
-impl RelayCellFormatTrait for RelayCellFormatV0 {
-    const FORMAT: RelayCellFormat = RelayCellFormat::V0;
-    type FIELDS = RelayCellFieldsV0;
-}
-
-/// Specifies field layout for a particular relay cell format.
-pub trait RelayCellFields {
-    /// The range containing the `recognized` field, within a relay cell's body.
-    const RECOGNIZED_RANGE: std::ops::Range<usize>;
-    /// The range containing the `digest` field, within a relay cell's body.
-    const DIGEST_RANGE: std::ops::Range<usize>;
-    /// A static array of zeroes of the same size as this format uses for the
-    /// digest field. e.g. this enables updating a comparison-digest in one
-    /// hash-update method call, instead of having to loop over `DIGEST_RANGE`.
-    const EMPTY_DIGEST: &'static [u8];
-}
-
-/// Specifies fields for `RelayCellFormat::V0`.
-#[non_exhaustive]
-pub struct RelayCellFieldsV0;
-
-impl RelayCellFields for RelayCellFieldsV0 {
-    const RECOGNIZED_RANGE: std::ops::Range<usize> = 1..3;
-    const DIGEST_RANGE: std::ops::Range<usize> = 5..9;
-    const EMPTY_DIGEST: &'static [u8] = &[0, 0, 0, 0];
+    /// A "transitional" format for use with Counter Galois Onion encryption.
+    ///
+    /// It provides a 16-byte tag field, and a simplified layout for the rest of
+    /// the cell.
+    V1,
 }
 
 /// Internal decoder state.
@@ -268,6 +265,8 @@ impl RelayCellFields for RelayCellFieldsV0 {
 enum RelayCellDecoderInternal {
     /// Internal state for `RelayCellFormat::V0`
     V0,
+    /// Internal state for `RelayCellFormat::V1`
+    V1,
 }
 
 // TODO prop340: We should also fuzz RelayCellDecoder, but not in this fuzzer.
@@ -287,6 +286,9 @@ impl RelayCellDecoder {
             RelayCellFormat::V0 => Self {
                 internal: RelayCellDecoderInternal::V0,
             },
+            RelayCellFormat::V1 => Self {
+                internal: RelayCellDecoderInternal::V1,
+            },
         }
     }
     /// Parse a RELAY or RELAY_EARLY cell body.
@@ -294,22 +296,24 @@ impl RelayCellDecoder {
     /// Requires that the cryptographic checks on the message have already been
     /// performed
     pub fn decode(&mut self, cell: BoxedCellBody) -> Result<RelayCellDecoderResult> {
-        match &self.internal {
-            RelayCellDecoderInternal::V0 => Ok(RelayCellDecoderResult {
-                msgs: smallvec![UnparsedRelayMsg {
-                    internal: UnparsedRelayMsgInternal::V0(cell)
-                }],
-                incomplete: None,
-            }),
-        }
+        let msg_internal = match &self.internal {
+            RelayCellDecoderInternal::V0 => UnparsedRelayMsgInternal::V0(cell),
+            RelayCellDecoderInternal::V1 => UnparsedRelayMsgInternal::V1(cell),
+        };
+        Ok(RelayCellDecoderResult {
+            msgs: smallvec![UnparsedRelayMsg {
+                internal: msg_internal
+            }],
+            incomplete: None,
+        })
     }
     /// Returns the `IncompleteRelayMsgInfo` describing the partial
     /// (fragmented) relay message at the end of the so-far-processed relay cell
     /// stream.
     pub fn incomplete_info(&self) -> Option<IncompleteRelayMsgInfo> {
         match &self.internal {
-            // V0 doesn't support fragmentation, so there is never a pending fragment.
-            RelayCellDecoderInternal::V0 => None,
+            // V0 and V1 don't support fragmentation, so there is never a pending fragment.
+            RelayCellDecoderInternal::V0 | RelayCellDecoderInternal::V1 => None,
         }
     }
 }
@@ -359,6 +363,17 @@ impl RelayCellDecoderResult {
     ///   previous one.
     pub fn incomplete_info(&self) -> Option<IncompleteRelayMsgInfo> {
         self.incomplete.clone()
+    }
+
+    /// Return true if this consists of nothing but padding.
+    pub fn is_padding(&self) -> bool {
+        // If all the messages we have are padding...
+        self.msgs.iter().all(|m| m.cmd() == RelayCmd::DROP) &&
+            // ... and any pending incomplete message is either absent or is padding...
+            self.incomplete
+                .as_ref()
+                .is_none_or(|incomplete| incomplete.cmd() == RelayCmd::DROP)
+        // ... then this is padding.
     }
 }
 
@@ -412,10 +427,15 @@ enum UnparsedRelayMsgInternal {
     // It *is* a bit ugly to have to encode so much knowledge about the format in
     // different functions here, but that information shouldn't leak out of this module.
     V0(BoxedCellBody),
+
+    /// For `V1` we can also avoid copies, since there is still exactly one
+    /// relay message per cell.
+    V1(BoxedCellBody),
 }
 
 /// An enveloped relay message that has not yet been fully parsed, but where we
-/// have access to the command and stream ID, for dispatching purposes.
+/// have access to the command, stream ID, and payload data length for dispatching
+/// and congestion control purposes.
 #[derive(Clone, Debug, Deftly)]
 #[derive_deftly(HasMemoryCost)]
 pub struct UnparsedRelayMsg {
@@ -423,8 +443,73 @@ pub struct UnparsedRelayMsg {
     internal: UnparsedRelayMsgInternal,
 }
 
-/// Position of the stream ID within the cell body.
-const STREAM_ID_OFFSET: usize = 3;
+/// Const helper to find the min between three u16 values.
+const fn min(a: u16, b: u16, c: u16) -> u16 {
+    const fn min_2(a: u16, b: u16) -> u16 {
+        if a < b { a } else { b }
+    }
+    min_2(a, min_2(b, c))
+}
+
+/// Const helper to find the max between three u16 values.
+const fn max(a: u16, b: u16, c: u16) -> u16 {
+    const fn max_2(a: u16, b: u16) -> u16 {
+        if a > b { a } else { b }
+    }
+    max_2(a, max_2(b, c))
+}
+
+/// Position of the stream ID within the V0 cell body.
+const STREAM_ID_OFFSET_V0: usize = 3;
+
+/// Position of the stream ID within the V1 cell body, if it is present.
+const STREAM_ID_OFFSET_V1: usize = 16 + 1 + 2; // tag, command, length.
+
+/// Position of the payload data length within the V0 cell body.
+const LENGTH_OFFSET_V0: usize = 1 + 2 + 2 + 4; // command, recognized, stream_id, digest.
+
+/// Position of the payload data length within the V1 cell body.
+const LENGTH_OFFSET_V1: usize = 16 + 1; // tag, command.
+
+/// Position of the payload data within the V0 cell body.
+const PAYLOAD_OFFSET_V0: usize = LENGTH_OFFSET_V0 + 2; // (everything before length), length.
+
+/// Position of the payload data within the V1 cell body, when not including a stream ID.
+const PAYLOAD_OFFSET_V1_WITHOUT_STREAM_ID: usize = LENGTH_OFFSET_V1 + 2; // (everything before length), length.
+
+/// Position of the payload data within the V1 cell body, when including a stream ID.
+const PAYLOAD_OFFSET_V1_WITH_STREAM_ID: usize = LENGTH_OFFSET_V1 + 2 + 2; // (everything before length), length, stream_id.
+
+/// Max amount of payload data that can be stored in a V0 cell body.
+const PAYLOAD_MAX_SIZE_V0: u16 = BODY_MAX_LEN_V0 - (PAYLOAD_OFFSET_V0 as u16);
+
+/// Max amount of payload data that can be stored in a V1 cell body, when not including a stream ID.
+const PAYLOAD_MAX_SIZE_V1_WITHOUT_STREAM_ID: u16 =
+    BODY_MAX_LEN_V1 - (PAYLOAD_OFFSET_V1_WITHOUT_STREAM_ID as u16);
+
+/// Max amount of payload data that can be stored in a V1 cell body, when including a stream ID.
+const PAYLOAD_MAX_SIZE_V1_WITH_STREAM_ID: u16 =
+    BODY_MAX_LEN_V1 - (PAYLOAD_OFFSET_V1_WITH_STREAM_ID as u16);
+
+/// The maximum length of a V0 cell message body.
+const BODY_MAX_LEN_V0: u16 = 509;
+
+/// The maximum length of a V1 cell message body.
+const BODY_MAX_LEN_V1: u16 = 509;
+
+/// The maximum amount of payload data that can fit within all cell body types.
+pub const PAYLOAD_MAX_SIZE_ALL: u16 = min(
+    PAYLOAD_MAX_SIZE_V0,
+    PAYLOAD_MAX_SIZE_V1_WITH_STREAM_ID,
+    PAYLOAD_MAX_SIZE_V1_WITHOUT_STREAM_ID,
+);
+
+/// The maximum amount of payload data that can fit within any cell body type.
+pub const PAYLOAD_MAX_SIZE_ANY: u16 = max(
+    PAYLOAD_MAX_SIZE_V0,
+    PAYLOAD_MAX_SIZE_V1_WITH_STREAM_ID,
+    PAYLOAD_MAX_SIZE_V1_WITHOUT_STREAM_ID,
+);
 
 impl UnparsedRelayMsg {
     /// Wrap a BoxedCellBody as an UnparsedRelayMsg.
@@ -459,8 +544,13 @@ impl UnparsedRelayMsg {
     pub fn cmd(&self) -> RelayCmd {
         match &self.internal {
             UnparsedRelayMsgInternal::V0(body) => {
-                /// Position of the command within the cell body.
+                /// Position of the command within the v0 cell body.
                 const CMD_OFFSET: usize = 0;
+                body[CMD_OFFSET].into()
+            }
+            UnparsedRelayMsgInternal::V1(body) => {
+                /// Position of the command within the v1 body.
+                const CMD_OFFSET: usize = 16;
                 body[CMD_OFFSET].into()
             }
         }
@@ -469,11 +559,55 @@ impl UnparsedRelayMsg {
     pub fn stream_id(&self) -> Option<StreamId> {
         match &self.internal {
             UnparsedRelayMsgInternal::V0(body) => StreamId::new(u16::from_be_bytes(
-                body[STREAM_ID_OFFSET..STREAM_ID_OFFSET + 2]
+                body[STREAM_ID_OFFSET_V0..STREAM_ID_OFFSET_V0 + 2]
                     .try_into()
                     .expect("two-byte slice was not two bytes long!?"),
             )),
+            UnparsedRelayMsgInternal::V1(body) => {
+                match self.cmd().expects_streamid(Some(RelayCellFormat::V1)) {
+                    StreamIdReq::WantNone => None,
+                    StreamIdReq::Unrecognized | StreamIdReq::Any => None,
+                    StreamIdReq::WantSome => StreamId::new(u16::from_be_bytes(
+                        body[STREAM_ID_OFFSET_V1..STREAM_ID_OFFSET_V1 + 2]
+                            .try_into()
+                            .expect("two-byte slice was not two bytes long!?"),
+                    )),
+                }
+            }
         }
+    }
+    /// Return the "length" field of a data cell, or 0 if not a data cell.
+    ///
+    /// This is the size of the cell data (the "data" field), not the size of the cell.
+    ///
+    /// If the field value is invalid (for example >509 for V0 cells), an error will be returned.
+    pub fn data_len(&self) -> Result<u16> {
+        if self.cmd() != RelayCmd::DATA {
+            return Ok(0);
+        }
+
+        let bytes: [u8; 2] = match &self.internal {
+            UnparsedRelayMsgInternal::V0(body) => &body[LENGTH_OFFSET_V0..LENGTH_OFFSET_V0 + 2],
+            UnparsedRelayMsgInternal::V1(body) => &body[LENGTH_OFFSET_V1..LENGTH_OFFSET_V1 + 2],
+        }
+        .try_into()
+        .expect("two-byte slice was not two bytes long!?");
+
+        let len = u16::from_be_bytes(bytes);
+
+        let max = match &self.internal {
+            UnparsedRelayMsgInternal::V0(_body) => BODY_MAX_LEN_V0,
+            UnparsedRelayMsgInternal::V1(_body) => BODY_MAX_LEN_V1,
+        };
+
+        if len > max {
+            // TODO: This error value isn't quite right as it has the error message "object length
+            // too large to represent as usize", which isn't what we're checking here.
+            // But it wouldn't make sense to add a different but similar variant to `Error`.
+            return Err(Error::BadLengthValue);
+        }
+
+        Ok(len)
     }
     /// Decode this unparsed cell into a given cell type.
     pub fn decode<M: RelayMsg>(self) -> Result<RelayMsgOuter<M>> {
@@ -481,6 +615,10 @@ impl UnparsedRelayMsg {
             UnparsedRelayMsgInternal::V0(body) => {
                 let mut reader = Reader::from_slice(body.as_ref());
                 RelayMsgOuter::decode_v0_from_reader(&mut reader)
+            }
+            UnparsedRelayMsgInternal::V1(body) => {
+                let mut reader = Reader::from_slice(body.as_ref());
+                RelayMsgOuter::decode_v1_from_reader(&mut reader)
             }
         }
     }
@@ -556,12 +694,21 @@ impl<M: RelayMsg> RelayMsgOuter<M> {
     }
     /// Consume this relay message and encode it as a 509-byte padded cell
     /// body.
-    pub fn encode<R: Rng + CryptoRng>(self, rng: &mut R) -> crate::Result<BoxedCellBody> {
+    //
+    // TODO prop340: This API won't work for packed or fragmented messages.
+    pub fn encode<R: Rng + CryptoRng>(
+        self,
+        format: RelayCellFormat,
+        rng: &mut R,
+    ) -> crate::Result<BoxedCellBody> {
         /// We skip this much space before adding any random padding to the
         /// end of the cell
         const MIN_SPACE_BEFORE_PADDING: usize = 4;
 
-        let (mut body, enc_len) = self.encode_to_cell()?;
+        let (mut body, enc_len) = match format {
+            RelayCellFormat::V0 => self.encode_to_cell_v0()?,
+            RelayCellFormat::V1 => self.encode_to_cell_v1()?,
+        };
         debug_assert!(enc_len <= CELL_DATA_LEN);
         if enc_len < CELL_DATA_LEN - MIN_SPACE_BEFORE_PADDING {
             rng.fill_bytes(&mut body[enc_len + MIN_SPACE_BEFORE_PADDING..]);
@@ -572,46 +719,30 @@ impl<M: RelayMsg> RelayMsgOuter<M> {
 
     /// Consume a relay cell and return its contents, encoded for use
     /// in a RELAY or RELAY_EARLY cell.
-    fn encode_to_cell(self) -> EncodeResult<(BoxedCellBody, usize)> {
+    fn encode_to_cell_v0(self) -> EncodeResult<(BoxedCellBody, usize)> {
         // NOTE: This implementation is a bit optimized, since it happens to
         // literally every relay cell that we produce.
 
         // TODO -NM: Add a specialized implementation for making a DATA cell from
         // a body?
 
-        /// Wrap a BoxedCellBody and implement AsMut<[u8]>
-        struct BodyWrapper(BoxedCellBody);
-        impl AsMut<[u8]> for BodyWrapper {
-            fn as_mut(&mut self) -> &mut [u8] {
-                self.0.as_mut()
-            }
-        }
         /// The position of the length field within a relay cell.
         const LEN_POS: usize = 9;
         /// The position of the body a relay cell.
         const BODY_POS: usize = 11;
 
-        let body = BodyWrapper(Box::new([0_u8; 509]));
+        let body = BodyWrapper(Box::new([0_u8; BODY_MAX_LEN_V0 as usize]));
 
         let mut w = crate::slicewriter::SliceWriter::new(body);
         w.write_u8(self.msg.cmd().into());
         w.write_u16(0); // "Recognized"
-        debug_assert_eq!(
-            w.offset().expect("Overflowed a cell with just the header!"),
-            STREAM_ID_OFFSET
-        );
+        w.assert_offset_is(STREAM_ID_OFFSET_V0);
         w.write_u16(StreamId::get_or_zero(self.streamid));
         w.write_u32(0); // Digest
-                        // (It would be simpler to use NestedWriter at this point, but it uses an internal Vec that we are trying to avoid.)
-        debug_assert_eq!(
-            w.offset().expect("Overflowed a cell with just the header!"),
-            LEN_POS
-        );
+        // (It would be simpler to use NestedWriter at this point, but it uses an internal Vec that we are trying to avoid.)
+        w.assert_offset_is(LEN_POS);
         w.write_u16(0); // Length.
-        debug_assert_eq!(
-            w.offset().expect("Overflowed a cell with just the header!"),
-            BODY_POS
-        );
+        w.assert_offset_is(BODY_POS);
         self.msg.encode_onto(&mut w)?; // body
         let (mut body, written) = w.try_unwrap().map_err(|_| {
             EncodeError::Bug(internal!(
@@ -621,6 +752,56 @@ impl<M: RelayMsg> RelayMsgOuter<M> {
         let payload_len = written - BODY_POS;
         debug_assert!(payload_len < u16::MAX as usize);
         *(<&mut [u8; 2]>::try_from(&mut body.0[LEN_POS..LEN_POS + 2])
+            .expect("Two-byte slice was not two bytes long!?")) =
+            (payload_len as u16).to_be_bytes();
+        Ok((body.0, written))
+    }
+
+    /// Consume a relay cell and return its contents, encoded for use
+    /// in a RELAY or RELAY_EARLY cell.
+    fn encode_to_cell_v1(self) -> EncodeResult<(BoxedCellBody, usize)> {
+        // NOTE: This implementation is a bit optimized, since it happens to
+        // literally every relay cell that we produce.
+        // TODO -NM: Add a specialized implementation for making a DATA cell from
+        // a body?
+
+        /// Position of the length field within the cell.
+        const LEN_POS_V1: usize = 16 + 1; // Skipping tag, command.
+
+        let cmd = self.msg.cmd();
+        let body = BodyWrapper(Box::new([0_u8; BODY_MAX_LEN_V1 as usize]));
+        let mut w = crate::slicewriter::SliceWriter::new(body);
+        w.advance(16); // Tag: 16 bytes
+        w.write_u8(cmd.get()); // Command: 1 byte.
+        w.assert_offset_is(LEN_POS_V1);
+        w.advance(2); //  Length: 2 bytes.
+        let mut body_pos = 16 + 1 + 2;
+        match (
+            cmd.expects_streamid(Some(RelayCellFormat::V1)),
+            self.streamid,
+        ) {
+            (StreamIdReq::WantNone, None) => {}
+            (StreamIdReq::WantSome, Some(id)) => {
+                w.write_u16(id.into());
+                body_pos += 2;
+            }
+            (_, id) => {
+                return Err(EncodeError::Bug(internal!(
+                    "Tried to encode invalid stream ID {id:?} for {cmd}"
+                )));
+            }
+        }
+        w.assert_offset_is(body_pos);
+
+        self.msg.encode_onto(&mut w)?; // body
+        let (mut body, written) = w.try_unwrap().map_err(|_| {
+            EncodeError::Bug(internal!(
+                "Encoding of relay message was too long to fit into a cell!"
+            ))
+        })?;
+        let payload_len = written - body_pos;
+        debug_assert!(payload_len < u16::MAX as usize);
+        *(<&mut [u8; 2]>::try_from(&mut body.0[LEN_POS_V1..LEN_POS_V1 + 2])
             .expect("Two-byte slice was not two bytes long!?")) =
             (payload_len as u16).to_be_bytes();
         Ok((body.0, written))
@@ -660,5 +841,63 @@ impl<M: RelayMsg> RelayMsgOuter<M> {
         r.truncate(len);
         let msg = M::decode_from_reader(cmd, r)?;
         Ok(Self { streamid, msg })
+    }
+
+    /// Parse a `RelayCellFormat::V1` RELAY or RELAY_EARLY cell body into a
+    /// RelayMsgOuter from a reader.
+    ///
+    /// Requires that the cryptographic checks on the message have already been
+    /// performed.
+    fn decode_v1_from_reader(r: &mut Reader<'_>) -> Result<Self> {
+        r.advance(16)?; // Tag
+        let cmd: RelayCmd = r.take_u8()?.into();
+        let len = r.take_u16()?.into();
+        let streamid = match cmd.expects_streamid(Some(RelayCellFormat::V1)) {
+            // If no stream ID is expected, then the body begins immediately.
+            StreamIdReq::WantNone => None,
+            // In this case, a stream ID _is_ expected.
+            //
+            // (If it happens to be zero, we will reject the message,
+            // since zero is never a stream ID.)
+            StreamIdReq::WantSome => Some(StreamId::new(r.take_u16()?).ok_or_else(|| {
+                Error::InvalidMessage(
+                    format!("Zero-valued stream ID with relay command {cmd}").into(),
+                )
+            })?),
+            // We treat an unrecognized command as having no stream ID.
+            //
+            // (Note: This command is truly unrecognized, and not one that we could parse
+            // differently under other circumstances.)
+            //
+            // Note that this enables a destructive fingerprinting opportunity,
+            // where an attacker can learn whether we have a version of Arti that recognizes this
+            // command, at the expense of our killing this circuit immediately if they are wrong.
+            // This is not a very bad attack.
+            //
+            // Note that StreamIdReq::Any should be impossible here, since we're using the V1
+            // format.
+            StreamIdReq::Unrecognized | StreamIdReq::Any => {
+                return Err(Error::InvalidMessage(
+                    format!("Unrecognized relay command {cmd}").into(),
+                ));
+            }
+        };
+        if r.remaining() < len {
+            //
+            return Err(Error::InvalidMessage(
+                "Insufficient data in relay cell".into(),
+            ));
+        }
+        r.truncate(len);
+        let msg = M::decode_from_reader(cmd, r)?;
+        Ok(Self { streamid, msg })
+    }
+}
+
+/// Wrap a BoxedCellBody and implement AsMut<[u8]>, so we can use it with `SliceWriter`.
+struct BodyWrapper(BoxedCellBody);
+impl AsMut<[u8]> for BodyWrapper {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.0.as_mut()
     }
 }

@@ -72,10 +72,55 @@ However, changing the set of Cargo features available can affect this; see
   * If you want to use a runtime with an explicitly chosen backend,
     name its type directly as [`async_std::AsyncStdNativeTlsRuntime`],
     [`async_std::AsyncStdRustlsRuntime`], [`tokio::TokioNativeTlsRuntime`],
-    or [`tokio::TokioRustlsRuntime`]. To construct one of these runtimes,
-    call its `create()` method.  Or if you have already constructed a
+    [`tokio::TokioRustlsRuntime`], [`smol::SmolNativeTlsRuntime`] or [`smol::SmolRustlsRuntime`].
+    To construct one of these runtimes, call its `create()` method.  Or if you have already constructed a
     Tokio runtime that you want to use, you can wrap it as a
     [`Runtime`] explicitly with `current()`.
+
+<div id="do-not-fork">
+
+## `fork` on Unix, threads, and Rust
+
+</div>
+
+Rust is typically not sound in combination with `fork`.
+
+This is mostly because
+(i) if there are any other threads in the program,
+the environment after `fork` (but before any `exec`)
+is extremely restricted and hazardous, and
+(ii) Rust code is allowed to make threads, and often does so.
+
+For this reason, Rust `fork` APIs are always `unsafe`.
+
+Most async runtimes create threads.
+Therefore, for example,
+[Tokio doesn't work if you fork](https://github.com/tokio-rs/tokio/issues/4301).
+
+Therefore:
+
+### Do not `fork` after creating any `Runtime`
+
+After instantiating any `Runtime`, you **must not** fork.
+
+This restriction applies to the *whole process*, and applies
+to forking from Rust, from C, or from any other language.
+You may not fork even after that `Runtime` value has been dropped or shut down.
+
+You may use safe facilities like [`std::process::Command`]
+and [`tokio::process::Command`](tokio_crate::process::Command).
+You may also use C libraries (and facilities in other languages)
+that wrap up fork/exec,
+so long as those facilities are safe to use in the presence of multiple threads
+(even threads that the other language doesn't know about).
+
+You *may* fork and then exec, or fork and then `_exit`,
+but the execution environment between between fork and exec/`_exit`
+is *extremely* restrictive.
+[`std::os::unix::process::CommandExt::pre_exec`] has a summary.
+
+`Runtime`s for which fork without exec is permitted,
+will document that explicitly.
 
 ## Advanced usage: implementing runtimes yourself
 
@@ -96,14 +141,21 @@ for a full example of this.
 Features supported by this crate:
 
 * `tokio` -- build with [Tokio](https://tokio.rs/) support
-* `async-std` -- build with [async-std](https://async.rs/) support
+* `async-std` -- build with [async-std](https://async.rs/) support.
 * `native-tls` --  build with the [native-tls](https://github.com/sfackler/rust-native-tls)
-  crate for TLS support
+  crate for TLS support.
 * `static` -- link the native TLS library statically (enables the `vendored` feature of the
   `native-tls` crate).
-* `rustls` -- build with the [rustls](https://github.com/rustls/rustls) crate for TLS support.  Note that `rustls` uses the `ring` crate, which uses
-   the old (3BSD/SSLEay) OpenSSL license, which may introduce licensing
-   compatibility issues.
+* `rustls` -- build with the [rustls](https://github.com/rustls/rustls) crate for TLS support.
+
+> ⚠️ **Notice for MacOS users:** On MacOS `native-tls` might fail to perform a TLS handshake over a buffered stream due to a known bug.
+> This should not affect any of the arti- or tor- crates, which establish TLS connections between arti/tor instances over unbuffered
+> TCP connections. This will be fixed once `security-framework` 3.5.1 is used by `native-tls`.
+> View issue [#2117](https://gitlab.torproject.org/tpo/core/arti/-/issues/2117) for more details.
+
+### Experimental and unstable features
+* `smol` -- build with [smol](https://github.com/smol-rs/smol) support.
+
 
 By default, *this* crate doesn't enable any features. However, you're almost certainly
 using this as part of the `arti-client` crate, which will enable `tokio` and `native-tls` in
@@ -144,3 +196,5 @@ network, in order to test asynchronous code effectively.
 (See the [`tor-rtmock`] crate for examples.)
 
 License: MIT OR Apache-2.0
+
+[`tor-rtmock`]: https://docs.rs/tor-rtmock/latest/tor_rtmock/

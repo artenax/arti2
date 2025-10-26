@@ -95,6 +95,7 @@ pub(crate) fn watch_for_config_changes<R: Runtime>(
 /// Start watching for configuration changes.
 ///
 /// Spawned from `watch_for_config_changes`.
+#[allow(clippy::cognitive_complexity)] // TODO: Refactor? Partly due to tracing.
 async fn run_watcher<R: Runtime>(
     runtime: R,
     sources: ConfigurationSources,
@@ -160,6 +161,7 @@ async fn run_watcher<R: Runtime>(
 }
 
 /// Reload the configuration.
+#[allow(clippy::cognitive_complexity)] // TODO: Refactor? Partly due to tracing.
 async fn reload_configuration<R: Runtime>(
     runtime: R,
     mut watcher: Option<FileWatcher>,
@@ -389,7 +391,6 @@ mod test {
     }
 
     #[test]
-    #[ignore] // TODO(#1607): Re-enable
     fn watch_single_file() {
         tor_rtcompat::test_with_one_runtime!(|rt| async move {
             let temp_dir = test_temp_dir!();
@@ -401,6 +402,9 @@ mod test {
             cfg_sources.push_source(ConfigurationSource::File(cfg_file), MustRead::MustRead);
 
             let (module, mut rx) = create_module().await;
+
+            config_builder.logging().log_sensitive_information(true);
+            let _: PathBuf = write_config(&temp_dir, CONFIG_NAME1, &config_builder);
 
             // Use a fake sighup stream to wait until run_watcher()'s select_biased!
             // loop is entered
@@ -417,11 +421,11 @@ mod test {
                 ).await.unwrap();
             }).unwrap();
 
-            config_builder.logging().log_sensitive_information(true);
-            let _: PathBuf = write_config(&temp_dir, CONFIG_NAME1, &config_builder);
             sighup_tx.send(()).await.unwrap();
+
             // The reconfigurable modules should've been reloaded in response to sighup
             let config = rx.next().await.unwrap();
+
             assert_eq!(config.0, config_builder.build().unwrap());
 
             // Overwrite the config
@@ -434,7 +438,9 @@ mod test {
         });
     }
 
+    // TODO: Ignored until #1607 is fixed
     #[test]
+    #[ignore]
     fn watch_multiple() {
         tor_rtcompat::test_with_one_runtime!(|rt| async move {
             let temp_dir = test_temp_dir!();

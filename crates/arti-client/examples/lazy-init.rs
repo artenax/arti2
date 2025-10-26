@@ -21,6 +21,7 @@ use futures::io::{AsyncReadExt, AsyncWriteExt};
 use once_cell::sync::OnceCell;
 use tor_rtcompat::PreferredRuntime;
 
+// TODO MSRV TBD: Replace with OnceLock (#1996)
 static TOR_CLIENT: OnceCell<TorClient<PreferredRuntime>> = OnceCell::new();
 
 /// Get a `TorClient` by copying the globally shared client stored in `TOR_CLIENT`.

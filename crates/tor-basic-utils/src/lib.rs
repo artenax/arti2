@@ -1,4 +1,4 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg, doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 // @@ begin lint list maintained by maint/add_warning @@
 #![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
@@ -41,6 +41,7 @@
 #![allow(clippy::result_large_err)] // temporary workaround for arti#587
 #![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
 #![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
 //! <!-- @@ end lint list maintained by maint/add_warning @@ -->
 
 use std::collections::BinaryHeap;
@@ -53,6 +54,7 @@ use std::time::Duration;
 pub mod iter;
 pub mod n_key_list;
 pub mod n_key_set;
+pub mod rand_hostname;
 pub mod rangebounds;
 pub mod retry;
 pub mod test_rng;
@@ -588,6 +590,40 @@ macro_rules! derive_serde_raw { {
         $($body)*
     }
 } }
+
+// ----------------------------------------------------------------------
+
+/// Flatten a `Result<Result<T, E>, E>` into a `Result<T, E>`.
+///
+/// See [`Result::flatten`], which is not available
+/// at our current MSRV.
+// TODO MSRV 1.89: When our MSRV is at least 1.89,
+// remove this function and replace uses with `Result::flatten`.
+pub fn flatten<T, E>(x: Result<Result<T, E>, E>) -> Result<T, E> {
+    match x {
+        Ok(Ok(x)) => Ok(x),
+        Err(e) | Ok(Err(e)) => Err(e),
+    }
+}
+
+// ----------------------------------------------------------------------
+
+/// Asserts that the type of the expression implements the given trait.
+///
+/// Example:
+///
+/// ```
+/// # use tor_basic_utils::assert_val_impl_trait;
+/// let x: u32 = 0;
+/// assert_val_impl_trait!(x, Clone);
+/// ```
+#[macro_export]
+macro_rules! assert_val_impl_trait {
+    ($check:expr, $trait:path $(,)?) => {{
+        fn ensure_trait<T: $trait>(_s: &T) {}
+        ensure_trait(&$check);
+    }};
+}
 
 // ----------------------------------------------------------------------
 

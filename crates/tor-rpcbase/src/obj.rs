@@ -345,7 +345,7 @@ define_derive_deftly! {
                 // of CastTables: one for each instantiation of the type.
                 // Therefore we keep a mutable add-only HashMap of CastTables.
 
-                use $crate::once_cell::sync::Lazy;
+                use std::sync::LazyLock;
                 use std::sync::RwLock;
                 use std::collections::HashMap;
                 use std::any::TypeId;
@@ -360,8 +360,8 @@ define_derive_deftly! {
                 // In order to get a `&'static`, we need to use Box::leak().
                 // That's fine, since we only create one CastTable per
                 // instantiation of the type.
-                static TABLES: Lazy<RwLock<HashMap<TypeId, &'static $crate::CastTable>>> =
-                Lazy::new(|| RwLock::new(HashMap::new()));
+                static TABLES: LazyLock<RwLock<HashMap<TypeId, &'static $crate::CastTable>>> =
+                LazyLock::new(|| RwLock::new(HashMap::new()));
                 {
                     let tables_r = TABLES.read().expect("poisoned lock");
                     if let Some(table) = tables_r.get(&TypeId::of::<Self>()) {
@@ -383,8 +383,8 @@ define_derive_deftly! {
             } else {
                 // For non-generic types, we only ever have a single CastTable,
                 // so we can just construct it once and return it.
-                use $crate::once_cell::sync::Lazy;
-                static TABLE: Lazy<$crate::CastTable> = Lazy::new(|| $ttype::make_cast_table());
+                use std::sync::LazyLock;
+                static TABLE: LazyLock<$crate::CastTable> = LazyLock::new(|| $ttype::make_cast_table());
                 &TABLE
             }}
         }
@@ -424,7 +424,7 @@ mod test {
         }
     }
 
-    #[derive(Deftly)]
+    #[derive(Deftly, Default)]
     #[derive_deftly(Object)]
     struct Opossum {}
 
@@ -478,11 +478,20 @@ mod test {
         assert!(Arc::ptr_eq(&err_arc, &erased_arc_bytes));
     }
 
-    #[derive(Deftly)]
+    #[derive(Deftly, Default)]
     #[derive_deftly(Object)]
     #[deftly(rpc(delegate_with = "|cage: &Self| Some(cage.possum.clone())"))]
     #[deftly(rpc(delegate_type = "Opossum"))]
     struct PossumCage {
         possum: Arc<Opossum>,
     }
+
+    // #[allow(unused)] isn't effective for `make_cast_table` because the d-d macro doesn't
+    // pass it through.  We don't want to add #[allow(unused)] in the macro, because (I think)
+    // `make_cast_table` being unused is indeed telling us that we haven't registered any
+    // method impls for this object.
+    const _: fn() = || {
+        // closure gives us a non-context in which to call ::default()
+        let _: &dyn Object = &PossumCage::default();
+    };
 }

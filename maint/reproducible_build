@@ -9,7 +9,7 @@ if [ ! -f /.dockerenv ]; then
     echo Use docker_reproducible_build instead to get the right environment
 fi
 if [ $# -eq 0 ]; then
-	echo usage : "$0" '<linux|windows|macos...>'
+	echo usage : "$0" '<linux|windows|macos|android...>'
 	exit 1
 fi
 
@@ -18,11 +18,13 @@ fi
 linux=""
 windows=""
 macos=""
+android=""
 while [ "$#" -ne 0 ]; do
 	case "$1" in
 	linux)   linux=1;;
 	windows) windows=1;;
 	macos)   macos=1;;
+	android) android=1;;
 	*)
 		echo "unknown target : $1" >&2
 		exit 1;;
@@ -36,35 +38,30 @@ here=$(pwd)
 ## the architecture was chosen as old enough that it should cover most usage
 ## while still supporting useful features like AES-NI. Older architectures
 ## won't be able to execute the resulting binary.
-export CFLAGS="-march=westmere"
-export RUSTFLAGS="-C target-cpu=westmere"
+if [ -z $android ]; then
+  export CFLAGS="-march=westmere"
+  export RUSTFLAGS="-C target-cpu=westmere"
+fi
+export SOURCE_DATE_EPOCH="0"
 
 ## force build to run in a fixed location. Necessary because the build path
 ## is somehow captured when compiling.
 cp -a "$here" /arti
 cd /arti
 
-## FIXME: This is a workaround for:
-## https://gitlab.torproject.org/tpo/core/arti/-/issues/1335
-##
-## Since 'native-tls' >= 0.2.14 only builds on rust >= 1.80,
-## and we can't use newer rust versions due to arti#1335,
-## we need to downgrade 'native-tls'.
-## (And similar for other libs.)
-$CARGO update -p native-tls --precise 0.2.13
-$CARGO update -p zerofrom --precise 0.1.5
-$CARGO update -p litemap --precise 0.7.4
-$CARGO update -p tinystr:0.8.1 --precise 0.8.0
-
 cargo_build () {
 	$CARGO build --locked "$@"
 }
 cargo_build_arti () {
-	cargo_build -p arti --release --features static "$@"
+	cargo_build -p arti --release --features full,static "$@"
 }
 
-## add missing dependencies
-apk add perl make git musl-dev
+echo "android: '$android'"
+if [ -z $android ]; then
+  ## add missing dependencies
+  apk add perl make git musl-dev
+fi
+
 if [ -n "$linux" ]; then
 	## no additional dependencies specifically for Linux
 
@@ -73,6 +70,14 @@ if [ -n "$linux" ]; then
 	## to system libraries. It is required to get a well behaving result.
 	cargo_build_arti --target x86_64-unknown-linux-musl
 	mv /arti/target/x86_64-unknown-linux-musl/release/arti "$here"/arti-linux
+fi
+if [ -n "$android" ]; then
+  cargo ndk --target aarch64-linux-android build --locked -p arti --release --features full,static
+  mv target/aarch64-linux-android/release/arti "$here"/arti-android-aarch64
+  "$ANDROID_NDK_ROOT"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip "$here"/arti-android-aarch64
+  cargo ndk --target armv7-linux-androideabi build --locked -p arti --release --features full,static
+  mv target/armv7-linux-androideabi/release/arti "$here"/arti-android-armv7
+  "$ANDROID_NDK_ROOT"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip "$here"/arti-android-armv7
 fi
 if [ -n "$windows" ]; then
 	apk add mingw-w64-gcc
@@ -91,7 +96,7 @@ if [ -n "$macos" ]; then
 	# (note: "ar" seems to be unused here. We could probably remove it?)
 	cat > .cargo/config << EOF
 [target.x86_64-apple-darwin]
-linker = "x86_64-apple-darwin16-clang"
+linker = "x86_64-apple-darwin16-clang++-stdc++"
 ar = "x86_64-apple-darwin16-ar"
 EOF
 	OSX_SDK_URL=https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX10.12.sdk.tar.xz
@@ -106,9 +111,12 @@ EOF
 		wget -nc "${OSX_SDK_URL}" -O tarballs/${OSX_SDK}
 		echo "${OSX_SDK_SHA256}  tarballs/${OSX_SDK}" > ./sdk-checksum
 		sha256sum -c ./sdk-checksum
+		# Lingering mystery: If I change this 10.7
+		# (and the occurrence of 10.7 below) to 10.12, the build fails with
+		# "cannot find libc++ headers" again.
 		UNATTENDED=yes OSX_VERSION_MIN=10.7 ./build.sh
 		# copy it to gitlab build-dir so it may get cached
-		cp -r /arti/osxcross "$here"
+		cp -R /arti/osxcross "$here"
 		cd ..
 	fi
 
@@ -126,5 +134,6 @@ set +x
 echo "branch       :" "$(git rev-parse --abbrev-ref HEAD)"
 echo "commit       :" "$(git rev-parse HEAD)"
 [ -z "$linux" ]   || echo "Linux hash   :" "$(sha256sum "$here"/arti-linux       | cut -d " " -f 1)"
+[ -z "$android" ]   || echo -e "Android hash   :" "\n$(sha256sum "$here"/arti-android* | cut -d " " -f 1)"
 [ -z "$windows" ] || echo "Windows hash :" "$(sha256sum "$here"/arti-windows.exe | cut -d " " -f 1)"
 [ -z "$macos" ]   || echo "MacOS hash   :" "$(sha256sum "$here"/arti-macos       | cut -d " " -f 1)"

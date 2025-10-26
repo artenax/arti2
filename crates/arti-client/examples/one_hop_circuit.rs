@@ -13,7 +13,7 @@ use tor_relay_selection::{RelayExclusion, RelaySelector, RelayUsage};
 use tor_rtcompat::Runtime;
 
 /// Find a random relay suitable to use for a directory request.
-fn find_one_hop_dir_cache(netdir: &NetDir) -> Option<Relay> {
+fn find_one_hop_dir_cache(netdir: &NetDir) -> Option<Relay<'_>> {
     let mut rng = rand::rng();
     let exclusion = RelayExclusion::no_relays_excluded();
     let selector = RelaySelector::new(RelayUsage::directory_cache(), exclusion);
@@ -38,8 +38,8 @@ async fn launch_one_hop_dir_circ<R: Runtime>(
         let circuit = arti_client.circmgr().deref();
         let one_hop_circ = circuit.get_or_launch_dir_specific(&relay).await;
         match one_hop_circ {
-            Err(e) => println!("[-] Unable to launch one-hop circuit: {}", e),
-            Ok(_) => println!("[+] Successful one-hop circuit to: {:?}", fp),
+            Err(e) => println!("[-] Unable to launch one-hop circuit: {e}"),
+            Ok(_) => println!("[+] Successful one-hop circuit to: {fp:?}"),
         };
     } else {
         println!("Could not find a relay suitable for a directory request.");
