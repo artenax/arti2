@@ -226,9 +226,25 @@ impl TorAddr {
         addr.into_tor_addr_dangerously()
     }
 
-    /// Return true if this is an IP address (rather than a hostname).
+    /// Return true if this is a hostname.
+    ///
+    /// Returns false for hidden services (`.onion` domains).
+    pub fn is_hostname(&self) -> bool {
+        matches!(&self.host, Host::Hostname(_))
+    }
+
+    /// Return true if this is an IP address.
     pub fn is_ip_address(&self) -> bool {
         matches!(&self.host, Host::Ip(_))
+    }
+
+    /// Return true if this is a hidden service (`.onion` service).
+    ///
+    /// Note that this is purely syntactic.
+    /// This function might return `true` even for
+    /// a domain name which isn't a valid encoding of a hidden service identity.
+    pub fn is_onion_address(&self) -> bool {
+        matches!(&self.host, Host::Onion(_))
     }
 
     /// Get instructions for how to make a stream to this address
@@ -703,6 +719,38 @@ mod test {
         assert!(ip("[2001:db8::42]:65535"));
         assert!(!ip("example.com:80"));
         assert!(!ip("example.onion:80"));
+    }
+
+    #[test]
+    fn is_hostname() {
+        fn hostname(s: &str) -> bool {
+            TorAddr::from(s).unwrap().is_hostname()
+        }
+
+        assert!(hostname("torproject.org:80"));
+        assert!(hostname("torproject.org:443"));
+        assert!(hostname("example.com:80"));
+        assert!(!hostname("192.168.0.1:80"));
+        assert!(!hostname("[::1]:80"));
+        assert!(!hostname("[2001:db8::42]:65535"));
+        assert!(!hostname("example.onion:80"));
+    }
+
+    #[test]
+    fn is_onion_address() {
+        fn onion_address(s: &str) -> bool {
+            TorAddr::from(s).unwrap().is_onion_address()
+        }
+
+        assert!(onion_address("example.onion:80"));
+        assert!(onion_address("some.example.onion:80"));
+        assert!(onion_address(
+            "eweiibe6tdjsdprb4px6rqrzzcsi22m4koia44kc5pcjr7nec2rlxyad.onion:443"
+        ));
+        assert!(!onion_address("192.168.0.1:80"));
+        assert!(!onion_address("[::1]:80"));
+        assert!(!onion_address("[2001:db8::42]:65535"));
+        assert!(!onion_address("example.com:80"));
     }
 
     #[test]
