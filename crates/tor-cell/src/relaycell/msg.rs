@@ -11,6 +11,7 @@ use crate::chancell::msg::{
 };
 use caret::caret_int;
 use derive_deftly::Deftly;
+use enumset::{EnumSet, EnumSetType};
 use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU8;
@@ -20,8 +21,6 @@ use tor_linkspec::EncodedLinkSpec;
 use tor_llcrypto::pk::rsa::RsaIdentity;
 use tor_llcrypto::util::ct::CtByteArray;
 use tor_memquota::{derive_deftly_template_HasMemoryCost, memory_cost_structural_copy};
-
-use bitflags::bitflags;
 
 #[cfg(feature = "conflux")]
 #[cfg_attr(docsrs, doc(cfg(feature = "conflux")))]
@@ -141,25 +140,38 @@ pub trait Body: Sized {
     fn encode_onto<W: Writer + ?Sized>(self, w: &mut W) -> EncodeResult<()>;
 }
 
-bitflags! {
-    /// A set of recognized flags that can be attached to a begin cell.
-    ///
-    /// For historical reasons, these flags are constructed so that 0
-    /// is a reasonable default for all of them.
-    #[derive(Clone, Copy, Debug)]
-    pub struct BeginFlags : u32 {
-        /// The client would accept a connection to an IPv6 address.
-        const IPV6_OKAY = (1<<0);
-        /// The client would not accept a connection to an IPv4 address.
-        const IPV4_NOT_OKAY = (1<<1);
-        /// The client would rather have a connection to an IPv6 address.
-        const IPV6_PREFERRED = (1<<2);
+/// Set of [`BeginFlag`].
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct BeginFlags(pub EnumSet<BeginFlag>);
+
+impl BeginFlags {
+    /// Create BeginFlags with no bits set.
+    pub fn empty() -> Self {
+        BeginFlags(EnumSet::empty())
     }
 }
+
+/// A set of recognized flags that can be attached to a begin cell.
+///
+/// For historical reasons, these flags are constructed so that 0
+/// is a reasonable default for all of them.
+#[derive(Debug, EnumSetType)]
+#[enumset(repr = "u8")]
+#[non_exhaustive]
+pub enum BeginFlag {
+    /// The client would accept a connection to an IPv6 address.
+    Ipv6Okay,
+    /// The client would not accept a connection to an IPv4 address.
+    Ipv4NotOkay,
+    /// The client would rather have a connection to an IPv6 address.
+    Ipv6Preferred,
+}
+
 memory_cost_structural_copy!(BeginFlags);
 impl From<u32> for BeginFlags {
     fn from(v: u32) -> Self {
-        BeginFlags::from_bits_truncate(v)
+        BeginFlags(EnumSet::from_u32(v))
     }
 }
 
@@ -181,12 +193,12 @@ pub enum IpVersionPreference {
 impl From<IpVersionPreference> for BeginFlags {
     fn from(v: IpVersionPreference) -> Self {
         use IpVersionPreference::*;
-        match v {
-            Ipv4Only => 0.into(),
-            Ipv4Preferred => BeginFlags::IPV6_OKAY,
-            Ipv6Preferred => BeginFlags::IPV6_OKAY | BeginFlags::IPV6_PREFERRED,
-            Ipv6Only => BeginFlags::IPV4_NOT_OKAY,
-        }
+        BeginFlags(match v {
+            Ipv4Only => EnumSet::empty(),
+            Ipv4Preferred => EnumSet::only(BeginFlag::Ipv6Okay),
+            Ipv6Preferred => BeginFlag::Ipv6Okay | BeginFlag::Ipv6Preferred,
+            Ipv6Only => EnumSet::only(BeginFlag::Ipv4NotOkay),
+        })
     }
 }
 
@@ -263,6 +275,7 @@ impl Body for Begin {
             }
         };
         let port = r.take_until(0)?;
+
         let flags = if r.remaining() >= 4 { r.take_u32()? } else { 0 };
 
         if !addr.is_ascii() {
@@ -295,8 +308,10 @@ impl Body for Begin {
         w.write_u8(b':');
         w.write_all(self.port.to_string().as_bytes());
         w.write_u8(0);
-        if self.flags.bits() != 0 {
-            w.write_u32(self.flags.bits());
+
+        let bits = self.flags.0.as_u32();
+        if bits != 0 {
+            w.write_u32(bits);
         }
         Ok(())
     }
