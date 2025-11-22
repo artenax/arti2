@@ -7227,7 +7227,6 @@ name = "tor-netdir"
 version = "0.36.0"
 dependencies = [
  "async-trait",
- "bitflags 2.10.0",
  "derive_more",
  "digest",
  "enumset",
