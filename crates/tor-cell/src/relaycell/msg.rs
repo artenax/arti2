@@ -140,7 +140,7 @@ pub trait Body: Sized {
     fn encode_onto<W: Writer + ?Sized>(self, w: &mut W) -> EncodeResult<()>;
 }
 
-/// Set of [`BeginFlag`].
+/// Wrapper struct around `EnumSet` of [`BeginFlag`].
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct BeginFlags(pub EnumSet<BeginFlag>);
