@@ -2347,7 +2347,7 @@ pub(crate) mod test {
 
             let simulate_client = async move {
                 let begin =
-                    relaymsg::Begin::new("localhost", 80, BeginFlags(BeginFlag::Ipv6Okay.into()))
+                    relaymsg::Begin::new("localhost", 80, BeginFlags::only(BeginFlag::Ipv6Okay))
                         .unwrap();
                 let body: BoxedCellBody =
                     AnyRelayMsgOuter::new(StreamId::new(12), AnyRelayMsg::Begin(begin))
@@ -2444,7 +2444,7 @@ pub(crate) mod test {
 
             let simulate_client = async move {
                 let begin =
-                    relaymsg::Begin::new("localhost", 80, BeginFlags(BeginFlag::Ipv6Okay.into()))
+                    relaymsg::Begin::new("localhost", 80, BeginFlags::only(BeginFlag::Ipv6Okay))
                         .unwrap();
                 let body: BoxedCellBody =
                     AnyRelayMsgOuter::new(StreamId::new(12), AnyRelayMsg::Begin(begin))
@@ -2517,7 +2517,7 @@ pub(crate) mod test {
 
             let simulate_client = async move {
                 let begin =
-                    relaymsg::Begin::new("localhost", 80, BeginFlags(BeginFlag::Ipv6Okay.into()))
+                    relaymsg::Begin::new("localhost", 80, BeginFlags::only(BeginFlag::Ipv6Okay))
                         .unwrap();
                 let body: BoxedCellBody =
                     AnyRelayMsgOuter::new(StreamId::new(12), AnyRelayMsg::Begin(begin))
