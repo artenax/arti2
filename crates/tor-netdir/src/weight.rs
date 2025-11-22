@@ -166,7 +166,7 @@ impl RelayWeight {
     }
 }
 
-/// Set of [`WeightKind`].
+/// Wrapper struct around `EnumSet` of [`WeightKind`].
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct WeightKinds(EnumSet<WeightKind>);
 
