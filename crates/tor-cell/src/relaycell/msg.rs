@@ -143,7 +143,7 @@ pub trait Body: Sized {
 /// Set of [`BeginFlag`].
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
-pub struct BeginFlags(EnumSet<BeginFlag>);
+pub struct BeginFlags(pub EnumSet<BeginFlag>);
 
 impl BeginFlags {
     /// Create BeginFlags with no bits set.
