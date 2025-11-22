@@ -185,9 +185,14 @@ enum WeightKind {
     Dir,
 }
 
-impl WeightKind {
+impl WeightKinds {
+    /// Return the index to use for this kind of a relay within a WeightSet.
+    fn idx(&self) -> usize {
+        self.0.as_u32() as usize
+    }
+
     /// Return the appropriate WeightKind for a relay.
-    fn for_rs(rs: &MdRouterStatus) -> WeightKinds {
+    fn for_rs(rs: &MdRouterStatus) -> Self {
         let mut r = EnumSet::empty();
         if rs.is_flagged_guard() {
             r |= WeightKind::Guard;
@@ -199,14 +204,7 @@ impl WeightKind {
             r |= WeightKind::Dir;
         }
 
-        WeightKinds(r)
-    }
-}
-
-impl WeightKinds {
-    /// Return the index to use for this kind of a relay within a WeightSet.
-    fn idx(&self) -> usize {
-        self.0.as_u32() as usize
+        Self(r)
     }
 }
 
@@ -244,7 +242,7 @@ impl WeightSet {
     /// actually matches the given role.  For example, if `role` is Guard
     /// we don't check whether or not `rs` actually has the Guard flag.
     pub(crate) fn weight_rs_for_role(&self, rs: &MdRouterStatus, role: WeightRole) -> u64 {
-        self.weight_bw_for_role(WeightKind::for_rs(rs), rs.weight(), role)
+        self.weight_bw_for_role(WeightKinds::for_rs(rs), rs.weight(), role)
     }
 
     /// Find the 64-bit weight to report for a relay of `kind` whose weight in
@@ -635,28 +633,28 @@ mod test {
     fn weight_flags() {
         let rs1 = rs_builder().set_flags(RelayFlag::Exit).build().unwrap();
         assert_eq!(
-            WeightKind::for_rs(&rs1),
+            WeightKinds::for_rs(&rs1),
             WeightKinds(WeightKind::Exit.into())
         );
 
         let rs1 = rs_builder().set_flags(RelayFlag::Guard).build().unwrap();
         assert_eq!(
-            WeightKind::for_rs(&rs1),
+            WeightKinds::for_rs(&rs1),
             WeightKinds(WeightKind::Guard.into())
         );
 
         let rs1 = rs_builder().set_flags(RelayFlag::V2Dir).build().unwrap();
         assert_eq!(
-            WeightKind::for_rs(&rs1),
+            WeightKinds::for_rs(&rs1),
             WeightKinds(WeightKind::Dir.into())
         );
 
         let rs1 = rs_builder().build().unwrap();
-        assert_eq!(WeightKind::for_rs(&rs1), WeightKinds(EnumSet::empty()));
+        assert_eq!(WeightKinds::for_rs(&rs1), WeightKinds(EnumSet::empty()));
 
         let rs1 = rs_builder().set_flags(RelayFlags::all()).build().unwrap();
         assert_eq!(
-            WeightKind::for_rs(&rs1),
+            WeightKinds::for_rs(&rs1),
             WeightKinds(WeightKind::Exit | WeightKind::Guard | WeightKind::Dir)
         );
     }
