@@ -143,12 +143,16 @@ pub trait Body: Sized {
 /// Set of [`BeginFlag`].
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
-pub struct BeginFlags(pub EnumSet<BeginFlag>);
+pub struct BeginFlags(EnumSet<BeginFlag>);
 
 impl BeginFlags {
     /// Create BeginFlags with no bits set.
     pub fn empty() -> Self {
         BeginFlags(EnumSet::empty())
+    }
+    /// Convert `BeginFlag` to `EnumSet`.
+    pub fn only(flag: BeginFlag) -> Self {
+        BeginFlags(EnumSet::only(flag))
     }
 }
 
