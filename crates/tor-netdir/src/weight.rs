@@ -167,7 +167,7 @@ impl RelayWeight {
 }
 
 /// Set of [`WeightKind`].
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 struct WeightKinds(EnumSet<WeightKind>);
 
 /// A kind of relay, for the purposes of selecting a relay by weight.
