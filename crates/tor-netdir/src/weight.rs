@@ -231,7 +231,7 @@ pub(crate) struct WeightSet {
     // Before making this change, however,
     // we should think a little about performance and precision.
     shift: u8,
-    /// A set of RelayWeight values, indexed by [`WeightKind::idx`], used
+    /// A set of RelayWeight values, indexed by [`WeightKinds::idx`], used
     /// to weight different kinds of relays.
     w: [RelayWeight; 8],
 }
@@ -320,7 +320,7 @@ impl WeightSet {
         let w_both = single(p, "Wgd", "Wmd", "Wed", "Wbd");
 
         // Note that the positions of the elements in this array need to
-        // match the values returned by WeightKind.as_idx().
+        // match the values returned by WeightKinds.idx().
         let w = [
             w_none,
             w_guard,
