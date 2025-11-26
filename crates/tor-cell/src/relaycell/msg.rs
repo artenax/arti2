@@ -1499,4 +1499,11 @@ mod test {
             Err(InvalidSendmeTag { .. }),
         ));
     }
+
+    #[test]
+    fn begin_flags_match_constants() {
+        assert_eq!(BeginFlags::only(BeginFlag::Ipv6Okay).0.as_u8(), 1 << 0);
+        assert_eq!(BeginFlags::only(BeginFlag::Ipv4NotOkay).0.as_u8(), 1 << 1);
+        assert_eq!(BeginFlags::only(BeginFlag::Ipv6Preferred).0.as_u8(), 1 << 2);
+    }
 }
