@@ -175,7 +175,7 @@ pub enum BeginFlag {
 memory_cost_structural_copy!(BeginFlags);
 impl From<u32> for BeginFlags {
     fn from(v: u32) -> Self {
-        BeginFlags(EnumSet::from_u32(v))
+        BeginFlags(EnumSet::from_u32_truncated(v))
     }
 }
 
