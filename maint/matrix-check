@@ -79,7 +79,16 @@ def test_crate_config(crate, features, allow_empty=False):
         )
 
 
+def run_cmd(cmd, env=None):
+    print("running:", " ".join(cmd), file=sys.stderr)
+    p = run(cmd, env=env)
+    if p.returncode != 0:
+        raise Exception(f"Cargo command failed: {' '.join(cmd)}")
+
+
 def test_crate(crate):
+    run_cmd(["cargo", "test", "-p", crate.name, "--all-targets"])
+
     if crate.name in ["fs-mistrust", "tor-config"]:
         # these tests do not pass as of now. Skipping them.
         return
