@@ -11,10 +11,6 @@ from subprocess import run
 TOPDIR = os.path.split(os.path.dirname(sys.argv[0]))[0]
 os.chdir(TOPDIR)
 
-# some tests don't compile on every combination 😐
-# also test is way slower than check
-KEYWORD = "check"
-
 supplementary_targets = dict()
 
 
@@ -62,21 +58,15 @@ def test_crate_config(crate, features, allow_empty=False):
     if len(features) == 0 and not allow_empty:
         return
     features = ",".join(features)
-    args = [
+    run_cmd([
         "cargo",
-        KEYWORD,
+        "check",
         "-p",
         crate,
         "--no-default-features",
         "--features",
         features,
-    ]
-    print("running:", " ".join(args), file=sys.stderr)
-    p = run(args)
-    if p.returncode != 0:
-        raise Exception(
-            "Failed to test '" + crate + "' with features '" + features + "'"
-        )
+    ])
 
 
 def run_cmd(cmd, env=None):
