@@ -89,6 +89,36 @@ def run_cmd(cmd, env=None):
 def test_crate(crate):
     run_cmd(["cargo", "test", "-p", crate.name, "--all-targets"])
 
+    # cargo test with minimal features
+
+    conditional_options = []
+
+    for line in open(crate.subdir + "/Cargo.toml"):
+        conditional_option_directive = "# @@ test-all-crates conditional-option "
+        # One option per line, so it can contain spaces
+        if line.startswith(conditional_option_directive):
+            (key, option) = (
+                line[len(conditional_option_directive) :].rstrip().split(maxsplit=1)
+            )
+            if key == "minimal":
+                conditional_options.append(option)
+            continue
+
+    env = os.environ.copy()
+    env["RUSTFLAGS"] = f"{env.get('RUSTFLAGS', '')} --cfg arti_features_precise"
+
+    run_cmd(
+        [
+            "cargo",
+            "test",
+            "-p",
+            crate.name,
+            "--no-default-features",
+        ]
+        + conditional_options,
+        env=env,
+    )
+
     if crate.name in ["fs-mistrust", "tor-config"]:
         # these tests do not pass as of now. Skipping them.
         return
