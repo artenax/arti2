@@ -58,16 +58,18 @@ def test_crate_config(crate, features, allow_empty=False):
     if len(features) == 0 and not allow_empty:
         return
     features = ",".join(features)
-    run_cmd([
-        "cargo",
-        "--locked",
-        "check",
-        "-p",
-        crate,
-        "--no-default-features",
-        "--features",
-        features,
-    ])
+    run_cmd(
+        [
+            "cargo",
+            "--locked",
+            "check",
+            "-p",
+            crate,
+            "--no-default-features",
+            "--features",
+            features,
+        ]
+    )
 
 
 def run_cmd(cmd, env=None):
