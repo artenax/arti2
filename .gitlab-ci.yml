@@ -749,7 +749,7 @@ matrix-check:
   needs: []
   script:
     - maint/common/apt-install python3-toml
-    - ./maint/matrix-check --parallel "5,$PARALLEL_N"
+    - ./maint/matrix-check --parallel "7,$PARALLEL_N"
   parallel:
     matrix:
       - PARALLEL_N:
@@ -758,6 +758,8 @@ matrix-check:
         - 2
         - 3
         - 4
+        - 5
+        - 6
 
 matrix-test-cfg:
   needs: []
