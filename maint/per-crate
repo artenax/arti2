@@ -60,6 +60,7 @@ def test_crate_config(crate, features, allow_empty=False):
     features = ",".join(features)
     run_cmd([
         "cargo",
+        "--locked",
         "check",
         "-p",
         crate,
@@ -77,7 +78,7 @@ def run_cmd(cmd, env=None):
 
 
 def test_crate(crate):
-    run_cmd(["cargo", "test", "-p", crate.name, "--all-targets"])
+    run_cmd(["cargo", "--locked", "test", "-p", crate.name, "--all-targets"])
 
     # cargo test with minimal features
 
@@ -100,6 +101,7 @@ def test_crate(crate):
     run_cmd(
         [
             "cargo",
+            "--locked",
             "test",
             "-p",
             crate.name,
