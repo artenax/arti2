@@ -639,6 +639,9 @@ mod test {
         let config: TestConfigFile = toml::from_str(r#"listen = """#).unwrap();
         assert!(config.listen.unwrap().is_empty());
 
+        let config: TestConfigFile = toml::from_str(r#"listen = []"#).unwrap();
+        assert!(config.listen.unwrap().is_empty());
+
         let config: TestConfigFile = toml::from_str(r#"listen = "127.0.0.1:8080""#).unwrap();
         #[rustfmt::skip]
         assert_eq!(config.listen.unwrap().ip_addrs().unwrap().flatten().count(), 1);
