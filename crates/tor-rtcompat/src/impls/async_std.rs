@@ -23,9 +23,10 @@ mod net {
     #[cfg(unix)]
     use tor_general_addr::unix;
     use tracing::instrument;
+}
 
-    /// Implement NetStreamProvider-related functionality for a single address type.
-    macro_rules! impl_stream {
+/// Implement NetStreamProvider-related functionality for a single address type.
+macro_rules! impl_stream {
         { $kind:ident, $addr:ty } => {paste!{
             /// A `Stream` of incoming streams.
             ///
@@ -38,7 +39,9 @@ mod net {
                 // TODO(nickm): I hate using this trick.  At some point in the
                 // future, once Rust has nice support for async traits, maybe
                 // we can refactor it.
-                state: Option<[<Incoming $kind StreamsState>]>,
+                //Changed it to hold the stream created by futures.unfold dynamically rather than using enum
+                //and manual workarounds.
+                inner: std::pin::Pin<Box<dyn futures::stream::Stream<Item = IoResult<([<$kind Stream], $addr)>>+ Send>>
             }
             /// The result type returned by `take_and_poll_*`.
             ///
@@ -50,46 +53,27 @@ mod net {
             /// This function calls `Listener::accept` while owning the
             /// listener.  Thus, it returns a future that itself owns the listener,
             /// and we don't have lifetime troubles.
-            async fn [<take_and_poll_ $kind:lower>](lis: [<$kind Listener>]) -> [<$kind FResult>] {
-                let result = lis.accept().await;
-                (result, lis)
-            }
-            /// The possible states for an `Incoming*Streams`.
-            enum [<Incoming $kind StreamsState>] {
-                /// We're ready to call `accept` on the listener again.
-                Ready([<$kind Listener>]),
-                /// We've called `accept` on the listener, and we're waiting
-                /// for a future to complete.
-                Accepting(Pin<Box<dyn Future<Output = [<$kind FResult>]> + Send + Sync>>),
-            }
+
             impl [<Incoming $kind Streams>] {
                 /// Create a new IncomingStreams from a Listener.
                 pub fn from_listener(lis: [<$kind Listener>]) -> [<Incoming $kind Streams>] {
-                    Self {
-                        state: Some([<Incoming $kind StreamsState>]::Ready(lis)),
-                    }
+                    let stream = futures::stream::unfold(lis, |listener| async move{
+                        let result =listener.accept().await;
+                        Some((result,listener))
+                    });
+                   Self {
+                    inner:Box::pin(stream);
+                   }
                 }
             }
-            impl Stream for [< Incoming $kind Streams >] {
+
+            impl futures::stream::Stream for [< Incoming $kind Streams >] {
                 type Item = IoResult<([<$kind Stream>], $addr)>;
 
-                fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-                    use [<Incoming $kind StreamsState>] as St;
-                    let state = self.state.take().expect("No valid state!");
-                    let mut future = match state {
-                        St::Ready(lis) => Box::pin([<take_and_poll_ $kind:lower>](lis)),
-                        St::Accepting(fut) => fut,
-                    };
-                    match future.as_mut().poll(cx) {
-                        Poll::Ready((val, lis)) => {
-                            self.state = Some(St::Ready(lis));
-                            Poll::Ready(Some(val))
-                        }
-                        Poll::Pending => {
-                            self.state = Some(St::Accepting(future));
-                            Poll::Pending
-                        }
-                    }
+                fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context) -> std::task::Poll<Option<Self::Item>> {
+
+                    self.inner.as_mut().poll_next(cx)
+
                 }
             }
             impl traits::NetStreamListener<$addr> for [<$kind Listener>] {
@@ -105,99 +89,98 @@ mod net {
         }}
     }
 
-    impl_stream! { Tcp, std::net::SocketAddr }
-    #[cfg(unix)]
-    impl_stream! { Unix, unix::SocketAddr}
+impl_stream! { Tcp, std::net::SocketAddr }
+#[cfg(unix)]
+impl_stream! { Unix, unix::SocketAddr}
 
-    #[async_trait]
-    impl traits::NetStreamProvider<std::net::SocketAddr> for async_executors::AsyncStd {
-        type Stream = TcpStream;
-        type Listener = TcpListener;
-        #[instrument(skip_all, level = "trace")]
-        async fn connect(&self, addr: &SocketAddr) -> IoResult<Self::Stream> {
-            TcpStream::connect(addr).await
-        }
-        async fn listen(&self, addr: &SocketAddr) -> IoResult<Self::Listener> {
-            // Use an implementation that's the same across all runtimes.
-            Ok(impls::tcp_listen(addr)?.into())
-        }
+#[async_trait]
+impl traits::NetStreamProvider<std::net::SocketAddr> for async_executors::AsyncStd {
+    type Stream = TcpStream;
+    type Listener = TcpListener;
+    #[instrument(skip_all, level = "trace")]
+    async fn connect(&self, addr: &SocketAddr) -> IoResult<Self::Stream> {
+        TcpStream::connect(addr).await
+    }
+    async fn listen(&self, addr: &SocketAddr) -> IoResult<Self::Listener> {
+        // Use an implementation that's the same across all runtimes.
+        Ok(impls::tcp_listen(addr)?.into())
+    }
+}
+
+#[cfg(unix)]
+#[async_trait]
+impl traits::NetStreamProvider<unix::SocketAddr> for async_executors::AsyncStd {
+    type Stream = UnixStream;
+    type Listener = UnixListener;
+    #[instrument(skip_all, level = "trace")]
+    async fn connect(&self, addr: &unix::SocketAddr) -> IoResult<Self::Stream> {
+        let path = addr
+            .as_pathname()
+            .ok_or(crate::unix::UnsupportedAfUnixAddressType)?;
+        UnixStream::connect(path).await
+    }
+    async fn listen(&self, addr: &unix::SocketAddr) -> IoResult<Self::Listener> {
+        let path = addr
+            .as_pathname()
+            .ok_or(crate::unix::UnsupportedAfUnixAddressType)?;
+        UnixListener::bind(path).await
+    }
+}
+
+#[cfg(not(unix))]
+crate::impls::impl_unix_non_provider! { async_executors::AsyncStd }
+
+#[async_trait]
+impl traits::UdpProvider for async_executors::AsyncStd {
+    type UdpSocket = UdpSocket;
+
+    async fn bind(&self, addr: &std::net::SocketAddr) -> IoResult<Self::UdpSocket> {
+        StdUdpSocket::bind(*addr)
+            .await
+            .map(|socket| UdpSocket { socket })
+    }
+}
+
+/// Wrap a AsyncStd UdpSocket
+pub struct UdpSocket {
+    /// The underlying UdpSocket
+    socket: StdUdpSocket,
+}
+
+#[async_trait]
+impl traits::UdpSocket for UdpSocket {
+    async fn recv(&self, buf: &mut [u8]) -> IoResult<(usize, SocketAddr)> {
+        self.socket.recv_from(buf).await
     }
 
-    #[cfg(unix)]
-    #[async_trait]
-    impl traits::NetStreamProvider<unix::SocketAddr> for async_executors::AsyncStd {
-        type Stream = UnixStream;
-        type Listener = UnixListener;
-        #[instrument(skip_all, level = "trace")]
-        async fn connect(&self, addr: &unix::SocketAddr) -> IoResult<Self::Stream> {
-            let path = addr
-                .as_pathname()
-                .ok_or(crate::unix::UnsupportedAfUnixAddressType)?;
-            UnixStream::connect(path).await
-        }
-        async fn listen(&self, addr: &unix::SocketAddr) -> IoResult<Self::Listener> {
-            let path = addr
-                .as_pathname()
-                .ok_or(crate::unix::UnsupportedAfUnixAddressType)?;
-            UnixListener::bind(path).await
-        }
+    async fn send(&self, buf: &[u8], target: &SocketAddr) -> IoResult<usize> {
+        self.socket.send_to(buf, target).await
     }
 
-    #[cfg(not(unix))]
-    crate::impls::impl_unix_non_provider! { async_executors::AsyncStd }
+    fn local_addr(&self) -> IoResult<SocketAddr> {
+        self.socket.local_addr()
+    }
+}
 
-    #[async_trait]
-    impl traits::UdpProvider for async_executors::AsyncStd {
-        type UdpSocket = UdpSocket;
-
-        async fn bind(&self, addr: &std::net::SocketAddr) -> IoResult<Self::UdpSocket> {
-            StdUdpSocket::bind(*addr)
-                .await
-                .map(|socket| UdpSocket { socket })
-        }
+impl traits::StreamOps for TcpStream {
+    fn set_tcp_notsent_lowat(&self, notsent_lowat: u32) -> IoResult<()> {
+        impls::streamops::set_tcp_notsent_lowat(self, notsent_lowat)
     }
 
-    /// Wrap a AsyncStd UdpSocket
-    pub struct UdpSocket {
-        /// The underlying UdpSocket
-        socket: StdUdpSocket,
+    #[cfg(target_os = "linux")]
+    fn new_handle(&self) -> Box<dyn traits::StreamOps + Send + Unpin> {
+        Box::new(impls::streamops::TcpSockFd::from_fd(self))
     }
+}
 
-    #[async_trait]
-    impl traits::UdpSocket for UdpSocket {
-        async fn recv(&self, buf: &mut [u8]) -> IoResult<(usize, SocketAddr)> {
-            self.socket.recv_from(buf).await
-        }
-
-        async fn send(&self, buf: &[u8], target: &SocketAddr) -> IoResult<usize> {
-            self.socket.send_to(buf, target).await
-        }
-
-        fn local_addr(&self) -> IoResult<SocketAddr> {
-            self.socket.local_addr()
-        }
-    }
-
-    impl traits::StreamOps for TcpStream {
-        fn set_tcp_notsent_lowat(&self, notsent_lowat: u32) -> IoResult<()> {
-            impls::streamops::set_tcp_notsent_lowat(self, notsent_lowat)
-        }
-
-        #[cfg(target_os = "linux")]
-        fn new_handle(&self) -> Box<dyn traits::StreamOps + Send + Unpin> {
-            Box::new(impls::streamops::TcpSockFd::from_fd(self))
-        }
-    }
-
-    #[cfg(unix)]
-    impl traits::StreamOps for UnixStream {
-        fn set_tcp_notsent_lowat(&self, _notsent_lowat: u32) -> IoResult<()> {
-            Err(traits::UnsupportedStreamOp::new(
-                "set_tcp_notsent_lowat",
-                "unsupported on Unix streams",
-            )
-            .into())
-        }
+#[cfg(unix)]
+impl traits::StreamOps for UnixStream {
+    fn set_tcp_notsent_lowat(&self, _notsent_lowat: u32) -> IoResult<()> {
+        Err(traits::UnsupportedStreamOp::new(
+            "set_tcp_notsent_lowat",
+            "unsupported on Unix streams",
+        )
+        .into())
     }
 }
 
