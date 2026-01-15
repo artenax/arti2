@@ -11,10 +11,6 @@ from subprocess import run
 TOPDIR = os.path.split(os.path.dirname(sys.argv[0]))[0]
 os.chdir(TOPDIR)
 
-# some tests don't compile on every combination 😐
-# also test is way slower than check
-KEYWORD = "check"
-
 supplementary_targets = dict()
 
 
@@ -62,27 +58,60 @@ def test_crate_config(crate, features, allow_empty=False):
     if len(features) == 0 and not allow_empty:
         return
     features = ",".join(features)
-    args = [
-        "cargo",
-        KEYWORD,
-        "-p",
-        crate,
-        "--no-default-features",
-        "--features",
-        features,
-    ]
-    print("running:", " ".join(args), file=sys.stderr)
-    p = run(args)
+    run_cmd(
+        [
+            "cargo",
+            "--locked",
+            "check",
+            "-p",
+            crate,
+            "--no-default-features",
+            "--features",
+            features,
+        ]
+    )
+
+
+def run_cmd(cmd, env=None):
+    print("running:", " ".join(cmd), file=sys.stderr)
+    p = run(cmd, env=env)
     if p.returncode != 0:
-        raise Exception(
-            "Failed to test '" + crate + "' with features '" + features + "'"
-        )
+        raise Exception(f"Cargo command failed: {' '.join(cmd)}")
 
 
 def test_crate(crate):
-    if crate.name in ["fs-mistrust", "tor-config"]:
-        # these tests do not pass as of now. Skipping them.
-        return
+    run_cmd(["cargo", "--locked", "test", "-p", crate.name, "--all-targets"])
+
+    # cargo test with minimal features
+
+    conditional_options = []
+
+    for line in open(crate.subdir + "/Cargo.toml"):
+        conditional_option_directive = "# @@ test-all-crates conditional-option "
+        # One option per line, so it can contain spaces
+        if line.startswith(conditional_option_directive):
+            (key, option) = (
+                line[len(conditional_option_directive) :].rstrip().split(maxsplit=1)
+            )
+            if key == "minimal":
+                conditional_options.append(option)
+            continue
+
+    env = os.environ.copy()
+    env["RUSTFLAGS"] = f"{env.get('RUSTFLAGS', '')} --cfg arti_features_precise"
+
+    run_cmd(
+        [
+            "cargo",
+            "--locked",
+            "test",
+            "-p",
+            crate.name,
+            "--no-default-features",
+        ]
+        + conditional_options,
+        env=env,
+    )
 
     toml_path = os.path.join(crate.subdir, "Cargo.toml")
     t = toml.decoder.load(toml_path)
