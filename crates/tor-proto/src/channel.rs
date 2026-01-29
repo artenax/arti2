@@ -87,7 +87,7 @@ use tor_cell::chancell::{AnyChanCell, CircId, msg::PaddingNegotiate};
 use tor_error::internal;
 use tor_linkspec::{HasRelayIds, OwnedChanTarget};
 use tor_memquota::mq_queue::{self, ChannelSpec as _, MpscSpec};
-use tor_rtcompat::{CoarseTimeProvider, DynTimeProvider, SleepProvider, StreamOps};
+use tor_rtcompat::{CoarseInstant, CoarseTimeProvider, DynTimeProvider, SleepProvider, StreamOps};
 
 #[cfg(feature = "circ-padding")]
 use tor_async_utils::counting_streams::{self, CountingSink, CountingStream};
@@ -315,7 +315,7 @@ pub struct Channel {
     /// created.
     clock_skew: ClockSkew,
     /// The time when this channel was successfully completed
-    opened_at: coarsetime::Instant,
+    opened_at: CoarseInstant,
     /// Mutable state used by the `Channel.
     mutable: Mutex<MutableDetails>,
 
@@ -664,7 +664,7 @@ impl Channel {
             unique_id,
             peer_id,
             clock_skew,
-            opened_at: coarsetime::Instant::now(),
+            opened_at: CoarseInstant::now(),
             mutable: Mutex::new(mutable),
             details: Arc::clone(&details),
         });
@@ -1024,7 +1024,7 @@ impl Channel {
             unique_id,
             peer_id,
             clock_skew: ClockSkew::None,
-            opened_at: coarsetime::Instant::now(),
+            opened_at: CoarseInstant::now(),
             mutable: Default::default(),
             details,
         };
@@ -1151,7 +1151,7 @@ pub(crate) mod test {
             unique_id,
             peer_id,
             clock_skew: ClockSkew::None,
-            opened_at: coarsetime::Instant::now(),
+            opened_at: CoarseInstant::now(),
             mutable: Default::default(),
             details: fake_channel_details(),
         }
