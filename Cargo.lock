@@ -6900,6 +6900,7 @@ dependencies = [
  "digest",
  "flate2",
  "futures",
+ "getset",
  "hex",
  "http",
  "http-body",
