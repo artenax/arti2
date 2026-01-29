@@ -6897,6 +6897,7 @@ name = "tor-dirserver"
 version = "0.39.0"
 dependencies = [
  "bytes",
+ "digest",
  "flate2",
  "futures",
  "hex",
