@@ -235,6 +235,7 @@ where
     let maxlen = req.max_response_len();
     let anonymized = req.anonymized();
     let req = req.make_request().map_err(wrap_err)?;
+    let method = req.method().clone();
     let encoded = util::encode_request(&req);
 
     // Write the request.
@@ -256,6 +257,7 @@ where
     let header = read_headers(&mut buffered).await.map_err(wrap_err)?;
     if header.status != Some(200) {
         return Ok(DirResponse::new(
+            method,
             header.status.unwrap_or(0),
             header.status_message,
             None,
@@ -281,7 +283,14 @@ where
         (_, Ok(()), _) => Ok(()),
     };
 
-    Ok(DirResponse::new(200, None, ok.err(), result, source))
+    Ok(DirResponse::new(
+        method,
+        200,
+        None,
+        ok.err(),
+        result,
+        source,
+    ))
 }
 
 /// Maximum length for the HTTP headers in a single request or response.
