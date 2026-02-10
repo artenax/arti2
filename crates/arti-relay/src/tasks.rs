@@ -4,6 +4,7 @@
 //! of a relay.
 
 mod channel;
+pub(crate) mod key_rotation;
 pub(crate) mod listeners;
 
 pub(crate) use channel::ChannelHouseKeepingTask;
