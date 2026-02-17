@@ -671,7 +671,8 @@ impl ChannelMethod {
                 // Remember, more than one, we don't have a single address.
                 _ => None,
             },
-            _ => None,
+            #[cfg(feature = "pt-client")]
+            Self::Pluggable(_) => None,
         }
     }
 
