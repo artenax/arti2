@@ -11,7 +11,7 @@ workflow:
     # These 3 are used to detect pushes, MR creation events, and scheduled
     # builds:
     - if: $CI_PIPELINE_SOURCE == "push"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_PIPELINE_SOURCE == "schedule"
     # This rule handles when a maintainer pushes a tag to the repository.
     - if: $CI_COMMIT_TAG
@@ -237,13 +237,13 @@ cargo-audit:
     paths:
       - cache
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push"
       changes:
         - "**/Cargo.lock"
       allow_failure: false
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push"
       allow_failure: true
-    - if: $CI_PIPELINE_SOURCE != "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE != "push"
       allow_failure: false
 
 rust-test-recent:
