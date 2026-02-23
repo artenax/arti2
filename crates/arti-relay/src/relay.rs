@@ -247,27 +247,35 @@ impl<R: Runtime> TorRelay<R> {
         .context("Failed to construct the relay's client")?;
 
         // An iterator of `listen()` futures with some extra error handling.
-        let or_listeners = inert.config.relay.listen.addrs().map(async |addr| {
-            match runtime.listen(addr).await {
-                Ok(x) => Some(Ok(x)),
-                // If we don't support the address family (typically IPv6), only warn.
-                #[cfg(unix)]
-                Err(ref e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
-                    let message =
-                        format!("Could not listen at {addr}: address family not supported");
-                    if addr.is_ipv6() {
-                        warn!("{message}");
-                    } else {
-                        // If we got `EAFNOSUPPORT` for a non-IPv6 address, then warn louder.
-                        tor_error::warn_report!(e, "{message}");
+        // TODO: For each address group,
+        // we want to ensure that at least one in the group was successful.
+        let or_listeners = inert
+            .config
+            .relay
+            .listen
+            .ip_addrs()
+            .flatten()
+            .map(async |addr| {
+                match runtime.listen(&addr).await {
+                    Ok(x) => Some(Ok(x)),
+                    // If we don't support the address family (typically IPv6), only warn.
+                    #[cfg(unix)]
+                    Err(ref e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+                        let message =
+                            format!("Could not listen at {addr}: address family not supported");
+                        if addr.is_ipv6() {
+                            warn!("{message}");
+                        } else {
+                            // If we got `EAFNOSUPPORT` for a non-IPv6 address, then warn louder.
+                            tor_error::warn_report!(e, "{message}");
+                        }
+                        None
                     }
-                    None
+                    Err(e) => {
+                        Some(Err(e).with_context(|| format!("Failed to listen at address {addr}")))
+                    }
                 }
-                Err(e) => {
-                    Some(Err(e).with_context(|| format!("Failed to listen at address {addr}")))
-                }
-            }
-        });
+            });
 
         // We await the futures sequentially rather than with something like `join_all` to make
         // errors more reproducible.
@@ -289,7 +297,7 @@ impl<R: Runtime> TorRelay<R> {
         if or_listeners.is_empty() {
             return Err(anyhow::anyhow!(
                 "Could not listen at any OR port addresses: {}",
-                crate::util::iter_join(", ", inert.config.relay.listen.addrs()),
+                crate::util::iter_join(", ", inert.config.relay.listen.ip_addrs().flatten()),
             ));
         }
 

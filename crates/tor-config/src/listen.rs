@@ -255,6 +255,108 @@ enum InvalidListen {
     ZeroPortInList,
 }
 
+/// Specification of a public address to listen on (eg, a port, or some addresses/ports)
+///
+/// Can represent, at least:
+///  * Listen on the following port at all addresses (IPv6 and IPv4)
+///  * Listen on precisely the following address and port
+///  * Listen on several addresses/ports
+///
+/// A port of "0" is not supported.
+/// At least one address must be given.
+//
+// NOTE: We may want to support optional addresses in the future
+// (like how a DirPort is optional in tor),
+// but we should still support non-optional addresses as well like the OR port.
+#[derive(Clone, Hash, Debug, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "CustomizableListen", into = "CustomizableListen")]
+pub struct PublicListen(CustomizableListen);
+
+impl PublicListen {
+    /// List the network socket addresses to listen on.
+    pub fn ip_addrs(
+        &self,
+    ) -> impl Iterator<Item = impl Iterator<Item = SocketAddr> + Clone + '_> + Clone + '_ {
+        // We interpret standalone ports to be for all IPv6 and IPv4 addresses.
+        let ips = [Ipv6Addr::UNSPECIFIED.into(), Ipv4Addr::UNSPECIFIED.into()];
+        self.0.items().map(move |item| item.iter(ips))
+    }
+}
+
+impl Display for PublicListen {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mut sep = "";
+        for item in self.ip_addrs().flatten() {
+            write!(f, "{sep}{item}")?;
+            sep = ", ";
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<CustomizableListen> for PublicListen {
+    type Error = InvalidPublicListen;
+
+    fn try_from(l: CustomizableListen) -> Result<Self, Self::Error> {
+        fn check_item(item: &ListenItem) -> Result<(), InvalidPublicListen> {
+            // We could do `is_zero_port()` and `is_auto()` checks,
+            // but the match ensures that we will handle future variants.
+            match item {
+                // We don't support a 0 port.
+                ListenItem::Port(port) if *port == 0 => Err(InvalidPublicListen::ZeroPort),
+                ListenItem::Port(_) => Ok(()),
+                ListenItem::General(addr) if addr.port() == 0 => Err(InvalidPublicListen::ZeroPort),
+                ListenItem::General(_) => Ok(()),
+                // We don't support an "auto" port.
+                ListenItem::Auto => Err(InvalidPublicListen::AutoPort),
+                ListenItem::AutoPort(_) => Err(InvalidPublicListen::AutoPort),
+            }
+        }
+
+        match &l {
+            CustomizableListen::Disabled => return Err(InvalidPublicListen::Disabled),
+            CustomizableListen::One(item) => {
+                check_item(item)?;
+            }
+            CustomizableListen::List(list) => {
+                // We require at least one address.
+                if list.is_empty() {
+                    return Err(InvalidPublicListen::Required);
+                }
+                for item in list {
+                    check_item(item)?;
+                }
+            }
+        }
+
+        Ok(Self(l))
+    }
+}
+
+impl From<PublicListen> for CustomizableListen {
+    fn from(l: PublicListen) -> Self {
+        l.0
+    }
+}
+
+/// Listen configuration is invalid
+#[derive(thiserror::Error, Debug, Clone)]
+#[non_exhaustive]
+enum InvalidPublicListen {
+    /// An attempt was made to disable listening.
+    #[error("This option cannot be disabled")]
+    Disabled,
+    /// An address was not provided.
+    #[error("At least one address is required")]
+    Required,
+    /// An address with a port of 0 was given.
+    #[error("Zero port is not supported")]
+    ZeroPort,
+    /// An address with an "auto" port was given.
+    #[error("An \"auto\" port is not supported")]
+    AutoPort,
+}
+
 /// A general structure for configuring listening ports.
 ///
 /// This is meant to provide some basic parsing without being too opinionated.
@@ -275,7 +377,7 @@ enum CustomizableListen {
 
 impl CustomizableListen {
     /// All configured listen options.
-    fn items(&self) -> impl Iterator<Item = &ListenItem> {
+    fn items(&self) -> impl Iterator<Item = &ListenItem> + Clone {
         match self {
             Self::Disabled => Either::Right(std::slice::Iter::default()),
             Self::One(one) => Either::Left(iter::once(one)),
@@ -321,10 +423,11 @@ impl ListenItem {
     ///
     /// If the item is a standalone port, then the returned iterator will return a socket address
     /// using that port for each IP address in `ips_for_port`.
-    fn iter<'a>(
-        &'a self,
-        ips_for_port: impl IntoIterator<Item = IpAddr> + 'a,
-    ) -> impl Iterator<Item = SocketAddr> + 'a {
+    fn iter<'a, I>(&'a self, ips_for_port: I) -> impl Iterator<Item = SocketAddr> + Clone + 'a
+    where
+        I: IntoIterator<Item = IpAddr> + 'a,
+        <I as IntoIterator>::IntoIter: Clone,
+    {
         use ListenItem as LI;
         let with_ips = |portnum| {
             Either::Left({
@@ -639,6 +742,9 @@ mod test {
         let config: TestConfigFile = toml::from_str(r#"listen = """#).unwrap();
         assert!(config.listen.unwrap().is_empty());
 
+        let config: TestConfigFile = toml::from_str(r#"listen = []"#).unwrap();
+        assert!(config.listen.unwrap().is_empty());
+
         let config: TestConfigFile = toml::from_str(r#"listen = "127.0.0.1:8080""#).unwrap();
         #[rustfmt::skip]
         assert_eq!(config.listen.unwrap().ip_addrs().unwrap().flatten().count(), 1);
@@ -752,5 +858,96 @@ mod test {
             false
         );
         assert_eq!(localhost_only(r#"listen = [  "192.168.0.1:1234" ]"#), false);
+    }
+
+    #[test]
+    fn public_listen_parsing_checks() {
+        #[derive(Debug, Deserialize, Serialize)]
+        struct PublicConfig {
+            listen: PublicListen,
+        }
+
+        let config: PublicConfig = toml::from_str(r#"listen = 1"#).unwrap();
+        assert_eq!(config.listen.ip_addrs().flatten().count(), 2);
+
+        let config: PublicConfig = toml::from_str(r#"listen = "127.0.0.1:8080""#).unwrap();
+        assert_eq!(config.listen.ip_addrs().flatten().count(), 1);
+
+        let config: PublicConfig = toml::from_str(r#"listen = ["127.0.0.1:8080"]"#).unwrap();
+        assert_eq!(config.listen.ip_addrs().flatten().count(), 1);
+
+        let config: PublicConfig = toml::from_str(r#"listen = [1]"#).unwrap();
+        assert_eq!(config.listen.ip_addrs().flatten().count(), 2);
+
+        let config: PublicConfig = toml::from_str(r#"listen = [1, 2]"#).unwrap();
+        assert_eq!(config.listen.ip_addrs().flatten().count(), 4);
+
+        let config: PublicConfig = toml::from_str(r#"listen = ["127.0.0.1:8080", 2]"#).unwrap();
+        assert_eq!(config.listen.ip_addrs().flatten().count(), 3);
+
+        let err =
+            |res: Result<PublicConfig, toml::de::Error>| res.unwrap_err().message().to_string();
+
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = []"#)),
+            "At least one address is required",
+        );
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = false"#)),
+            "This option cannot be disabled",
+        );
+        // TODO: this is a bad error message since we don't allow standalone bools either
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = [false]"#)),
+            "value was not a bool, `u16` integer, string, or list of integers/strings",
+        );
+        // TODO: this is a bad error message since we don't allow "false" either
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = true"#)),
+            "Invalid listen specification: need actual addr/port, or `false`; not `true`",
+        );
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = [true]"#)),
+            "value was not a bool, `u16` integer, string, or list of integers/strings",
+        );
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = 0"#)),
+            "Zero port is not supported",
+        );
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = [0]"#)),
+            "Zero port is not supported",
+        );
+        #[rustfmt::skip]
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = ["127.0.0.1:8080", 0]"#)),
+            "Zero port is not supported",
+        );
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = "127.0.0.1:0""#)),
+            "Zero port is not supported",
+        );
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = ["foo"]"#)),
+            "Invalid listen specification: failed to parse string: invalid socket address syntax",
+        );
+        #[rustfmt::skip]
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = ["127.0.0.1:8080", "foo"]"#)),
+            "Invalid listen specification: failed to parse string: invalid socket address syntax",
+        );
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = """#)),
+            "At least one address is required",
+        );
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = [""]"#)),
+            "Invalid listen specification: failed to parse string: invalid socket address syntax",
+        );
+        #[rustfmt::skip]
+        assert_eq!(
+            err(toml::from_str::<PublicConfig>(r#"listen = ["127.0.0.1:8080", ""]"#)),
+            "Invalid listen specification: failed to parse string: invalid socket address syntax",
+        );
     }
 }

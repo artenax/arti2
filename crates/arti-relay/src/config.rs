@@ -4,8 +4,6 @@
 // them for arti-relay. But I don't think we can do so while still using tor-config. See:
 // https://gitlab.torproject.org/tpo/core/arti/-/issues/2253
 
-mod listen;
-
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
@@ -18,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use tor_chanmgr::{ChannelConfig, ChannelConfigBuilder};
 use tor_circmgr::{CircuitTiming, PathConfig, PreemptiveCircuitConfig};
-use tor_config::{ConfigBuildError, ExplicitOrAuto, impl_standard_builder, mistrust::BuilderExt};
+use tor_config::{
+    ConfigBuildError, ExplicitOrAuto, PublicListen, impl_standard_builder, mistrust::BuilderExt,
+};
 use tor_config_path::{CfgPath, CfgPathError, CfgPathResolver};
 use tor_dircommon::config::{NetworkConfig, NetworkConfigBuilder};
 use tor_dircommon::fallback::FallbackList;
@@ -29,8 +29,6 @@ use tracing::metadata::Level;
 use tracing_subscriber::filter::EnvFilter;
 
 use crate::util::NonEmptyList;
-
-use self::listen::Listen;
 
 /// Paths used for default configuration files.
 pub(crate) fn default_config_paths() -> Result<Vec<PathBuf>, CfgPathError> {
@@ -234,7 +232,7 @@ impl tor_guardmgr::GuardMgrConfig for TorRelayConfig {
 #[builder(derive(Debug, Serialize, Deserialize))]
 pub(crate) struct RelayConfig {
     /// Addresses to listen on for incoming OR connections.
-    pub(crate) listen: Listen,
+    pub(crate) listen: PublicListen,
 
     /// Addresses to advertise on the network for receiving OR connections.
     // For now, we've decided that we don't want to include any IP address auto-detection in
