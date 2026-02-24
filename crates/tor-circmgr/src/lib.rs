@@ -462,7 +462,7 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> CircMgrInner<B, R> {
             config.preemptive_circuits().clone(),
         )));
 
-        guardmgr.set_filter(config.path_rules().build_guard_filter());
+        guardmgr.set_path_filter(config.path_rules().build_guard_filter());
 
         let mgr =
             mgr::AbstractTunnelMgr::new(builder, runtime.clone(), config.circuit_timing().clone());
@@ -660,7 +660,7 @@ impl<B: AbstractTunnelBuilder<R> + 'static, R: Runtime> CircMgrInner<B, R> {
         let new_reachable = &new_config.path_rules().reachable_addrs;
         if new_reachable != &old_path_rules.reachable_addrs {
             let filter = new_config.path_rules().build_guard_filter();
-            self.mgr.peek_builder().guardmgr().set_filter(filter);
+            self.mgr.peek_builder().guardmgr().set_path_filter(filter);
         }
 
         let discard_all_circuits = !new_config
@@ -1159,7 +1159,7 @@ mod test {
     #![allow(clippy::needless_pass_by_value)]
     //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
     use mocks::FakeBuilder;
-    use tor_guardmgr::GuardMgr;
+    use tor_guardmgr::{GuardFilter, GuardMgr, PickGuardError};
     use tor_linkspec::OwnedChanTarget;
     use tor_netdir::testprovider::TestNetDirProvider;
     use tor_persist::TestingStateMgr;
@@ -1223,6 +1223,41 @@ mod test {
         CircMgrInner::launch_background_tasks(&circmgr, &runtime, &netdir, statemgr)
             .expect("launch CircMgrInner background tasks");
         circmgr
+    }
+
+    #[test]
+    fn circmgr_override_test() {
+        tor_rtcompat::test_with_all_runtimes!(|runtime| async move {
+            let config = crate::config::test_config::TestConfig::default();
+            let statemgr = TestingStateMgr::new();
+            let guardmgr =
+                GuardMgr::new(runtime.clone(), statemgr.clone(), &config).expect("Create GuardMgr");
+
+            let netdir = tor_netdir::testnet::construct_netdir()
+                .unwrap_if_sufficient()
+                .unwrap();
+            guardmgr.install_test_netdir(&netdir);
+
+            let mut filter = GuardFilter::default();
+            filter.push_reachable_addresses(["1.1.1.1:1".parse().unwrap()]);
+            guardmgr.set_filter(filter);
+
+            let before = guardmgr.select_guard(tor_guardmgr::GuardUsage::default());
+            assert!(
+                matches!(before, Err(PickGuardError::AllGuardsDown { .. })),
+                "test precondition failed: restrictive filter is not active before circmgr init"
+            );
+
+            let builder =
+                FakeBuilder::new(&runtime, statemgr, &tor_guardmgr::TestConfig::default());
+            let _circmgr = CircMgrInner::new_generic(&config, &runtime, &guardmgr, builder);
+
+            let result = guardmgr.select_guard(tor_guardmgr::GuardUsage::default());
+            assert!(
+                matches!(result, Err(PickGuardError::AllGuardsDown { .. })),
+                "filter was clobbered by CircMgrInner::new_generic"
+            );
+        });
     }
 
     #[test]

@@ -157,12 +157,11 @@ struct GuardMgrInner {
     /// use, along with their relative priorities and statuses.
     guards: GuardSets,
 
-    /// The current filter that we're using to decide which guards are
-    /// supported.
-    //
-    // TODO: This field is duplicated in the current active [`GuardSet`]; we
-    // should fix that.
-    filter: GuardFilter,
+    /// Filter constraints from `tor-circmgr` path configuration.
+    path_filter: GuardFilter,
+
+    /// Additional filter constraints set directly on this guard manager.
+    runtime_filter: GuardFilter,
 
     /// Configuration values derived from the consensus parameters.
     ///
@@ -348,7 +347,8 @@ impl<R: Runtime> GuardMgr<R> {
 
         let inner = Arc::new(Mutex::new(GuardMgrInner {
             guards: state,
-            filter: GuardFilter::unfiltered(),
+            path_filter: GuardFilter::unfiltered(),
+            runtime_filter: GuardFilter::unfiltered(),
             last_primary_retry_time: runtime.now(),
             params: GuardParams::default(),
             ctrl,
@@ -570,13 +570,27 @@ impl<R: Runtime> GuardMgr<R> {
         }
     }
 
-    /// Replace the current [`GuardFilter`] used by this `GuardMgr`.
+    /// Replace the caller-provided [`GuardFilter`] used by this `GuardMgr`.
+    ///
+    /// This filter is applied in addition to any path filter set by
+    /// [`GuardMgr::set_path_filter`]
     // TODO should this be part of the config?
     pub fn set_filter(&self, filter: GuardFilter) {
         let wallclock = self.runtime.wallclock();
         let now = self.runtime.now();
         let mut inner = self.inner.lock().expect("Poisoned lock");
-        inner.set_filter(filter, wallclock, now);
+        inner.set_runtime_filter(filter, wallclock, now);
+    }
+
+    /// Replace the path-derived [`GuardFilter`] used by this `GuardMgr`
+    ///
+    /// This filter is applied in addition to any caller-provided filter set by
+    /// [`GuardMgr::set_filter`]
+    pub fn set_path_filter(&self, filter: GuardFilter) {
+        let wallclock = self.runtime.wallclock();
+        let now = self.runtime.now();
+        let mut inner = self.inner.lock().expect("Poisoned lock");
+        inner.set_path_filter(filter, wallclock, now);
     }
 
     /// Select a guard for a given [`GuardUsage`].
@@ -788,6 +802,11 @@ impl GuardSets {
 }
 
 impl GuardMgrInner {
+    /// Return the effective filter to apply for guard selection
+    fn effective_filter(&self) -> GuardFilter {
+        self.path_filter.and_with(&self.runtime_filter)
+    }
+
     /// Look up the latest [`NetDir`] (if there is one) from our
     /// [`NetDirProvider`] (if we have one).
     fn timely_netdir(&self) -> Option<Arc<NetDir>> {
@@ -990,11 +1009,12 @@ impl GuardMgrInner {
         // TODO(nickm): We could use a "dirty" flag or something to decide
         // whether we need to call set_filter, if this comparison starts to show
         // up in profiles.
-        if self.guards.active_guards().filter() != &self.filter {
+        let effective_filter = self.effective_filter();
+        if self.guards.active_guards().filter() != &effective_filter {
             let restrictive = self.guards.active_set == GuardSetSelector::Restricted;
             self.guards
                 .active_guards_mut()
-                .set_filter(self.filter.clone(), restrictive);
+                .set_filter(effective_filter, restrictive);
         }
     }
 
@@ -1117,7 +1137,7 @@ impl GuardMgrInner {
             #[cfg(feature = "bridge-client")]
             GuardSetSelector::Bridges => return,
         };
-        let frac_permitted = self.filter.frac_bw_permitted(netdir);
+        let frac_permitted = self.effective_filter().frac_bw_permitted(netdir);
         let threshold = self.params.filter_threshold + offset;
         let new_choice = if frac_permitted < threshold {
             GuardSetSelector::Restricted
@@ -1165,10 +1185,17 @@ impl GuardMgrInner {
         }
     }
 
-    /// Replace the current GuardFilter with `filter`.
+    /// Replace the current caller-provided GuardFilter with `filter`.
     #[instrument(level = "trace", skip_all)]
-    fn set_filter(&mut self, filter: GuardFilter, wallclock: SystemTime, now: Instant) {
-        self.filter = filter;
+    fn set_runtime_filter(&mut self, filter: GuardFilter, wallclock: SystemTime, now: Instant) {
+        self.runtime_filter = filter;
+        self.update(wallclock, now);
+    }
+
+    /// Replace the current path-derived GuardFilter with `filter`.
+    #[instrument(level = "trace", skip_all)]
+    fn set_path_filter(&mut self, filter: GuardFilter, wallclock: SystemTime, now: Instant) {
+        self.path_filter = filter;
         self.update(wallclock, now);
     }
 
@@ -2110,6 +2137,27 @@ mod test {
             // Make sure that the filter worked.
             let addr = guard.addrs().next().unwrap();
             assert_eq!(addr, "2.0.0.3:9001".parse().unwrap());
+        });
+    }
+
+    #[test]
+    fn path_and_runtime_filters_are_combined() {
+        test_with_all_runtimes!(|rt| async move {
+            let (guardmgr, _statemgr, netdir) = init(rt);
+            let u = GuardUsage::default();
+
+            let mut path_filter = GuardFilter::default();
+            path_filter.push_reachable_addresses(vec!["2.0.0.0/8:9001".parse().unwrap()]);
+            guardmgr.set_path_filter(path_filter);
+
+            let mut runtime_filter = GuardFilter::default();
+            runtime_filter.push_reachable_addresses(vec!["3.0.0.0/8:9001".parse().unwrap()]);
+            guardmgr.set_filter(runtime_filter);
+
+            guardmgr.install_test_netdir(&netdir);
+
+            let result = guardmgr.select_guard(u);
+            assert!(matches!(result, Err(PickGuardError::AllGuardsDown { .. })));
         });
     }
 
