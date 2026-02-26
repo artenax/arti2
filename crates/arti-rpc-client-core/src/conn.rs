@@ -40,7 +40,7 @@ use tor_rpc_connect::{HasClientErrorAction, auth::cookie::CookieAccessError};
 // stuff a `void fn(void*), void*` inside of one of these.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[allow(clippy::exhaustive_structs)]
-pub struct RequestTag(pub usize, pub usize);
+pub struct UserTag(pub usize, pub usize);
 
 /// A handle to an open request.
 ///
@@ -326,7 +326,7 @@ impl RpcConn {
     ///
     /// (If nobody is running `wait()`, then responses will never be handled,
     /// and can potentially fill up memory.)
-    pub fn submit(&self, tag: RequestTag, cmd: &str) -> Result<(), ProtoError> {
+    pub fn submit(&self, tag: UserTag, cmd: &str) -> Result<(), ProtoError> {
         self.send_pollable_request(tag, cmd)
     }
 
@@ -349,7 +349,7 @@ impl RpcConn {
     /// only to requests submitted with `submit()`.
     ///
     /// It is safe, but generally pointless, to call this method from multiple threads.
-    pub fn wait(&self) -> Result<(RequestTag, AnyResponse), ProtoError> {
+    pub fn wait(&self) -> Result<(UserTag, AnyResponse), ProtoError> {
         let (tag, r) = self.receiver.wait_on_pollable_response()?;
         Ok((tag, AnyResponse::from_validated(r)))
     }
