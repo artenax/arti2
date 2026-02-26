@@ -62,11 +62,18 @@ define_derive_deftly! {
 /// Consequently, leading or trailing or duplicated / are forbidden.
 ///
 /// The last component of the path may optionally contain the encoded (string) representation
+/// of one or more *denotator sets*.
+/// A denotator set consists
 /// of one or more
 /// [`KeySpecifierComponent`]
 /// s representing the denotators of the key.
-/// They are separated from the rest of the component, and from each other,
+///
+/// Within a denotator set, denotarors are separated
 /// by [`DENOTATOR_SEP`] characters.
+///
+/// Denotator sets are separated from each other
+/// by two consecutive [`DENOTATOR_SEP`] characters.
+///
 /// Denotators are encoded using their
 /// [`KeySpecifierComponent::to_slug`]
 /// implementation.
@@ -74,8 +81,11 @@ define_derive_deftly! {
 /// Denotator strings are validated in the same way as [`Slug`](tor-persist::slug::Slug)s.
 ///
 /// For example, the last component of the path `"foo/bar/bax+denotator_example+1"`
-/// is `"bax+denotator_example+1"`.
+/// is the denotator set `"bax+denotator_example+1"`.
 /// Its denotators are `"denotator_example"` and `"1"` (encoded as strings).
+/// As another example, the path `"foo/bar/bax+denotator_example+1++foo+bar++baz"`
+/// has three denotator sets, separated by `++`,
+/// `"bax+denotator_example+1"`, `foo+bar`, and `baz`.
 ///
 /// NOTE: There is a 1:1 mapping between a value that implements `KeySpecifier` and its
 /// corresponding `ArtiPath`. A `KeySpecifier` can be converted to an `ArtiPath`, but the reverse
