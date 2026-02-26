@@ -420,7 +420,8 @@ pub struct RpcConn {
 /// Only one handle of this type can exist per [`RpcConn`].
 ///
 /// This type is _not_ intended to be used by multiple threads at once: Only one thread at a time
-/// should ever invoke its methods.
+/// should ever invoke its [`poll`](RpcPoll::poll) method.
+/// (In Rust, this is enforced by having RpcPoll::poll take `&mut self`.)
 ///
 /// [event-driven IO]: https://man7.org/linux/man-pages/man2/select.2.html
 pub struct RpcPoll {
