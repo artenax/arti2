@@ -334,24 +334,30 @@ mod tests {
             // A base path with no denotator sets
             ("my_key_path", "my_key_path+foo+bar+baz"),
             // A base path with a single denotator sets
-            ("my_key_path+dino+saur", "my_key_path+dino+saur++foo+bar+baz"),
+            (
+                "my_key_path+dino+saur",
+                "my_key_path+dino+saur++foo+bar+baz",
+            ),
             // A base path with two denotator sets
-            ("my_key_path+dino++saur", "my_key_path+dino++saur++foo+bar+baz"),
+            (
+                "my_key_path+dino++saur",
+                "my_key_path+dino++saur++foo+bar+baz",
+            ),
         ];
 
         for (base_path, expected_path) in TEST_PATHS {
             let path = ArtiPath::new(base_path.to_string()).unwrap();
             let expected_path = ArtiPath::new(expected_path.to_string()).unwrap();
 
-        assert_eq!(
-            ArtiPath::from_path_and_denotators(path.clone(), &denotators[..]).unwrap(),
-            expected_path
-        );
+            assert_eq!(
+                ArtiPath::from_path_and_denotators(path.clone(), &denotators[..]).unwrap(),
+                expected_path
+            );
 
-        assert_eq!(
-            ArtiPath::from_path_and_denotators(path.clone(), &[]).unwrap(),
-            path
-        );
+            assert_eq!(
+                ArtiPath::from_path_and_denotators(path.clone(), &[]).unwrap(),
+                path
+            );
         }
     }
 
