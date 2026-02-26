@@ -328,7 +328,7 @@ impl RpcConnBuilder {
     /// (See `EventLoop` documentation for implementation suggestions.)
     ///
     /// Once you have received an RpcPoll from this function,
-    /// you _must_ begin using [`RpcPoll:poll()`] as documented;
+    /// you _must_ begin using [`RpcPoll::poll()`] as documented;
     /// otherwise, no requests--even those crated with `execute` methods--will receive responses.
     pub fn connect_polling(
         &self,

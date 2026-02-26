@@ -811,7 +811,7 @@ impl Receiver {
     }
 }
 
-/// Type returned by [`RpcPoll::Poll`] when no progress can be made until the underlying
+/// Type returned by [`RpcPoll::poll`] when no progress can be made until the underlying
 /// connection has more data to read or write.
 #[derive(Copy, Clone, Debug, Default)]
 #[non_exhaustive]
@@ -836,7 +836,7 @@ impl RpcPoll {
     /// and passes any responses to requests created with the [`RpcConn::execute`] methods.
     /// If it finds a response to a request crated with [`RpcConn::submit`], it returns that response.
     ///
-    /// If no further progress can be made without performing more IO, it returns a [`WantIo`] object.
+    /// If no further progress can be made without performing more IO, it returns [`WouldBlock`].
     /// The caller should then register the fd/socket for this [`RpcPoll`] in its event-driven IO framework,
     /// waiting for read/write events as specified by the `WantIo`.
     ///

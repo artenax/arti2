@@ -326,7 +326,7 @@ pub(crate) struct NonblockingStream {
     stream: Box<dyn Stream>,
 }
 
-/// Helper to return which events a [`NonblockingStream`] is interested in.
+/// A set of events that a [`RpcPoll`](crate::RpcPoll) is interested in.
 #[derive(Clone, Debug, Default, Copy)]
 pub struct WantIo {
     /// True if the stream is interested in writing.
@@ -372,7 +372,7 @@ pub(crate) enum PollStatus {
 }
 
 impl NonblockingStream {
-    /// Create a new `NonblockingStream` from a provided [`Waker`] and [`Stream`].
+    /// Create a new `NonblockingStream` from a provided [`EventLoop`] and [`Stream`].
     pub(crate) fn new(event_loop: Box<dyn EventLoop>, stream: Box<dyn Stream>) -> Self {
         Self {
             write_handle: WriteHandle {
@@ -575,7 +575,7 @@ pub trait EventLoop: Send + Sync {
     ///
     /// In a user-provided `EventLoop`,
     /// this method will only be invoked from within one of the `submit` or `execute` methods
-    /// on [`RpcConn`].
+    /// on [`RpcConn`](crate::RpcConn).
     fn start_writing(&mut self) -> io::Result<()>;
 }
 
