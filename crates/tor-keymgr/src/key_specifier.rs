@@ -619,11 +619,8 @@ impl Display for KeySpecifierComponentPrettyHelper<'_> {
 ///
 ///   * the `ArtiPath` of the [`KeyCertificateSpecifier::subject_key_specifier`],
 ///     if [`KeyCertificateSpecifier::cert_denotators`] is empty
-//
-// TODO(#2377): use something other than DENOTATOR_SEP as the separator
-//
 ///   * the `ArtiPath` of the [`KeyCertificateSpecifier::subject_key_specifier`],
-///     followed by a [`DENOTATOR_SEP`](crate::DENOTATOR_SEP) character and the
+///     followed by a [`DENOTATOR_SET_SEP`](crate::DENOTATOR_SET_SEP) character and the
 ///     [`KeyCertificateSpecifier::cert_denotators`] encoded as described
 ///     in the [`ArtiPath`] docs,
 ///     if [`KeyCertificateSpecifier::cert_denotators`] is non-empty
