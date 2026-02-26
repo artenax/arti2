@@ -25,9 +25,9 @@
 //! (Requests themselves all have an [`AnyRequestId`] --
 //! the actual ID that we send out in the request,
 //! which the RPC server sends back in all responses.
-//! Additionally, Pollable requests are created with a client-defined [`RequestTag`],
+//! Additionally, Pollable requests are created with a client-defined [`UserTag`],
 //! which the client can use to identify their particular requests.
-//! `RequestTag` is a separate type to help FFI-style programs
+//! `UserTag is a separate type to help FFI-style programs
 //! that want to put things like pointers in it.)
 //!
 //! # Data structure
@@ -66,8 +66,8 @@
 //!
 //! The two kinds of queue are slightly different.
 //! (We represent their differences with the QueueId trait):
-//!     - Pollable responses need to carry a `RequestTag``;
-//!       Waitable responses don't. This is [`QueueId::Tag`].
+//!     - Pollable responses need to carry a `UserTag`;
+//!       Waitable responses don't. This is [`QueueId::UserTag`].
 //!     - We need to treat final responses a bit differently
 //!       in terms of how we find what to remove.
 //!       This is [`QueueId::remove_entry`].
@@ -96,7 +96,7 @@ use super::{ProtoError, ShutdownError};
 trait QueueId {
     /// A tag type associated with responses in the identified queue.
     ///
-    /// ("Polling" requests use tags to tell the user which response goes with which request.)
+    /// ("Polling" requests use [`UserTag`]s to tell the user which response goes with which request.)
     type UserTag: Sized;
 
     /// Find the queue identified by this `QueueId` within `map`,
@@ -178,7 +178,7 @@ impl QueueId for AnyRequestId {
 /// As distinct from "Waitable" requests, which are created with "execute*" methods and
 /// whose APIs expect the user to block while waiting for responses,
 /// polled requests are created with "submit*" methods,
-/// and their replies are returned, along with [`RequestTag`] instances,
+/// and their replies are returned, along with [`UserTag`] instances,
 /// from the RpcConn directly.
 struct PolledRequests;
 
@@ -251,7 +251,7 @@ enum RequestState {
     Waiting(ResponseQueue<AnyRequestId>),
 
     /// A request submitted by one of the `submit_*` functions:
-    /// the user must provide an associated [`RequestTag`],
+    /// the user must provide an associated [`UserTag`],
     /// and call [`RpcConn::wait`] to find responses.
     Pollable(UserTag),
 }

@@ -329,7 +329,7 @@ impl RpcConn {
 
     /// As execute(), but do not wait for a response.
     ///
-    /// Instead, the caller must provide a [`RequestTag`] to identify a particular request,
+    /// Instead, the caller must provide a [`UserTag`] to identify a particular request,
     /// and must make sure that responses are being processed via [`wait()`](Self::wait).
     ///
     /// (If nobody is running `wait()`, then responses will never be handled,
@@ -351,7 +351,7 @@ impl RpcConn {
     /// Wait for a response to arrive for a request that was sent via [`submit()`](Self::submit).
     ///
     /// Return that response,
-    /// along with the tag that was associated with its request.
+    /// along with the [`UserTag`] that was associated with its request.
     ///
     /// This method will never return responses to any requests made with one of the `execute` methods;
     /// only to requests submitted with `submit()`.
