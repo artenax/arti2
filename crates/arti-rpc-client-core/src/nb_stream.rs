@@ -87,7 +87,10 @@ pub(crate) struct PollingStream {
     ///
     /// Invariant: `stream.stream` is a [`MioStream`], so [`Stream::as_mio_stream`] will return
     /// Some when we call it.
-    stream: NonblockingStream,
+    ///
+    /// This is None only if we have called `into_nonblocking()` or `drop()`
+    /// we store this in an Option so `that we can move it out of this object.
+    stream: Option<NonblockingStream>,
 }
 
 /// A `mio` token corresponding to the Waker we use to tell the interactor about new writes.
@@ -110,13 +113,15 @@ impl PollingStream {
         let mut cio = Self {
             poll,
             events: mio::Events::with_capacity(4),
-            stream,
+            stream: Some(stream),
         };
 
         // We register the stream here, since we want to use it exclusively with `reregister`
         // later on.  We do not deregister the stream until `Drop::drop` is called.
         cio.poll.registry().register(
             cio.stream
+                .as_mut()
+                .expect("Logic error: stream not present")
                 .stream
                 .as_mio_stream()
                 .expect("logic error: not a mio stream."),
@@ -129,7 +134,10 @@ impl PollingStream {
 
     /// Return a new [`WriteHandle`] that can be used to queue messages to be sent via this stream.
     pub(crate) fn writer(&self) -> WriteHandle {
-        self.stream.writer()
+        self.stream
+            .as_ref()
+            .expect("logic error: stream not present")
+            .writer()
     }
 
     /// Interact with the peer until some response is received.
@@ -152,8 +160,13 @@ impl PollingStream {
         let mut try_reading = true;
 
         loop {
+            let stream = self
+                .stream
+                .as_mut()
+                .expect("logic error: stream not present!");
+
             // Try interacting with the underlying stream.
-            let want_io = match self.stream.interact_once(try_writing, try_reading)? {
+            let want_io = match stream.interact_once(try_writing, try_reading)? {
                 PollStatus::Closed => return Ok(None),
                 PollStatus::Msg(msg) => return Ok(Some(msg)),
                 PollStatus::WouldBlock(w) => w,
@@ -162,7 +175,7 @@ impl PollingStream {
             // We're blocking on reading and possibly writing.  Register our interest,
             // so that we get woken as appropriate.
             self.poll.registry().reregister(
-                self.stream
+                stream
                     .stream
                     .as_mio_stream()
                     .expect("logic error: not a mio stream!"),
@@ -194,18 +207,24 @@ impl PollingStream {
     }
 
     /// Downgrade this stream into a [`NonblockingStream`] for use within an [`RpcPoll`](crate::RpcPoll).
-    pub(crate) fn into_nonblocking(self) -> NonblockingStream {
-        let mut result = self.stream;
-        result.stream = result.stream.remove_mio();
-        result
+    pub(crate) fn into_nonblocking(mut self) -> NonblockingStream {
+        let mut stream = self
+            .deregister_and_take_stream()
+            .expect("logic error: stream not present!");
+        stream.stream = stream.stream.remove_mio();
+        stream
     }
-}
 
-impl Drop for PollingStream {
-    fn drop(&mut self) {
+    /// Implementation helper for Drop and into_nonblocking:
+    ///
+    /// Deregisters the NonblockingStream with the mio Registry, removes it from this object,
+    /// and returns it.
+    ///
+    /// After this method is called, this object may no longer be used.
+    fn deregister_and_take_stream(&mut self) -> Option<NonblockingStream> {
         // IO SAFETY: See "IO Safety" note in documentation for PollingStream.
-        let s = self
-            .stream
+        let mut stream = self.stream.take()?;
+        let s: &mut _ = stream
             .stream
             .as_mio_stream()
             .expect("Logic error: Stream was not a MIO stream.");
@@ -213,6 +232,14 @@ impl Drop for PollingStream {
             .registry()
             .deregister(s)
             .expect("Deregister operation failed");
+        Some(stream)
+    }
+}
+
+impl Drop for PollingStream {
+    fn drop(&mut self) {
+        // IO SAFETY: See "IO Safety" note in documentation for PollingStream.
+        let _ = self.deregister_and_take_stream();
     }
 }
 
