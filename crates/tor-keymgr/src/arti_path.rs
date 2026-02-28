@@ -62,11 +62,19 @@ define_derive_deftly! {
 /// Consequently, leading or trailing or duplicated / are forbidden.
 ///
 /// The last component of the path may optionally contain the encoded (string) representation
+/// of one or more *denotator sets*.
+/// A denotator set consists
 /// of one or more
 /// [`KeySpecifierComponent`]
 /// s representing the denotators of the key.
-/// They are separated from the rest of the component, and from each other,
+///
+/// Within a denotator set, denotarors are separated
 /// by [`DENOTATOR_SEP`] characters.
+///
+/// Denotator sets are separated from each other
+/// by two consecutive [`DENOTATOR_SEP`] characters.
+/// Denotator sets may not be empty.
+///
 /// Denotators are encoded using their
 /// [`KeySpecifierComponent::to_slug`]
 /// implementation.
@@ -74,8 +82,11 @@ define_derive_deftly! {
 /// Denotator strings are validated in the same way as [`Slug`](tor-persist::slug::Slug)s.
 ///
 /// For example, the last component of the path `"foo/bar/bax+denotator_example+1"`
-/// is `"bax+denotator_example+1"`.
+/// is the denotator set `"bax+denotator_example+1"`.
 /// Its denotators are `"denotator_example"` and `"1"` (encoded as strings).
+/// As another example, the path `"foo/bar/bax+denotator_example+1++foo+bar++baz"`
+/// has three denotator sets, separated by `++`,
+/// `"bax+denotator_example+1"`, `foo+bar`, and `baz`.
 ///
 /// NOTE: There is a 1:1 mapping between a value that implements `KeySpecifier` and its
 /// corresponding `ArtiPath`. A `KeySpecifier` can be converted to an `ArtiPath`, but the reverse
@@ -95,16 +106,21 @@ pub(crate) const PATH_SEP: char = '/';
 ///
 /// This separator can only appear within the last component of an [`ArtiPath`],
 /// and the substring that follows it is assumed to be the string representation
-/// of the denotators of the path.
+/// of the denotator sets of the path.
 pub const DENOTATOR_SEP: char = '+';
+
+/// A separator for separating individual denotator sets from each other.
+pub const DENOTATOR_SET_SEP: &str = "++";
 
 impl ArtiPath {
     /// Validate the underlying representation of an `ArtiPath`
     fn validate_str(inner: &str) -> Result<(), ArtiPathSyntaxError> {
         // Validate the denotators, if there are any.
-        let path = if let Some((main_part, denotators)) = inner.split_once(DENOTATOR_SEP) {
-            for d in denotators.split(DENOTATOR_SEP) {
-                let () = slug::check_syntax(d)?;
+        let path = if let Some((main_part, denotator_sets)) = inner.split_once(DENOTATOR_SEP) {
+            if !denotator_sets.is_empty() {
+                for denotators in denotator_sets.split(DENOTATOR_SET_SEP) {
+                    let () = validate_denotator_set(denotators)?;
+                }
             }
 
             main_part
@@ -204,18 +220,43 @@ impl ArtiPath {
             return Ok(path);
         }
 
-        let path: String = [Ok(path.0)]
-            .into_iter()
-            .chain(
-                cert_denotators
-                    .iter()
-                    .map(|s| s.to_slug().map(|s| s.to_string())),
-            )
+        let cert_denotators = cert_denotators
+            .iter()
+            .map(|s| s.to_slug().map(|s| s.to_string()))
             .collect::<Result<Vec<_>, _>>()?
             .join(&DENOTATOR_SEP.to_string());
 
+        let path = if cert_denotators.is_empty() {
+            format!("{path}")
+        } else {
+            // If the path already contains some denotators,
+            // we need to use the denotator set separator
+            // to separate them from the certificate denotators.
+            // Otherwise, we simply use the regular DENOTATOR_SEP
+            // to indicate the start of the denotator section.
+            if path.contains("+") {
+                format!("{path}{DENOTATOR_SET_SEP}{cert_denotators}")
+            } else {
+                format!("{path}{DENOTATOR_SEP}{cert_denotators}")
+            }
+        };
+
         ArtiPath::new(path)
     }
+}
+
+/// Validate a single denotator set.
+fn validate_denotator_set(denotators: &str) -> Result<(), ArtiPathSyntaxError> {
+    if denotators.is_empty() {
+        // Empty denotator sets are not allowed
+        return Err(ArtiPathSyntaxError::Slug(BadSlug::EmptySlugNotAllowed));
+    }
+
+    for d in denotators.split(DENOTATOR_SEP) {
+        let () = slug::check_syntax(d)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -281,24 +322,43 @@ mod tests {
 
     #[test]
     fn arti_path_from_path_and_denotators() {
-        let path = ArtiPath::new("my_key_path".into()).unwrap();
         let denotators = [
             &Denotator("foo".to_string()) as &dyn KeySpecifierComponent,
             &Denotator("bar".to_string()) as &dyn KeySpecifierComponent,
             &Denotator("baz".to_string()) as &dyn KeySpecifierComponent,
         ];
 
-        let expected_path = ArtiPath::new("my_key_path+foo+bar+baz".into()).unwrap();
+        /// Base ArtiPaths and the expected outcome from concatenating
+        /// the base with the denotator set above.
+        const TEST_PATHS: &[(&str, &str)] = &[
+            // A base path with no denotator sets
+            ("my_key_path", "my_key_path+foo+bar+baz"),
+            // A base path with a single denotator sets
+            (
+                "my_key_path+dino+saur",
+                "my_key_path+dino+saur++foo+bar+baz",
+            ),
+            // A base path with two denotator sets
+            (
+                "my_key_path+dino++saur",
+                "my_key_path+dino++saur++foo+bar+baz",
+            ),
+        ];
 
-        assert_eq!(
-            ArtiPath::from_path_and_denotators(path.clone(), &denotators[..]).unwrap(),
-            expected_path
-        );
+        for (base_path, expected_path) in TEST_PATHS {
+            let path = ArtiPath::new(base_path.to_string()).unwrap();
+            let expected_path = ArtiPath::new(expected_path.to_string()).unwrap();
 
-        assert_eq!(
-            ArtiPath::from_path_and_denotators(path.clone(), &[]).unwrap(),
-            path
-        );
+            assert_eq!(
+                ArtiPath::from_path_and_denotators(path.clone(), &denotators[..]).unwrap(),
+                expected_path
+            );
+
+            assert_eq!(
+                ArtiPath::from_path_and_denotators(path.clone(), &[]).unwrap(),
+                path
+            );
+        }
     }
 
     #[test]
