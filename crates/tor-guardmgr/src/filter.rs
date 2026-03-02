@@ -121,6 +121,13 @@ impl GuardFilter {
             });
         }
     }
+
+    /// Return a filter that requires this filter and `other` (both)
+    pub(crate) fn and_with(&self, other: &Self) -> Self {
+        let mut combined = self.clone();
+        combined.filters.extend(other.filters.iter().cloned());
+        combined
+    }
 }
 
 impl SingleFilter {
