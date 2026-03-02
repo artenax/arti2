@@ -6886,8 +6886,10 @@ name = "tor-dirserver"
 version = "0.39.0"
 dependencies = [
  "bytes",
+ "digest",
  "flate2",
  "futures",
+ "getset",
  "hex",
  "http",
  "http-body",
@@ -6902,7 +6904,6 @@ dependencies = [
  "retry-error",
  "rusqlite",
  "saturating-time",
- "sha2",
  "strum",
  "tempfile",
  "thiserror 2.0.18",
