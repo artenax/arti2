@@ -26,6 +26,30 @@ use serde::{Deserialize, de::DeserializeOwned};
 pub use stream::StreamError;
 use tor_rpc_connect::{HasClientErrorAction, auth::cookie::CookieAccessError};
 
+/// A user-provided tag used to identify requests provided to
+/// [`RpcConn::submit`].
+///
+/// Most users will want to crate tags that are unique
+/// for the lifetime of their associated requests.
+/// This is not enforced: the only drawback of duplicating tags
+/// is that you will not be able to use them to distinguish
+/// which reply is which.
+///
+/// This is distinct from the request ID type (represented by [`AnyRequestId`])
+/// that is sent to the RPC server with each request
+/// and returned along with each corresponding response.
+/// By contrast, a `UserTag` is never sent to the RPC server,
+/// and therefore is safe to use with information
+/// (like callback and data pointers)
+/// which it would not be safe to take from an untrusted source.
+//
+// Note: The tag is chosen to be two pointers in size,
+// to accommodate C implementations that want to
+// stuff a `void fn(void*), void*` inside of one of these.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[allow(clippy::exhaustive_structs)]
+pub struct UserTag(pub usize, pub usize);
+
 /// A handle to an open request.
 ///
 /// These handles are created with [`RpcConn::execute_with_handle`].
@@ -282,7 +306,7 @@ impl RpcConn {
     /// Like `execute`, but don't wait.  This lets the caller see the
     /// request ID and  maybe cancel it.
     pub fn execute_with_handle(&self, cmd: &str) -> Result<RequestHandle, ProtoError> {
-        self.send_request(cmd)
+        self.send_waitable_request(cmd)
     }
     /// As execute(), but run update_cb for every update we receive.
     pub fn execute_with_updates<F>(
@@ -303,6 +327,17 @@ impl RpcConn {
         }
     }
 
+    /// As execute(), but do not wait for a response.
+    ///
+    /// Instead, the caller must provide a [`UserTag`] to identify a particular request,
+    /// and must make sure that responses are being processed via [`wait()`](Self::wait).
+    ///
+    /// (If nobody is running `wait()`, then responses will never be handled,
+    /// and can potentially fill up memory.)
+    pub fn submit(&self, tag: UserTag, cmd: &str) -> Result<(), ProtoError> {
+        self.send_pollable_request(tag, cmd)
+    }
+
     /// Helper: Tell Arti to release `obj`.
     ///
     /// Do not use this method for a user-provided object ID:
@@ -311,6 +346,20 @@ impl RpcConn {
         let release_request = crate::msgs::request::Request::new(obj, "rpc:release", NoParams {});
         let _empty_response: EmptyReply = self.execute_internal_ok(&release_request.encode()?)?;
         Ok(())
+    }
+
+    /// Wait for a response to arrive for a request that was sent via [`submit()`](Self::submit).
+    ///
+    /// Return that response,
+    /// along with the [`UserTag`] that was associated with its request.
+    ///
+    /// This method will never return responses to any requests made with one of the `execute` methods;
+    /// only to requests submitted with `submit()`.
+    ///
+    /// It is safe, but generally pointless, to call this method from multiple threads.
+    pub fn wait(&self) -> Result<(UserTag, AnyResponse), ProtoError> {
+        let (tag, r) = self.receiver.wait_on_pollable_response()?;
+        Ok((tag, AnyResponse::from_validated(r)))
     }
 
     // TODO RPC: shutdown() on the socket on Drop.
@@ -352,7 +401,6 @@ impl RequestHandle {
     pub fn wait_with_updates(&self) -> Result<AnyResponse, ProtoError> {
         let conn = self.conn.lock().expect("Poisoned lock");
         let validated = conn.wait_on_message_for(&self.id)?;
-
         Ok(AnyResponse::from_validated(validated))
     }
 
@@ -428,6 +476,12 @@ pub enum ProtoError {
     /// (This should be impossible.)
     #[error("Internal error while encoding request")]
     CouldNotEncode(#[source] Arc<serde_json::Error>),
+
+    /// We tried to wait on a request that was not created with a queue.
+    ///
+    /// (This should be impossible).
+    #[error("Internal error: waiting on a request created for polling.")]
+    RequestNotWaitable,
 
     /// We got a response to some internally generated request that wasn't what we expected.
     #[error("{0}")]
@@ -624,6 +678,7 @@ impl HasClientErrorAction for ProtoError {
             | E::RequestIdInUse
             | E::RequestCompleted
             | E::DuplicateWait
+            | E::RequestNotWaitable
             | E::CouldNotEncode(_) => A::Abort,
         }
     }
