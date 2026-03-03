@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
+# stdlib imports
 import argparse
-import dataclasses
 import os
 import shutil
 import shlex
@@ -9,8 +9,12 @@ import subprocess
 import sys
 import textwrap
 
+# stdlib "from" imports
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
+
+# "local" imports
+from config import Config
 
 _SCRIPT_NAME = Path(sys.argv[0]).name
 _SCRIPT_DIR = Path(sys.argv[0]).parent.resolve()
@@ -149,16 +153,6 @@ class ChutneyNetworkResolver:
         )
 
 
-@dataclasses.dataclass
-class Config:
-    chutney: Path
-    arti: Path
-    arti_bench: Path
-    jq: Path
-    chutney_data_dir: Path
-    network: str
-
-
 class ConfigResolver:
     def __init__(self, parser: ArgumentParser) -> None:
         self._jq_resolver = JqBinResolver(parser)
@@ -170,11 +164,11 @@ class ConfigResolver:
 
     def resolve(self, args: Namespace) -> Config:
         return Config(
-            chutney=self._chutney_resolver.resolve(args),
-            arti=self._arti_resolver.resolve(args),
-            arti_bench=self._arti_bench_resolver.resolve(args),
-            jq=self._jq_resolver.resolve(args),
-            chutney_data_dir=self._chutney_data_dir_resolver.resolve(args),
+            chutney=str(self._chutney_resolver.resolve(args)),
+            arti=str(self._arti_resolver.resolve(args)),
+            arti_bench=str(self._arti_bench_resolver.resolve(args)),
+            jq=str(self._jq_resolver.resolve(args)),
+            chutney_data_dir=str(self._chutney_data_dir_resolver.resolve(args)),
             network=self._network_resolver.resolve(args),
         )
 
@@ -198,6 +192,9 @@ def _main() -> None:
             f"export CHUTNEY_DATA_DIR={shlex.quote(str(config.chutney_data_dir))}",
             file=c,
         )
+
+    # Also dump as json, for use by python scripts
+    config.dump_json(_SCRIPT_DIR.joinpath("arti.run.json"))
 
 
 if __name__ == "__main__":
